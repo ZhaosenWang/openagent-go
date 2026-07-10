@@ -2,6 +2,7 @@ package acp
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -31,6 +32,18 @@ type AgentHandler interface {
 
 	// OnCancel is called when the client cancels an ongoing prompt.
 	OnCancel(ctx context.Context, sessionID string) error
+
+	// OnLoadSession is called when the client requests to resume an existing
+	// session. The handler should restore the session state and return the
+	// session ID if successful.
+	OnLoadSession(ctx context.Context, req LoadSessionRequest) (*LoadSessionResponse, error)
+
+	// OnListSessions returns the sessions available for loading via OnLoadSession.
+	OnListSessions(ctx context.Context, req ListSessionsRequest) (*ListSessionsResponse, error)
+
+	// OnDeleteSession is called when the client deletes a session.
+	// The handler should remove all session state permanently.
+	OnDeleteSession(ctx context.Context, sessionID string) error
 
 	// OnCloseSession is called when the client closes a session.
 	OnCloseSession(ctx context.Context, sessionID string) error
@@ -165,13 +178,46 @@ func (b *agentBridge) Initialize(ctx context.Context, params acpsdk.InitializeRe
 		ProtocolVersion: int(params.ProtocolVersion),
 		ClientName:      clientInfoName(params.ClientInfo),
 		ClientVersion:   clientInfoVersion(params.ClientInfo),
+		ClientCapabilities: ClientCapabilities{
+			Terminal: params.ClientCapabilities.Terminal,
+		},
 	})
 	if err != nil {
 		return acpsdk.InitializeResponse{}, err
 	}
 
+	// Merge handler capabilities with bridge-level defaults.
+	// The bridge always supports load, list, delete, resume, and close
+	// because those are required AgentHandler methods. Prompt and MCP
+	// capabilities come from the handler.
+	caps := resp.Capabilities
+	caps.LoadSession = true
+	caps.SessionCapabilities.List = true
+	caps.SessionCapabilities.Delete = true
+	caps.SessionCapabilities.Resume = true
+	caps.SessionCapabilities.Close = true
+
 	return acpsdk.InitializeResponse{
 		ProtocolVersion: acpsdk.ProtocolVersion(resp.ProtocolVersion),
+		AgentCapabilities: acpsdk.AgentCapabilities{
+			LoadSession: caps.LoadSession,
+			McpCapabilities: acpsdk.McpCapabilities{
+				Acp:  caps.McpCapabilities.Acp,
+				Http: caps.McpCapabilities.Http,
+				Sse:  caps.McpCapabilities.Sse,
+			},
+			PromptCapabilities: acpsdk.PromptCapabilities{
+				Image:           caps.PromptCapabilities.Image,
+				Audio:           caps.PromptCapabilities.Audio,
+				EmbeddedContext: caps.PromptCapabilities.EmbeddedContext,
+			},
+			SessionCapabilities: acpsdk.SessionCapabilities{
+				List:   sessionListCapPtr(caps.SessionCapabilities.List),
+				Delete: sessionDeleteCapPtr(caps.SessionCapabilities.Delete),
+				Resume: sessionResumeCapPtr(caps.SessionCapabilities.Resume),
+				Close:  sessionCloseCapPtr(caps.SessionCapabilities.Close),
+			},
+		},
 		AgentInfo: &acpsdk.Implementation{
 			Name: b.server.name, Version: b.server.version,
 		},
@@ -185,15 +231,18 @@ func (b *agentBridge) NewSession(ctx context.Context, params acpsdk.NewSessionRe
 	}
 
 	resp, err := b.handler.OnNewSession(ctx, NewSessionRequest{
-		Cwd:        params.Cwd,
-		McpServers: mcpServers,
+		Cwd:                   params.Cwd,
+		McpServers:            mcpServers,
+		AdditionalDirectories: params.AdditionalDirectories,
 	})
 	if err != nil {
 		return acpsdk.NewSessionResponse{}, err
 	}
 
 	return acpsdk.NewSessionResponse{
-		SessionId: acpsdk.SessionId(resp.SessionID),
+		SessionId:     acpsdk.SessionId(resp.SessionID),
+		ConfigOptions: convertConfigOptions(resp.ConfigOptions),
+		Modes:         convertModeState(resp.Modes),
 	}, nil
 }
 
@@ -250,16 +299,68 @@ func (b *agentBridge) Logout(ctx context.Context, params acpsdk.LogoutRequest) (
 	return acpsdk.LogoutResponse{}, nil
 }
 func (b *agentBridge) ListSessions(ctx context.Context, params acpsdk.ListSessionsRequest) (acpsdk.ListSessionsResponse, error) {
-	return acpsdk.ListSessionsResponse{Sessions: []acpsdk.SessionInfo{}}, nil
+	resp, err := b.handler.OnListSessions(ctx, ListSessionsRequest{
+		Cursor: params.Cursor,
+		Cwd:    params.Cwd,
+	})
+	if err != nil {
+		return acpsdk.ListSessionsResponse{}, err
+	}
+
+	sessions := make([]acpsdk.SessionInfo, 0, len(resp.Sessions))
+	for _, s := range resp.Sessions {
+		info := acpsdk.SessionInfo{
+			SessionId: acpsdk.SessionId(s.SessionID),
+			Cwd:       s.Cwd,
+		}
+		if s.Title != "" {
+			info.Title = &s.Title
+		}
+		if s.UpdatedAt != "" {
+			info.UpdatedAt = &s.UpdatedAt
+		}
+		sessions = append(sessions, info)
+	}
+
+	return acpsdk.ListSessionsResponse{
+		Sessions:   sessions,
+		NextCursor: resp.NextCursor,
+	}, nil
 }
 func (b *agentBridge) ResumeSession(ctx context.Context, params acpsdk.ResumeSessionRequest) (acpsdk.ResumeSessionResponse, error) {
-	return acpsdk.ResumeSessionResponse{}, fmt.Errorf("not supported")
+	mcpServers := make([]McpServer, 0, len(params.McpServers))
+	for _, m := range params.McpServers {
+		mcpServers = append(mcpServers, fromSDKMcpServer(m))
+	}
+
+	_, err := b.handler.OnLoadSession(ctx, LoadSessionRequest{
+		SessionID:            string(params.SessionId),
+		Cwd:                  params.Cwd,
+		McpServers:           mcpServers,
+		AdditionalDirectories: params.AdditionalDirectories,
+	})
+	if err != nil {
+		return acpsdk.ResumeSessionResponse{}, err
+	}
+
+	return acpsdk.ResumeSessionResponse{}, nil
 }
 func (b *agentBridge) SetSessionConfigOption(ctx context.Context, params acpsdk.SetSessionConfigOptionRequest) (acpsdk.SetSessionConfigOptionResponse, error) {
 	return acpsdk.SetSessionConfigOptionResponse{}, nil
 }
 func (b *agentBridge) SetSessionMode(ctx context.Context, params acpsdk.SetSessionModeRequest) (acpsdk.SetSessionModeResponse, error) {
 	return acpsdk.SetSessionModeResponse{}, nil
+}
+
+// SessionDelete implements the SDK's optional session/delete interface.
+// This is a protocol-defined method that the SDK marks as unstable.
+func (b *agentBridge) UnstableDeleteSession(ctx context.Context, params acpsdk.UnstableDeleteSessionRequest) (acpsdk.UnstableDeleteSessionResponse, error) {
+	sessionID := string(params.SessionId)
+	b.deleteSender(sessionID)
+	if err := b.handler.OnDeleteSession(ctx, sessionID); err != nil {
+		return acpsdk.UnstableDeleteSessionResponse{}, err
+	}
+	return acpsdk.UnstableDeleteSessionResponse{}, nil
 }
 
 // ── agentSender ──
@@ -300,12 +401,16 @@ func (s *agentSender) SendToolCall(tc ToolCallEvent) error {
 	switch tc.Status {
 	case "completed":
 		update = acpsdk.UpdateToolCall(acpsdk.ToolCallId(tc.ID),
-			acpsdk.WithUpdateStatus(acpsdk.ToolCallStatusCompleted))
+			acpsdk.WithUpdateStatus(acpsdk.ToolCallStatusCompleted),
+			acpsdk.WithUpdateRawOutput(tc.RawOutput))
 	case "failed":
 		update = acpsdk.UpdateToolCall(acpsdk.ToolCallId(tc.ID),
-			acpsdk.WithUpdateStatus(acpsdk.ToolCallStatusFailed))
+			acpsdk.WithUpdateStatus(acpsdk.ToolCallStatusFailed),
+			acpsdk.WithUpdateRawOutput(tc.RawOutput))
 	default:
-		update = acpsdk.StartToolCall(acpsdk.ToolCallId(tc.ID), tc.Title)
+		update = acpsdk.StartToolCall(acpsdk.ToolCallId(tc.ID), tc.Title,
+			acpsdk.WithStartStatus(acpsdk.ToolCallStatusInProgress),
+			acpsdk.WithStartRawInput(tc.RawInput))
 	}
 	return s.conn.SessionUpdate(context.Background(), acpsdk.SessionNotification{
 		Update: update,
@@ -333,6 +438,51 @@ func (s *agentSender) SendSessionInfo(title string, metadata map[string]any) err
 }
 
 // ── Helpers ──
+
+func sessionListCapPtr(ok bool) *acpsdk.SessionListCapabilities {
+	if !ok { return nil }
+	return &acpsdk.SessionListCapabilities{}
+}
+func sessionResumeCapPtr(ok bool) *acpsdk.SessionResumeCapabilities {
+	if !ok { return nil }
+	return &acpsdk.SessionResumeCapabilities{}
+}
+func sessionDeleteCapPtr(ok bool) *acpsdk.SessionDeleteCapabilities {
+	if !ok { return nil }
+	return &acpsdk.SessionDeleteCapabilities{}
+}
+func sessionCloseCapPtr(ok bool) *acpsdk.SessionCloseCapabilities {
+	if !ok { return nil }
+	return &acpsdk.SessionCloseCapabilities{}
+}
+
+// convertConfigOptions converts our ConfigOptions to the SDK type via JSON round-trip.
+func convertConfigOptions(opts []SessionConfigOption) []acpsdk.SessionConfigOption {
+	if len(opts) == 0 {
+		return nil
+	}
+	data, err := json.Marshal(opts)
+	if err != nil {
+		return nil
+	}
+	var sdk []acpsdk.SessionConfigOption
+	json.Unmarshal(data, &sdk)
+	return sdk
+}
+
+// convertModeState converts our SessionModeState to the SDK type via JSON round-trip.
+func convertModeState(m *SessionModeState) *acpsdk.SessionModeState {
+	if m == nil {
+		return nil
+	}
+	data, err := json.Marshal(m)
+	if err != nil {
+		return nil
+	}
+	var sdk acpsdk.SessionModeState
+	json.Unmarshal(data, &sdk)
+	return &sdk
+}
 
 func fromSDKMcpServer(m acpsdk.McpServer) McpServer {
 	ms := McpServer{}

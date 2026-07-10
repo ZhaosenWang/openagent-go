@@ -616,8 +616,8 @@ func (h *runnerHandler) OnToolCall(tc openacp.ToolCallEvent) {
 		})
 	}
 
-	// Emit tool result when the tool finishes.
-	if tc.Status == "completed" && tc.RawOutput != nil {
+	// Emit tool result when the tool finishes (completed or failed).
+	if (tc.Status == "completed" || tc.Status == "failed") && tc.RawOutput != nil {
 		resultMsg := openagent.Message{
 			Role:       openagent.RoleTool,
 			Content:    fmt.Sprintf("%v", tc.RawOutput),

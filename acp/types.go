@@ -31,14 +31,54 @@ type PromptResponse struct {
 // ── Session ──
 
 // NewSessionRequest configures a new ACP session.
+// See: https://agentclientprotocol.com/protocol/session-setup#creating-a-session
 type NewSessionRequest struct {
-	Cwd        string
-	McpServers []McpServer
+	Cwd                  string      // working directory (required)
+	McpServers           []McpServer // MCP servers the agent should connect to
+	AdditionalDirectories []string   // additional workspace roots
 }
 
 // NewSessionResponse is the result of creating a session.
 type NewSessionResponse struct {
-	SessionID string
+	SessionID     string                 // unique session identifier
+	ConfigOptions []SessionConfigOption  // initial config options (if supported)
+	Modes         *SessionModeState      // initial mode state (if supported)
+}
+
+// LoadSessionRequest requests resuming an existing ACP session.
+// See: https://agentclientprotocol.com/protocol/session-setup#loading-sessions
+type LoadSessionRequest struct {
+	SessionID             string      // session to resume (required)
+	Cwd                   string      // working directory (required)
+	McpServers            []McpServer // MCP servers to connect to
+	AdditionalDirectories []string    // additional workspace roots
+}
+
+// LoadSessionResponse is the result of loading an existing session.
+type LoadSessionResponse struct {
+	ConfigOptions []SessionConfigOption // session config options (if supported)
+	Modes         *SessionModeState     // session mode state (if supported)
+}
+
+// ListSessionsRequest requests the list of available sessions from the agent.
+type ListSessionsRequest struct {
+	Cursor *string // opaque cursor from previous response for pagination
+	Cwd    *string // filter sessions by working directory
+}
+
+// SessionInfo describes an available ACP session.
+type SessionInfo struct {
+	SessionID             string   // unique session identifier
+	Cwd                   string   // working directory
+	Title                 string   // human-readable title
+	UpdatedAt             string   // ISO 8601 timestamp of last activity
+	AdditionalDirectories []string // additional workspace roots
+}
+
+// ListSessionsResponse is the result of listing available sessions.
+type ListSessionsResponse struct {
+	NextCursor *string        // present if there are more results
+	Sessions   []SessionInfo
 }
 
 // McpServer describes an MCP server the agent should connect to.
@@ -50,13 +90,82 @@ type McpServer struct {
 	Args    []string // command arguments
 }
 
+// SessionConfigOption describes a configuration option presented to the user.
+// Type is "select" or "boolean"; for "select", Options is populated.
+type SessionConfigOption struct {
+	Type         string                   `json:"type"`
+	Name         string                   `json:"name,omitempty"`
+	Label        string                   `json:"label,omitempty"`
+	CurrentValue string                   `json:"currentValue,omitempty"`
+	Options      []SessionConfigOptValue  `json:"options,omitempty"`
+}
+
+// SessionConfigOptValue is a single option value in a select config.
+type SessionConfigOptValue struct {
+	Value string `json:"value"`
+	Label string `json:"label"`
+}
+
+// SessionModeState reports the agent's available modes and current mode.
+type SessionModeState struct {
+	AvailableModes []SessionMode // all modes the agent supports
+	CurrentModeID  string        // currently active mode ID
+}
+
+// SessionMode describes a single agent mode.
+type SessionMode struct {
+	ID          string // unique mode identifier
+	Name        string // human-readable name
+	Description string // optional description
+}
+
+// ── Capabilities ──
+
+// AgentCapabilities describes what the agent supports.
+// Reported by the agent during [InitializeResponse].
+type AgentCapabilities struct {
+	LoadSession         bool                // supports session/resume
+	McpCapabilities     McpCapabilities     // MCP transport support
+	PromptCapabilities  PromptCapabilities  // prompt features
+	SessionCapabilities SessionCapabilities // session methods
+}
+
+// McpCapabilities describes MCP transport methods the agent supports.
+type McpCapabilities struct {
+	Acp  bool // ACP-native transport
+	Http bool // StreamableHTTP transport
+	Sse  bool // SSE transport
+}
+
+// PromptCapabilities describes the prompt features an agent supports.
+type PromptCapabilities struct {
+	Image           bool // can process image inputs
+	Audio           bool // can process audio inputs
+	EmbeddedContext bool // can process embedded context blocks
+}
+
+// SessionCapabilities describes which session methods an agent supports.
+type SessionCapabilities struct {
+	List   bool // supports session/list
+	Delete bool // supports session/delete
+	Resume bool // supports session/resume
+	Close  bool // supports session/close
+}
+
+// ClientCapabilities describes what the client supports.
+// Reported by the client during [InitializeRequest].
+type ClientCapabilities struct {
+	Terminal bool // client supports terminal
+}
+
 // ── Initialize ──
 
 // InitializeRequest is the ACP handshake request.
 type InitializeRequest struct {
-	ProtocolVersion int
-	ClientName      string
-	ClientVersion   string
+	ProtocolVersion    int
+	ClientName         string
+	ClientVersion      string
+	ClientCapabilities ClientCapabilities
 }
 
 // InitializeResponse is the ACP handshake response.
@@ -64,6 +173,7 @@ type InitializeResponse struct {
 	ProtocolVersion int
 	AgentName       string
 	AgentVersion    string
+	Capabilities    AgentCapabilities
 }
 
 // ── Event handler ──

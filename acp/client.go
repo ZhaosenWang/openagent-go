@@ -1,8 +1,19 @@
+// Package acp provides an abstraction over the Agent Client Protocol (ACP).
+//
+// It defines openagent-go's own ACP types and a Client for connecting to
+// external ACP agent processes. The default implementation uses
+// coder/acp-go-sdk internally, but the interfaces are designed so that
+// alternative implementations can be plugged in.
+//
+// Import as:
+//
+//	openacp "github.com/yusheng-g/openagent-go/acp"
 package acp
 
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -107,6 +118,9 @@ func (s *Session) Initialize(ctx context.Context, req InitializeRequest) (*Initi
 		ClientInfo: &acpsdk.Implementation{
 			Name: req.ClientName, Version: req.ClientVersion,
 		},
+		ClientCapabilities: acpsdk.ClientCapabilities{
+			Terminal: req.ClientCapabilities.Terminal,
+		},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("acp initialize: %w", err)
@@ -123,6 +137,25 @@ func (s *Session) Initialize(ctx context.Context, req InitializeRequest) (*Initi
 		ProtocolVersion: int(resp.ProtocolVersion),
 		AgentName:       agentName,
 		AgentVersion:    agentVersion,
+		Capabilities: AgentCapabilities{
+			LoadSession: resp.AgentCapabilities.LoadSession,
+			McpCapabilities: McpCapabilities{
+				Acp:  resp.AgentCapabilities.McpCapabilities.Acp,
+				Http: resp.AgentCapabilities.McpCapabilities.Http,
+				Sse:  resp.AgentCapabilities.McpCapabilities.Sse,
+			},
+			PromptCapabilities: PromptCapabilities{
+				Image:           resp.AgentCapabilities.PromptCapabilities.Image,
+				Audio:           resp.AgentCapabilities.PromptCapabilities.Audio,
+				EmbeddedContext: resp.AgentCapabilities.PromptCapabilities.EmbeddedContext,
+			},
+			SessionCapabilities: SessionCapabilities{
+				List:   resp.AgentCapabilities.SessionCapabilities.List != nil,
+				Delete: resp.AgentCapabilities.SessionCapabilities.Delete != nil,
+				Resume: resp.AgentCapabilities.SessionCapabilities.Resume != nil,
+				Close:  resp.AgentCapabilities.SessionCapabilities.Close != nil,
+			},
+		},
 	}, nil
 }
 
@@ -150,7 +183,9 @@ func (s *Session) NewSession(ctx context.Context, req NewSessionRequest) (*NewSe
 	s.mu.Unlock()
 
 	return &NewSessionResponse{
-		SessionID: string(resp.SessionId),
+		SessionID:     string(resp.SessionId),
+		ConfigOptions: fromSDKConfigOptions(resp.ConfigOptions),
+		Modes:         fromSDKModeState(resp.Modes),
 	}, nil
 }
 
@@ -188,6 +223,17 @@ func (s *Session) Prompt(ctx context.Context, req PromptRequest) (*PromptRespons
 	}, nil
 }
 
+// DeleteSession permanently removes a session and all its data from the agent.
+func (s *Session) DeleteSession(ctx context.Context, sessionID string) error {
+	_, err := s.conn.UnstableDeleteSession(ctx, acpsdk.UnstableDeleteSessionRequest{
+		SessionId: acpsdk.SessionId(sessionID),
+	})
+	if err != nil {
+		return fmt.Errorf("acp delete session: %w", err)
+	}
+	return nil
+}
+
 // CloseSession closes the current ACP session.
 func (s *Session) CloseSession(ctx context.Context) error {
 	s.mu.Lock()
@@ -202,6 +248,64 @@ func (s *Session) CloseSession(ctx context.Context) error {
 		SessionId: acpsdk.SessionId(sid),
 	})
 	return err
+}
+
+// ListSessions returns the sessions available on the agent.
+func (s *Session) ListSessions(ctx context.Context, req ListSessionsRequest) (*ListSessionsResponse, error) {
+	resp, err := s.conn.ListSessions(ctx, acpsdk.ListSessionsRequest{
+		Cursor: req.Cursor,
+		Cwd:    req.Cwd,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("acp list sessions: %w", err)
+	}
+
+	sessions := make([]SessionInfo, len(resp.Sessions))
+	for i, info := range resp.Sessions {
+		title := ""
+		if info.Title != nil {
+			title = *info.Title
+		}
+		updatedAt := ""
+		if info.UpdatedAt != nil {
+			updatedAt = *info.UpdatedAt
+		}
+		sessions[i] = SessionInfo{
+			SessionID: string(info.SessionId),
+			Cwd:       info.Cwd,
+			Title:     title,
+			UpdatedAt: updatedAt,
+		}
+	}
+
+	return &ListSessionsResponse{
+		NextCursor: resp.NextCursor,
+		Sessions:   sessions,
+	}, nil
+}
+
+// LoadSession resumes an existing session on the agent.
+func (s *Session) LoadSession(ctx context.Context, req LoadSessionRequest) (*LoadSessionResponse, error) {
+	mcpServers := make([]acpsdk.McpServer, 0, len(req.McpServers))
+	for _, m := range req.McpServers {
+		mcpServers = append(mcpServers, toSDKMcpServer(m))
+	}
+
+	_, err := s.conn.ResumeSession(ctx, acpsdk.ResumeSessionRequest{
+		SessionId:            acpsdk.SessionId(req.SessionID),
+		Cwd:                  req.Cwd,
+		McpServers:           mcpServers,
+		AdditionalDirectories: req.AdditionalDirectories,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("acp load session: %w", err)
+	}
+
+	s.mu.Lock()
+	s.sessionID = req.SessionID
+	s.mu.Unlock()
+
+	return &LoadSessionResponse{}, nil
 }
 
 // Close terminates the ACP connection and cleans up the subprocess.
@@ -290,6 +394,31 @@ func (b *sessionBridge) SessionUpdate(ctx context.Context, params acpsdk.Session
 			Status:    status,
 			RawOutput: tc.RawOutput,
 		})
+
+	case update.ToolCallUpdate != nil:
+		tu := update.ToolCallUpdate
+		status := ""
+		if tu.Status != nil {
+			switch *tu.Status {
+			case acpsdk.ToolCallStatusCompleted:
+				status = "completed"
+			case acpsdk.ToolCallStatusInProgress:
+				status = "in_progress"
+			case acpsdk.ToolCallStatusFailed:
+				status = "failed"
+			}
+		}
+		title := ""
+		if tu.Title != nil {
+			title = *tu.Title
+		}
+		h.OnToolCall(ToolCallEvent{
+			ID:        string(tu.ToolCallId),
+			Title:     title,
+			RawInput:  tu.RawInput,
+			Status:    status,
+			RawOutput: tu.RawOutput,
+		})
 	}
 
 	return nil
@@ -327,6 +456,34 @@ func (b *sessionBridge) WaitForTerminalExit(ctx context.Context, params acpsdk.W
 }
 
 // ── Helpers ──
+
+// fromSDKConfigOptions converts SDK config options to our type via JSON round-trip.
+func fromSDKConfigOptions(opts []acpsdk.SessionConfigOption) []SessionConfigOption {
+	if len(opts) == 0 {
+		return nil
+	}
+	data, err := json.Marshal(opts)
+	if err != nil {
+		return nil
+	}
+	var ours []SessionConfigOption
+	json.Unmarshal(data, &ours)
+	return ours
+}
+
+// fromSDKModeState converts SDK mode state to our type via JSON round-trip.
+func fromSDKModeState(m *acpsdk.SessionModeState) *SessionModeState {
+	if m == nil {
+		return nil
+	}
+	data, err := json.Marshal(m)
+	if err != nil {
+		return nil
+	}
+	var ours SessionModeState
+	json.Unmarshal(data, &ours)
+	return &ours
+}
 
 func toSDKMcpServer(m McpServer) acpsdk.McpServer {
 	sdk := acpsdk.McpServer{}
