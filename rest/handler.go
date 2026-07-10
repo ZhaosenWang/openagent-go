@@ -69,8 +69,9 @@ func (h *Handler) Register(mux *http.ServeMux) {
 // Events are published to the Handler-level bus so that multiple
 // SSE connections (e.g. browser tabs) all receive the full stream.
 type sessionState struct {
-	info  SessionInfo
-	agent *openagent.Agent
+	info    SessionInfo
+	agent   *openagent.Agent
+	modelID string // session default model (empty = use agent's model)
 
 	mu              sync.Mutex
 	pendingApproval *pendingApproval
@@ -104,12 +105,13 @@ func (h *Handler) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		ID:        id,
 		Title:     req.Title,
 		AgentName: agentName,
+		ModelID:   req.ModelID,
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
 
 	h.mu.Lock()
-	h.sessions[id] = h.newSession(info)
+	h.sessions[id] = h.newSession(info, req.ModelID)
 	h.mu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
@@ -187,10 +189,18 @@ func (h *Handler) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	setSSEHeaders(w)
 
-	// Subscribe to the session's event bus. History is replayed automatically
-	// (empty on first message, useful for reconnecting tabs).
-	sub := h.bus.Subscribe(id)
+	// Subscribe to the session's event bus. Live-only — history is NOT
+	// replayed because this is a new chat, not a reconnection. Replaying
+	// old "done" events would cause the handler to return before the
+	// current chat's events arrive.
+	sub := h.bus.SubscribeLive(id)
 	defer h.bus.Unsubscribe(id, sub)
+
+	// Resolve model: chat-level override > session default.
+	modelID := body.ModelID
+	if modelID == "" {
+		modelID = s.modelID
+	}
 
 	// Start the agent run in a background goroutine.
 	go func() {
@@ -200,6 +210,7 @@ func (h *Handler) handleChat(w http.ResponseWriter, r *http.Request) {
 		oaSession := openagent.Session{
 			ID:        id,
 			AgentName: s.info.AgentName,
+			ModelID:   modelID,
 			CreatedAt: s.info.CreatedAt,
 		}
 
@@ -275,14 +286,15 @@ func (h *Handler) getOrCreateSession(id string) *sessionState {
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
 	}
-	s := h.newSession(info)
+	s := h.newSession(info, "")
 	h.sessions[id] = s
 	return s
 }
 
-func (h *Handler) newSession(info SessionInfo) *sessionState {
+func (h *Handler) newSession(info SessionInfo, modelID string) *sessionState {
 	s := &sessionState{
-		info: info,
+		info:    info,
+		modelID: modelID,
 	}
 
 	s.agent = openagent.NewAgent(info.AgentName,

@@ -30,6 +30,7 @@ import (
 	"path/filepath"
 
 	openagent "github.com/yusheng-g/openagent-go"
+	"github.com/yusheng-g/openagent-go/memory/sqlite"
 	"github.com/yusheng-g/openagent-go/model/openai"
 	"github.com/yusheng-g/openagent-go/rest"
 	"github.com/yusheng-g/openagent-go/sandbox/native"
@@ -45,6 +46,13 @@ func main() {
 	}
 
 	llm := openai.New(apiKey, modelID, baseURL).WithContextWindow(128_000)
+
+	// ── Memory ──
+	mem, err := sqlite.New("./rest-memory.db")
+	if err != nil {
+		log.Fatalf("memory: %v", err)
+	}
+	defer mem.Close()
 
 	// ── Sandbox + tools ──
 	workDir, _ := filepath.Abs(".")
@@ -65,6 +73,7 @@ func main() {
 	// ── Single agent ──
 	agent := openagent.NewAgent("assistant",
 		openagent.WithModel(llm),
+		openagent.WithMemory(mem),
 		openagent.WithInstructions("You are a capable assistant. Use shell, read, write, ls, and grep tools to explore, build, and edit the codebase. Be concise and action-oriented."),
 		openagent.WithTools(sandboxTools...),
 		openagent.WithMaxTurns(10),

@@ -30,6 +30,7 @@ type SessionInfo struct {
 	ID        string    `json:"id"`
 	Title     string    `json:"title,omitempty"`
 	AgentName string    `json:"agentName"`
+	ModelID   string    `json:"modelId,omitempty"`
 	CreatedAt time.Time `json:"createdAt"`
 	UpdatedAt time.Time `json:"updatedAt"`
 }
@@ -41,11 +42,15 @@ type SessionInfo struct {
 type CreateSessionRequest struct {
 	AgentName string `json:"agentName,omitempty"`
 	Title     string `json:"title,omitempty"`
+	ModelID   string `json:"modelId,omitempty"` // override model per session
 }
 
 // ChatRequest is the body for POST /sessions/{id}/chat.
+// Model overrides the session model for this single request (e.g. for
+// switching between gpt-4o and gpt-4 within the same conversation).
 type ChatRequest struct {
 	Message string `json:"message"`
+	ModelID string `json:"modelId,omitempty"` // override model for this turn
 }
 
 // ApproveRequest is the body for POST /sessions/{id}/approve.

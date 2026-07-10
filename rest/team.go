@@ -184,7 +184,7 @@ func (h *TeamHandler) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	setSSEHeaders(w)
 
-	sub := h.bus.Subscribe(id)
+	sub := h.bus.SubscribeLive(id)
 	defer h.bus.Unsubscribe(id, sub)
 
 	go func() {
