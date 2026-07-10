@@ -399,28 +399,20 @@ func (r *runner) prepareMemory(ctx context.Context, session Session) []Message {
 			break
 		}
 	}
-	if overflow > 0 {
-		overflow = SafeCompressionBoundary(msgs, overflow)
-		globalCutoff := globalOffset + overflow
-		_ = r.agent.Memory.Compact(ctx, session.ID, globalCutoff, msgs)
-	}
-
-	// ── Working set: trim to token budget ──
-	keep := len(msgs)
-	tokens = 0
-	for i := len(msgs) - 1; i >= 0; i-- {
-		tokens += countMessageTokens(session.ModelID, msgs[i])
-		if tokens > budget {
-			keep = SafeCompressionBoundary(msgs, i+1)
-			break
+	if overflow < len(msgs) {
+			overflow = SafeCompressionBoundary(msgs, overflow)
+			globalCutoff := globalOffset + overflow
+			_ = r.agent.Memory.Compact(ctx, session.ID, globalCutoff, msgs)
 		}
-	}
-	if keep >= len(msgs) {
-		return msgs
-	}
-	return msgs[keep:]
-}
 
+		// ── Working set: trim to token budget ──
+		// Re-use overflow from compaction pass — same token counting.
+		keep := overflow
+		if keep >= len(msgs) {
+			return msgs
+		}
+		return msgs[keep:]
+	}
 func (r *runner) buildPrompt(ctx context.Context, session Session, working []Message) []Message {
 	input := PromptInput{
 		AgentName:        r.agent.Name,
