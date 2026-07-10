@@ -140,7 +140,7 @@ func (m *Memory) Compact(ctx context.Context, sessionID string, throughIndex int
 
 	all := messages
 	var err error
-	if all == nil {
+	if all == nil || throughIndex > len(all) {
 		all, err = m.readAllLocked(ctx, sessionID)
 		if err != nil {
 			return err

@@ -252,7 +252,7 @@ func (m *Memory) Compact(ctx context.Context, sessionID string, throughIndex int
 
 	// Use pre-fetched messages if available, otherwise query.
 	var all []openagent.Message
-	if messages != nil {
+	if messages != nil && throughIndex <= len(messages) {
 		all = messages
 	} else {
 		var count int

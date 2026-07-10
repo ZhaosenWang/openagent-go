@@ -114,9 +114,7 @@ func (r *runner) run(ctx context.Context, session Session, prefix []Message, inp
 		// ── ① Build working message set on first turn ──
 		// Order: memory history → prefix (transient, not persisted) → input
 		if turn == 1 {
-			// Token-based compaction: compress overflow before fetching
-			// the working set. Compact() is explicit; Recent() is pure query.
-			r.compactIfNeeded(ctx, session)
+			// prepareMemory handles compaction + fetch in one call
 
 			mfStart := time.Now()
 			r.observe(ctx, StageMemoryFetch, "enter", nil, time.Time{}, nil)
@@ -124,7 +122,7 @@ func (r *runner) run(ctx context.Context, session Session, prefix []Message, inp
 			var history []Message
 			var compErr error
 			if r.agent.Memory != nil {
-				history = r.fetchMemory(ctx, session)
+				history = r.prepareMemory(ctx, session)
 				// The input was just appended to memory — strip it
 				// from history since we add it back after prefix.
 				if len(history) > 0 && history[len(history)-1].Role == RoleUser {
@@ -363,94 +361,64 @@ func (r *runner) workingTokenBudget() int {
 	return 20000
 }
 
-// compactIfNeeded triggers incremental compression when the working set
-// exceeds the token budget. It determines the cutoff point by counting
-// tokens backward from the most recent message, then adjusts to a safe
-// boundary (not cutting tool_call/tool_result pairs) before calling
-// Memory.Compact(). Messages are NEVER deleted.
-func (r *runner) compactIfNeeded(ctx context.Context, session Session) {
+// prepareMemory fetches the working message set, triggers token-based
+// compaction if needed, and trims to the token budget. It replaces the
+// previous compactIfNeeded + fetchMemory pair, eliminating a redundant
+// Recent() call. Messages are NEVER deleted — compaction only updates
+// the summary.
+func (r *runner) prepareMemory(ctx context.Context, session Session) []Message {
 	if r.agent.Memory == nil {
-		return
+		return nil
 	}
 
 	budget := r.workingTokenBudget()
 
-	// Fetch total count and recent messages for token counting.
+	// Fetch total count and recent messages — one Recent() call for both
+	// compaction and working-set trimming.
 	totalCount, err := r.agent.Memory.Count(ctx, session.ID)
 	if err != nil || totalCount == 0 {
-		return
+		return nil
 	}
-	// Fetch enough to cover the token budget. At ~4 token/chars with
-	// ~100 tokens/msg, 5000 messages > any practical context window.
 	fetchN := totalCount
 	if fetchN > 5000 {
 		fetchN = 5000
 	}
 	msgs, err := r.agent.Memory.Recent(ctx, session.ID, fetchN)
 	if err != nil || len(msgs) == 0 {
-		return
+		return nil
 	}
+	globalOffset := totalCount - len(msgs)
 
-	// Count tokens backward to find the working set boundary.
+	// ── Compaction pass: compress overflow messages ──
+	overflow := len(msgs)
 	tokens := 0
-	cutoff := len(msgs)
 	for i := len(msgs) - 1; i >= 0; i-- {
 		tokens += countMessageTokens(session.ModelID, msgs[i])
 		if tokens > budget {
-			cutoff = i + 1 // messages before this index are overflow
+			overflow = i + 1 // messages before this index overflow the budget
 			break
 		}
 	}
-
-	if cutoff == 0 {
-		return // nothing overflows
+	if overflow > 0 {
+		overflow = SafeCompressionBoundary(msgs, overflow)
+		globalCutoff := globalOffset + overflow
+		_ = r.agent.Memory.Compact(ctx, session.ID, globalCutoff, msgs)
 	}
 
-	// Ensure safe boundary (don't cut tool_call/tool_result pairs).
-	cutoff = SafeCompressionBoundary(msgs, cutoff)
-	if cutoff == 0 {
-		return
-	}
-
-	// Convert slice-relative cutoff to global throughIndex.
-	// msgs represents positions [totalCount - fetchN, totalCount) or
-	// [0, totalCount) if fetchN >= totalCount.
-	globalOffset := totalCount - len(msgs)
-	globalCutoff := globalOffset + cutoff
-
-	// Pass the full message set to Compact to avoid a redundant read.
-	// Compact reads from the backend only when msgs doesn't cover the full
-	// range up to throughIndex (we use Recent fetch for the full set when
-	// fetchN >= totalCount, which is the common case).
-	_ = r.agent.Memory.Compact(ctx, session.ID, globalCutoff, msgs)
-}
-
-func (r *runner) fetchMemory(ctx context.Context, session Session) []Message {
-	if r.agent.Memory == nil {
-		return nil
-	}
-	// Fetch generously, then trim by token budget.
-	// 5000 messages at ~100 tokens/msg covers any practical context window.
-	msgs, err := r.agent.Memory.Recent(ctx, session.ID, 5000)
-	if err != nil || len(msgs) == 0 {
-		return nil
-	}
-
-	budget := r.workingTokenBudget()
-	// Count tokens backward from most recent; trim when budget exceeded.
-	tokens := 0
+	// ── Working set: trim to token budget ──
+	keep := len(msgs)
+	tokens = 0
 	for i := len(msgs) - 1; i >= 0; i-- {
 		tokens += countMessageTokens(session.ModelID, msgs[i])
 		if tokens > budget {
-			// Trim at safe boundary to not break tool pairs.
-			cutoff := SafeCompressionBoundary(msgs, i+1)
-			if cutoff > i+1 && cutoff <= len(msgs) {
-				return msgs[cutoff:]
-			}
-			return msgs[i+1:]
+			keep = SafeCompressionBoundary(msgs, i+1)
+			break
 		}
 	}
-	return msgs
+	if keep >= len(msgs) {
+		return msgs
+	}
+	return msgs[keep:]
 }
 
 func (r *runner) buildPrompt(ctx context.Context, session Session, working []Message) []Message {

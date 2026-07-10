@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 
 	openaisdk "github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
@@ -314,38 +313,14 @@ func extractReasoning(raw string) string {
 	if raw == "" {
 		return ""
 	}
-	// Fast path: look for "reasoning_content":"..." in the raw JSON.
-	const key = `"reasoning_content":"`
-	idx := strings.Index(raw, key)
-	if idx < 0 {
+	var delta struct {
+		ReasoningContent *string `json:"reasoning_content"`
+	}
+	if err := json.Unmarshal([]byte(raw), &delta); err != nil {
 		return ""
 	}
-	start := idx + len(key)
-	// Scan until the closing unescaped quote.
-	var buf strings.Builder
-	for i := start; i < len(raw); i++ {
-		if raw[i] == '\\' && i+1 < len(raw) {
-			switch raw[i+1] {
-			case '"':
-				buf.WriteByte('"')
-				i++
-			case 'n':
-				buf.WriteByte('\n')
-				i++
-			case 't':
-				buf.WriteByte('\t')
-				i++
-			case '\\':
-				buf.WriteByte('\\')
-				i++
-			default:
-				buf.WriteByte(raw[i])
-			}
-		} else if raw[i] == '"' {
-			break
-		} else {
-			buf.WriteByte(raw[i])
-		}
+	if delta.ReasoningContent != nil && *delta.ReasoningContent != "" {
+		return *delta.ReasoningContent
 	}
-	return buf.String()
+	return ""
 }
