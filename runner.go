@@ -120,9 +120,10 @@ func (r *runner) run(ctx context.Context, session Session, prefix []Message, inp
 			r.observe(ctx, StageMemoryFetch, "enter", nil, time.Time{}, nil)
 
 			var history []Message
-			var compErr error
+			var compressedErr error // fetching Compressed() context (Layer 2)
+			var compactErr error    // writing compaction (Compact())
 			if r.agent.Memory != nil {
-				history = r.prepareMemory(ctx, session)
+				history, compactErr = r.prepareMemory(ctx, session)
 				// The input was just appended to memory — strip it
 				// from history since we add it back after prefix.
 				if len(history) > 0 && history[len(history)-1].Role == RoleUser {
@@ -133,11 +134,11 @@ func (r *runner) run(ctx context.Context, session Session, prefix []Message, inp
 				// Fetch compressed context (Layer 2 of the memory model).
 				// Errors are collected and reported in the leave event below —
 				// compressed context is an optimization, not a requirement.
-				comp, err := r.agent.Memory.Compressed(ctx, session.ID)
+				cc, err := r.agent.Memory.Compressed(ctx, session.ID)
 				if err == nil {
-					r.compressed = comp
+					r.compressed = cc
 				} else {
-					compErr = err
+					compressedErr = err
 				}
 			}
 
@@ -147,11 +148,13 @@ func (r *runner) run(ctx context.Context, session Session, prefix []Message, inp
 			workingMessages = append(workingMessages, input)
 
 			mfDetail := map[string]any{}
-			if compErr != nil {
-				mfDetail["warning"] = "compressed context unavailable"
-				mfDetail["error"] = compErr.Error()
+			if compressedErr != nil {
+				mfDetail["compressed_error"] = compressedErr.Error()
 			}
-			r.observe(ctx, StageMemoryFetch, "leave", mfDetail, mfStart, compErr)
+			if compactErr != nil {
+				mfDetail["compaction_error"] = compactErr.Error()
+			}
+			r.observe(ctx, StageMemoryFetch, "leave", mfDetail, mfStart, nil)
 
 			// ── ③ Guard.in: input check with full history (memory + prefix + input) ──
 			giStart := time.Now()
@@ -389,12 +392,16 @@ func (r *runner) workingTokenBudget() int {
 // previous compactIfNeeded + fetchMemory pair, eliminating a redundant
 // Recent() call. Messages are NEVER deleted — compaction only updates
 // the summary.
-func (r *runner) prepareMemory(ctx context.Context, session Session) []Message {
+//
+// The returned error carries a compaction failure if one occurred
+// (observability only; the working set is still usable).
+func (r *runner) prepareMemory(ctx context.Context, session Session) ([]Message, error) {
 	if r.agent.Memory == nil {
-		return nil
+		return nil, nil
 	}
 
 	budget := r.workingTokenBudget()
+	var compactErr error
 
 	// Fetch total count and recent messages — one Recent() call for both
 	// compaction and working-set trimming.
@@ -402,10 +409,10 @@ func (r *runner) prepareMemory(ctx context.Context, session Session) []Message {
 	if err != nil {
 		r.observe(ctx, StageMemoryFetch, "leave",
 			map[string]any{"error": err.Error()}, time.Now(), err)
-		return nil
+		return nil, nil
 	}
 	if totalCount == 0 {
-		return nil
+		return nil, nil
 	}
 	fetchN := totalCount
 	if fetchN > 5000 {
@@ -413,7 +420,7 @@ func (r *runner) prepareMemory(ctx context.Context, session Session) []Message {
 	}
 	msgs, err := r.agent.Memory.Recent(ctx, session.ID, fetchN)
 	if err != nil || len(msgs) == 0 {
-		return nil
+		return nil, nil
 	}
 	globalOffset := totalCount - len(msgs)
 
@@ -430,16 +437,16 @@ func (r *runner) prepareMemory(ctx context.Context, session Session) []Message {
 	if overflow < len(msgs) {
 			overflow = SafeCompressionBoundary(msgs, overflow)
 			globalCutoff := globalOffset + overflow
-			_ = r.agent.Memory.Compact(ctx, session.ID, globalCutoff, msgs)
+			compactErr = r.agent.Memory.Compact(ctx, session.ID, globalCutoff, msgs)
 		}
 
 		// ── Working set: trim to token budget ──
 		// Re-use overflow from compaction pass — same token counting.
 		keep := overflow
 		if keep >= len(msgs) {
-			return msgs
+			return msgs, compactErr
 		}
-		return msgs[keep:]
+		return msgs[keep:], compactErr
 	}
 func (r *runner) buildPrompt(ctx context.Context, session Session, working []Message) []Message {
 	input := PromptInput{

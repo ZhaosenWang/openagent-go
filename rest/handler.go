@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"log"
 	"net/http"
 	"sync"
 	"time"
@@ -31,10 +32,14 @@ type Handler struct {
 	name         string
 	maxTurns     int
 
+	sessionIdleTTL time.Duration // 0 = sessions never expire
+
 	bus *eventbus.Bus[SSEEvent]
 
 	mu       sync.RWMutex
 	sessions map[string]*sessionState
+
+	reapOnce sync.Once
 }
 
 // NewHandler creates a Handler from a configured Agent.
@@ -63,15 +68,27 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /sessions/{id}/approve", h.handleApprove)
 }
 
+// WithSessionTTL sets the idle duration after which inactive sessions are
+// removed from memory. The messages themselves are not deleted — only the
+// in-memory agent runtime state is released. A client reconnecting with the
+// same session ID triggers a transparent rebuild from persistent Memory.
+//
+// 0 (the default) disables TTL — sessions never expire.
+func (h *Handler) WithSessionTTL(idle time.Duration) *Handler {
+	h.sessionIdleTTL = idle
+	return h
+}
+
 // ── sessionState ──
 
 // sessionState holds the per-session runtime state.
 // Events are published to the Handler-level bus so that multiple
 // SSE connections (e.g. browser tabs) all receive the full stream.
 type sessionState struct {
-	info    SessionInfo
-	agent   *openagent.Agent
-	modelID string // session default model (empty = use agent's model)
+	info       SessionInfo
+	agent      *openagent.Agent
+	modelID    string // session default model (empty = use agent's model)
+	lastAccess time.Time
 
 	mu              sync.Mutex
 	pendingApproval *pendingApproval
@@ -289,6 +306,7 @@ func (h *Handler) getOrCreateSession(id string) *sessionState {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if s, ok := h.sessions[id]; ok {
+		s.lastAccess = time.Now()
 		return s
 	}
 	info := SessionInfo{
@@ -298,7 +316,9 @@ func (h *Handler) getOrCreateSession(id string) *sessionState {
 		UpdatedAt: time.Now(),
 	}
 	s := h.newSession(info, "")
+	s.lastAccess = time.Now()
 	h.sessions[id] = s
+	h.maybeStartReaper()
 	return s
 }
 
@@ -465,8 +485,72 @@ func (o *stageObserver) ObserveStage(ctx context.Context, evt openagent.StageEve
 	if evt.Err != nil {
 		sd.Err = evt.Err.Error()
 	}
-	b, _ := json.Marshal(sd)
+	b, err := json.Marshal(sd)
+	if err != nil {
+		o.bus.Publish(o.sid, SSEEvent{Type: "error", Text: "stage marshal failed: " + err.Error()})
+		return
+	}
 	o.bus.Publish(o.sid, SSEEvent{Type: "stage", Stage: b})
 }
 
 var _ openagent.RunObserver = (*stageObserver)(nil)
+
+// ── Session TTL ──
+
+// maybeStartReaper lazily starts a background goroutine that reclaims
+// idle sessionState entries. It's a no-op when sessionIdleTTL is 0.
+func (h *Handler) maybeStartReaper() {
+	if h.sessionIdleTTL <= 0 {
+		return
+	}
+	h.reapOnce.Do(func() {
+		go h.reapLoop()
+	})
+}
+
+func (h *Handler) reapLoop() {
+	const interval = 1 * time.Minute
+	for {
+		time.Sleep(interval)
+		h.reap()
+	}
+}
+
+func (h *Handler) reap() {
+	now := time.Now()
+
+	// Phase 1: collect expired IDs under read lock.
+	h.mu.RLock()
+	var expired []string
+	for id, s := range h.sessions {
+		if now.Sub(s.lastAccess) > h.sessionIdleTTL {
+			expired = append(expired, id)
+		}
+	}
+	h.mu.RUnlock()
+
+	if len(expired) == 0 {
+		return
+	}
+
+	// Phase 2: under write lock, re-verify lastAccess to prevent
+	// TOCTOU races with getOrCreateSession.
+	h.mu.Lock()
+	reaped := 0
+	for _, id := range expired {
+		s, ok := h.sessions[id]
+		if !ok {
+			continue
+		}
+		if now.Sub(s.lastAccess) < h.sessionIdleTTL {
+			continue // refreshed between RLock→Lock
+		}
+		delete(h.sessions, id)
+		reaped++
+	}
+	h.mu.Unlock()
+
+	if reaped > 0 {
+		log.Printf("rest: reaped %d idle sessions", reaped)
+	}
+}

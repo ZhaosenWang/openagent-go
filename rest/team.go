@@ -3,6 +3,7 @@ package rest
 import (
 	"context"
 	"encoding/json"
+	"log"
 	"net/http"
 	"sync"
 	"time"
@@ -28,10 +29,14 @@ type TeamHandler struct {
 	memory openagent.Memory
 	model  openagent.Model // from first template, used by dynamically added agents
 
+	sessionIdleTTL time.Duration // 0 = sessions never expire
+
 	bus *eventbus.Bus[SSEEvent]
 
 	mu       sync.RWMutex
 	sessions map[string]*teamSessionState
+
+	reapOnce sync.Once
 }
 
 // TeamAgentTemplate describes an agent to include in every new team session.
@@ -70,13 +75,25 @@ func (h *TeamHandler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /team/sessions/{id}/agents", h.handleRemoveAgent)
 }
 
+// WithSessionTTL sets the idle duration after which inactive sessions are
+// removed from memory. Per-agent private memory partitions are also cleaned up.
+// Team-shared messages are not deleted — only the in-memory runtime state
+// and agent-private partitions are released.
+//
+// 0 (the default) disables TTL — sessions never expire.
+func (h *TeamHandler) WithSessionTTL(idle time.Duration) *TeamHandler {
+	h.sessionIdleTTL = idle
+	return h
+}
+
 // ── teamSessionState ──
 
 type teamSessionState struct {
-	info      SessionInfo
-	team      *openagent.Team
-	agentList []agentInfo
-	agentMems []*teamAgentMemory // per-agent memory wrappers for cleanup
+	info       SessionInfo
+	team       *openagent.Team
+	agentList  []agentInfo
+	agentMems  []*teamAgentMemory // per-agent memory wrappers for cleanup
+	lastAccess time.Time
 
 	mu              sync.Mutex
 	pendingApproval *pendingApproval
@@ -415,6 +432,7 @@ func (h *TeamHandler) getOrCreateSession(id string) *teamSessionState {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if s, ok := h.sessions[id]; ok {
+		s.lastAccess = time.Now()
 		return s
 	}
 	info := SessionInfo{
@@ -424,7 +442,9 @@ func (h *TeamHandler) getOrCreateSession(id string) *teamSessionState {
 		UpdatedAt: time.Now(),
 	}
 	s := h.newSession(info)
+	s.lastAccess = time.Now()
 	h.sessions[id] = s
+	h.maybeStartReaper()
 	return s
 }
 
@@ -568,5 +588,82 @@ func teamEventToSSE(evt openagent.TeamEvent) SSEEvent {
 
 	default:
 		return SSEEvent{}
+	}
+}
+
+// ── Session TTL ──
+
+// maybeStartReaper lazily starts a background goroutine that reclaims
+// idle teamSessionState entries. It also cleans up per-agent private
+// memory partitions (teamAgentMemory) so SQLite keys like
+// sessionID::analyst don't leak. Team-shared messages are not deleted.
+func (h *TeamHandler) maybeStartReaper() {
+	if h.sessionIdleTTL <= 0 {
+		return
+	}
+	h.reapOnce.Do(func() {
+		go h.reapLoop()
+	})
+}
+
+func (h *TeamHandler) reapLoop() {
+	const interval = 1 * time.Minute
+	for {
+		time.Sleep(interval)
+		h.reap()
+	}
+}
+
+func (h *TeamHandler) reap() {
+	now := time.Now()
+
+	// Phase 1: collect expired IDs and their agentMems under read lock.
+	h.mu.RLock()
+	type toReap struct {
+		id        string
+		agentMems []*teamAgentMemory
+	}
+	var expired []toReap
+	for id, s := range h.sessions {
+		if now.Sub(s.lastAccess) > h.sessionIdleTTL {
+			// Copy agentMems slice so we can use it after RUnlock.
+			mems := make([]*teamAgentMemory, len(s.agentMems))
+			copy(mems, s.agentMems)
+			expired = append(expired, toReap{id: id, agentMems: mems})
+		}
+	}
+	h.mu.RUnlock()
+
+	if len(expired) == 0 {
+		return
+	}
+
+	// Phase 2: under write lock, re-verify lastAccess (TOCTOU guard).
+	h.mu.Lock()
+	var confirmed []toReap
+	for _, e := range expired {
+		s, ok := h.sessions[e.id]
+		if !ok {
+			continue
+		}
+		if now.Sub(s.lastAccess) < h.sessionIdleTTL {
+			continue // refreshed between RLock→Lock
+		}
+		delete(h.sessions, e.id)
+		confirmed = append(confirmed, e)
+	}
+	h.mu.Unlock()
+
+	// Phase 3: I/O outside the lock — clean up agent-private memory partitions.
+	for _, e := range confirmed {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		for _, tam := range e.agentMems {
+			_ = tam.DeleteSession(ctx, e.id)
+		}
+		cancel()
+	}
+
+	if len(confirmed) > 0 {
+		log.Printf("team: reaped %d idle sessions", len(confirmed))
 	}
 }

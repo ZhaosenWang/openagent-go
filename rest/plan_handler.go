@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"sync"
 	"time"
@@ -37,10 +38,14 @@ type PlanHandler struct {
 	model  openagent.Model
 	memory openagent.Memory
 
+	sessionIdleTTL time.Duration // 0 = sessions never expire
+
 	bus *eventbus.Bus[SSEEvent]
 
 	mu       sync.RWMutex
 	sessions map[string]*planSessionState
+
+	reapOnce sync.Once
 }
 
 // planSessionState holds per-session data for a plan workflow.
@@ -48,6 +53,7 @@ type planSessionState struct {
 	info       SessionInfo
 	plan       *plan.Plan
 	currentDef *plan.PlanDef // nil until generated
+	lastAccess time.Time
 
 	mu              sync.Mutex
 	pendingApproval *pendingApproval
@@ -88,6 +94,17 @@ func (h *PlanHandler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /plan/sessions/{id}/steps/{stepID}/retry", h.handleStepRetry)
 	mux.HandleFunc("POST /plan/sessions/{id}/replan", h.handleReplan)
 	mux.HandleFunc("POST /plan/sessions/{id}/approve", h.handleApprove)
+}
+
+// WithSessionTTL sets the idle duration after which inactive sessions are
+// removed from memory. Messages are not deleted — only the in-memory plan
+// state is released. Reconnecting with the same session ID triggers a
+// transparent rebuild from persistent Memory.
+//
+// 0 (the default) disables TTL — sessions never expire.
+func (h *PlanHandler) WithSessionTTL(idle time.Duration) *PlanHandler {
+	h.sessionIdleTTL = idle
+	return h
 }
 
 // ── Session CRUD ──
@@ -297,8 +314,8 @@ func (h *PlanHandler) handleUpdatePlan(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
-	// Enforce max steps (same as generate-time check).
-	maxSteps := 20
+	// Enforce max steps (same as plan.DefaultPlanConfig().MaxSteps).
+	maxSteps := plan.DefaultPlanConfig().MaxSteps
 	if len(def.Steps) > maxSteps {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
@@ -675,6 +692,7 @@ func (h *PlanHandler) getOrCreateSession(id string) *planSessionState {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if s, ok := h.sessions[id]; ok {
+		s.lastAccess = time.Now()
 		return s
 	}
 	info := SessionInfo{
@@ -684,7 +702,9 @@ func (h *PlanHandler) getOrCreateSession(id string) *planSessionState {
 		UpdatedAt: time.Now(),
 	}
 	s := h.newSession(info)
+	s.lastAccess = time.Now()
 	h.sessions[id] = s
+	h.maybeStartReaper()
 	return s
 }
 
@@ -816,5 +836,65 @@ func planEventToSSE(evt plan.PlanEvent) SSEEvent {
 
 	default:
 		return SSEEvent{}
+	}
+}
+
+// ── Session TTL ──
+
+// maybeStartReaper lazily starts a background goroutine that reclaims
+// idle planSessionState entries. It's a no-op when sessionIdleTTL is 0.
+func (h *PlanHandler) maybeStartReaper() {
+	if h.sessionIdleTTL <= 0 {
+		return
+	}
+	h.reapOnce.Do(func() {
+		go h.reapLoop()
+	})
+}
+
+func (h *PlanHandler) reapLoop() {
+	const interval = 1 * time.Minute
+	for {
+		time.Sleep(interval)
+		h.reap()
+	}
+}
+
+func (h *PlanHandler) reap() {
+	now := time.Now()
+
+	// Phase 1: collect expired IDs under read lock.
+	h.mu.RLock()
+	var expired []string
+	for id, s := range h.sessions {
+		if now.Sub(s.lastAccess) > h.sessionIdleTTL {
+			expired = append(expired, id)
+		}
+	}
+	h.mu.RUnlock()
+
+	if len(expired) == 0 {
+		return
+	}
+
+	// Phase 2: under write lock, re-verify lastAccess to prevent
+	// TOCTOU races with getOrCreateSession.
+	h.mu.Lock()
+	reaped := 0
+	for _, id := range expired {
+		s, ok := h.sessions[id]
+		if !ok {
+			continue
+		}
+		if now.Sub(s.lastAccess) < h.sessionIdleTTL {
+			continue // refreshed between RLock→Lock
+		}
+		delete(h.sessions, id)
+		reaped++
+	}
+	h.mu.Unlock()
+
+	if reaped > 0 {
+		log.Printf("plan: reaped %d idle sessions", reaped)
 	}
 }

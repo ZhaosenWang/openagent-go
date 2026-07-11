@@ -313,7 +313,14 @@ func (e *executor) executeStep(ctx context.Context, stepID string, state *PlanSt
 		// Generate summary.
 		summary, sumErr := e.summarize(ctx, step, result.FinalOutput)
 		if sumErr != nil {
-			// Non-fatal: fall back to truncated output.
+			// Non-fatal: emit a warning then fall back to truncated output.
+			if eventCh != nil {
+				eventCh <- PlanEvent{
+					Type:   PlanEventTextDelta,
+					StepID: stepID,
+					Text:   fmt.Sprintf("[warning: summarization failed (%v), using truncated output]", sumErr),
+				}
+			}
 			summary = truncateStr(result.FinalOutput, 500)
 		}
 
