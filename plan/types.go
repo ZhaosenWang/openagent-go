@@ -46,11 +46,11 @@ const (
 
 // StepDef defines one step in a plan DAG.
 type StepDef struct {
-	ID         string   `json:"id"`                   // unique within the plan
-	Agent      string   `json:"agent"`                // agent name (must exist in the plan's agent set)
-	Task       string   `json:"task"`                 // what this step should accomplish
-	DependsOn  []string `json:"depends_on,omitempty"` // step IDs this step depends on
-	Final      bool     `json:"final,omitempty"`      // true if this step's output is the plan's final answer
+	ID         string   `json:"id"`                    // unique within the plan
+	Agent      string   `json:"agent"`                 // agent name (must exist in the plan's agent set)
+	Task       string   `json:"task"`                  // what this step should accomplish
+	DependsOn  []string `json:"depends_on,omitempty"`  // step IDs this step depends on
+	Final      bool     `json:"final,omitempty"`       // true if this step's output is the plan's final answer
 	MaxRetries int      `json:"max_retries,omitempty"` // per-step retry limit (0 = use plan default of 3)
 }
 
@@ -65,13 +65,14 @@ type PlanDef struct {
 
 // StepResult holds the outcome of executing one step.
 type StepResult struct {
-	Status      StepStatus `json:"status"`
-	Summary     string     `json:"summary"`               // LLM-generated concise summary
-	FinalOutput string     `json:"final_output"`          // raw agent output (may be truncated)
-	Error       string     `json:"error,omitempty"`       // error message if failed
-	Retries     int        `json:"retries"`               // actual retry count
-	StartTime   time.Time  `json:"start_time"`
-	EndTime     time.Time  `json:"end_time"`
+	Status      StepStatus      `json:"status"`
+	Summary     string          `json:"summary"`         // LLM-generated concise summary
+	FinalOutput string          `json:"final_output"`    // raw agent output (may be truncated)
+	Error       string          `json:"error,omitempty"` // error message if failed
+	Retries     int             `json:"retries"`         // actual retry count
+	Usage       openagent.Usage `json:"usage"`           // token usage from this step
+	StartTime   time.Time       `json:"start_time"`
+	EndTime     time.Time       `json:"end_time"`
 }
 
 // PlanState is the runtime state of a plan execution.
@@ -90,11 +91,11 @@ type PlanState struct {
 
 // PlanResult is the final output of a plan execution.
 type PlanResult struct {
-	Goal        string           `json:"goal"`
-	FinalOutput string           `json:"final_output"`
-	Steps       []StepResult     `json:"steps"` // in execution order
-	Usage       openagent.Usage  `json:"usage"`
-	ReplanCount int              `json:"replan_count"`
+	Goal        string          `json:"goal"`
+	FinalOutput string          `json:"final_output"`
+	Steps       []StepResult    `json:"steps"` // in execution order
+	Usage       openagent.Usage `json:"usage"`
+	ReplanCount int             `json:"replan_count"`
 }
 
 // ── Step context (data passed between steps) ──
@@ -166,19 +167,19 @@ func DefaultPlanConfig() PlanConfig {
 type PlanEventType string
 
 const (
-	PlanEventGenerated  PlanEventType = "plan_generated"  // Planner produced a PlanDef
-	PlanEventApproved   PlanEventType = "plan_approved"   // user approved the plan
-	PlanEventStepStart  PlanEventType = "step_start"      // step began execution
-	PlanEventTextDelta  PlanEventType = "step_text_delta" // text token from a running step
+	PlanEventGenerated    PlanEventType = "plan_generated"     // Planner produced a PlanDef
+	PlanEventApproved     PlanEventType = "plan_approved"      // user approved the plan
+	PlanEventStepStart    PlanEventType = "step_start"         // step began execution
+	PlanEventTextDelta    PlanEventType = "step_text_delta"    // text token from a running step
 	PlanEventToolCall     PlanEventType = "step_tool_call"     // tool call from a step
 	PlanEventToolProgress PlanEventType = "step_tool_progress" // streaming tool output chunk
 	PlanEventToolResult   PlanEventType = "step_tool_result"   // tool result (final)
-	PlanEventStepDone   PlanEventType = "step_done"       // step completed successfully
-	PlanEventStepFailed PlanEventType = "step_failed"     // step failed
-	PlanEventReplanning    PlanEventType = "replanning"       // replan in progress
+	PlanEventStepDone     PlanEventType = "step_done"          // step completed successfully
+	PlanEventStepFailed   PlanEventType = "step_failed"        // step failed
+	PlanEventReplanning   PlanEventType = "replanning"         // replan in progress
 	PlanEventWaitingRetry PlanEventType = "plan_waiting_retry" // paused, waiting for manual retry/replan
-	PlanEventDone          PlanEventType = "plan_done"        // plan execution complete
-	PlanEventError         PlanEventType = "plan_error"       // fatal error
+	PlanEventDone         PlanEventType = "plan_done"          // plan execution complete
+	PlanEventError        PlanEventType = "plan_error"         // fatal error
 )
 
 // PlanEvent is emitted during plan execution for streaming progress.
@@ -186,12 +187,12 @@ type PlanEvent struct {
 	Type    PlanEventType `json:"type"`
 	StepID  string        `json:"step_id,omitempty"`
 	Agent   string        `json:"agent,omitempty"`
-	Text    string        `json:"text,omitempty"`    // text_delta, tool_result content, plan_done summary
-	Result  *StepResult   `json:"result,omitempty"`  // step_done, step_failed
-	Goal    string        `json:"goal,omitempty"`    // plan_generated
-	Def     *PlanDef      `json:"def,omitempty"`     // plan_generated
-	ErrText string        `json:"error,omitempty"`   // plan_error, step_failed, waiting_retry
-	Error   error         `json:"-"`                 // internal, not serialised
+	Text    string        `json:"text,omitempty"`   // text_delta, tool_result content, plan_done summary
+	Result  *StepResult   `json:"result,omitempty"` // step_done, step_failed
+	Goal    string        `json:"goal,omitempty"`   // plan_generated
+	Def     *PlanDef      `json:"def,omitempty"`    // plan_generated
+	ErrText string        `json:"error,omitempty"`  // plan_error, step_failed, waiting_retry
+	Error   error         `json:"-"`                // internal, not serialised
 
 	// Tool call detail (PlanEventToolCall).
 	ToolName string `json:"tool_name,omitempty"` // function name

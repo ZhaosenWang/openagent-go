@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -279,6 +280,10 @@ func (a *Agent) AsTool() Tool {
 	return &agentTool{agent: a}
 }
 
+// globalAgentSeq is a monotonically increasing counter used to
+// prevent session ID collisions in agentTool.Execute.
+var globalAgentSeq atomic.Int64
+
 // agentTool wraps an Agent as a Tool for parallel delegation.
 type agentTool struct {
 	agent *Agent
@@ -321,7 +326,7 @@ func (t *agentTool) Execute(ctx context.Context, args json.RawMessage) (string, 
 
 	// New session — fully isolated from the coordinator.
 	session := Session{
-		ID:        fmt.Sprintf("%s-%d", t.agent.Name, time.Now().UnixNano()),
+		ID:        fmt.Sprintf("%s-%d-%d", t.agent.Name, time.Now().UnixNano(), globalAgentSeq.Add(1)),
 		AgentName: t.agent.Name,
 		CreatedAt: time.Now(),
 	}

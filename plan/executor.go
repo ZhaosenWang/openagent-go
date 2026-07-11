@@ -8,15 +8,16 @@ import (
 	"time"
 
 	openagent "github.com/yusheng-g/openagent-go"
+	"golang.org/x/sync/errgroup"
 )
 
 // executor runs a PlanDef to completion.
 type executor struct {
-	config          PlanConfig
-	agents          map[string]openagent.AgentRunner
-	agentInfos      []openagent.AgentInfo
-	model           openagent.Model // for summarisation
-	sessionID       string          // base session id for step isolation
+	config     PlanConfig
+	agents     map[string]openagent.AgentRunner
+	agentInfos []openagent.AgentInfo
+	model      openagent.Model // for summarisation
+	sessionID  string          // base session id for step isolation
 }
 
 // ── Entry point ──
@@ -60,15 +61,15 @@ func (e *executor) execute(ctx context.Context, def *PlanDef, state *PlanState, 
 		}
 
 		// Execute batches.
-		result, err := e.executeBatches(ctx, def, state, finalSteps, eventCh)
+		batchResult, err := e.executeBatches(ctx, def, state, finalSteps, &totalUsage, eventCh)
 		if err != nil {
 			state.Status = PlanStatusFailed
 			return nil, err
 		}
-		if result != nil {
-			totalUsage.PromptTokens += result.Usage.PromptTokens
-			totalUsage.CompletionTokens += result.Usage.CompletionTokens
-			totalUsage.TotalTokens += result.Usage.TotalTokens
+		if batchResult != nil {
+			totalUsage.PromptTokens = batchResult.Usage.PromptTokens
+			totalUsage.CompletionTokens = batchResult.Usage.CompletionTokens
+			totalUsage.TotalTokens = batchResult.Usage.TotalTokens
 		}
 
 		// Check for failures.
@@ -77,11 +78,11 @@ func (e *executor) execute(ctx context.Context, def *PlanDef, state *PlanState, 
 			// All done.
 			state.Status = PlanStatusDone
 			state.UpdatedAt = time.Now()
-			result := e.buildResult(def, state, totalUsage)
+			finalResult := e.buildResult(def, state, totalUsage)
 			if eventCh != nil {
-				eventCh <- PlanEvent{Type: PlanEventDone, Text: result.FinalOutput}
+				eventCh <- PlanEvent{Type: PlanEventDone, Text: finalResult.FinalOutput}
 			}
-			return result, nil
+			return finalResult, nil
 		}
 
 		// If auto-replan is disabled, pause for manual intervention.
@@ -128,7 +129,7 @@ func (e *executor) execute(ctx context.Context, def *PlanDef, state *PlanState, 
 
 // ── Batch execution ──
 
-func (e *executor) executeBatches(ctx context.Context, def *PlanDef, state *PlanState, finalSteps map[string]bool, eventCh chan<- PlanEvent) (*PlanResult, error) {
+func (e *executor) executeBatches(ctx context.Context, def *PlanDef, state *PlanState, finalSteps map[string]bool, totalUsage *openagent.Usage, eventCh chan<- PlanEvent) (*PlanResult, error) {
 	// Build adjacency and in-degree for remaining (pending) steps.
 	pending := make(map[string]StepDef)
 	for _, s := range def.Steps {
@@ -153,81 +154,72 @@ func (e *executor) executeBatches(ctx context.Context, def *PlanDef, state *Plan
 		}
 
 		// Run batch in parallel.
-		batchResult, err := e.runBatch(ctx, batch, state, eventCh)
+		batchUsage, batchFailed, err := e.runBatch(ctx, batch, state, eventCh)
 		if err != nil {
 			return nil, err
 		}
-		if batchResult != nil {
-			// A step failed — stop batch execution, return result so caller can replan.
-			return batchResult, nil
+		totalUsage.PromptTokens += batchUsage.PromptTokens
+		totalUsage.CompletionTokens += batchUsage.CompletionTokens
+		totalUsage.TotalTokens += batchUsage.TotalTokens
+		if batchFailed {
+			// A step failed — stop batch execution, let caller check and replan.
+			return &PlanResult{Usage: *totalUsage}, nil
 		}
 	}
 
 	return nil, nil
 }
 
-// runBatch executes a single topological batch concurrently.
-// Returns a result with usage if a step failed (to trigger replan);
-// returns nil, nil if all steps succeeded.
-// When one step fails, all other in-progress steps in the batch are cancelled
-// via context to avoid wasting tokens.
-func (e *executor) runBatch(ctx context.Context, batch []string, state *PlanState, eventCh chan<- PlanEvent) (*PlanResult, error) {
+// runBatch executes a single topological batch concurrently via errgroup.
+// Returns accumulated usage from all steps in the batch, a failed flag,
+// and an error (only for context cancellation, never for step failures).
+// When one step fails, errgroup cancels the derived context so sibling
+// goroutines check gCtx.Err() and exit early — no manual TOCTOU flags.
+func (e *executor) runBatch(ctx context.Context, batch []string, state *PlanState, eventCh chan<- PlanEvent) (openagent.Usage, bool, error) {
 	concurrency := e.config.MaxConcurrency
 	if concurrency <= 0 {
 		concurrency = 8
 	}
-	if len(batch) < concurrency {
-		concurrency = len(batch)
-	}
 
-	batchCtx, batchCancel := context.WithCancel(ctx)
-	defer batchCancel()
+	g, gCtx := errgroup.WithContext(ctx)
+	g.SetLimit(concurrency)
 
 	var (
-		wg      sync.WaitGroup
-		mu      sync.Mutex
-		failed  bool
-		usage   openagent.Usage
-		sem     = make(chan struct{}, concurrency)
+		mu     sync.Mutex
+		usage  openagent.Usage
+		failed bool
 	)
 
 	for _, stepID := range batch {
-		if failed {
-			break
-		}
-		wg.Add(1)
-		sem <- struct{}{}
-		go func(id string) {
-			defer wg.Done()
-			defer func() { <-sem }()
-
-			// Check context before starting.
-			select {
-			case <-batchCtx.Done():
-				mu.Lock()
-				failed = true
-				mu.Unlock()
-				return
-			default:
+		stepID := stepID
+		g.Go(func() error {
+			// Early exit if a sibling already failed — errgroup cancelled the derived ctx.
+			if err := gCtx.Err(); err != nil {
+				return err
 			}
 
-			sr := e.executeStep(batchCtx, id, state, eventCh)
+			sr := e.executeStep(gCtx, stepID, state, eventCh)
 
 			mu.Lock()
-			if sr.Status == StepStatusFailed && !failed {
+			usage.PromptTokens += sr.Usage.PromptTokens
+			usage.CompletionTokens += sr.Usage.CompletionTokens
+			usage.TotalTokens += sr.Usage.TotalTokens
+			if sr.Status == StepStatusFailed {
 				failed = true
-				batchCancel() // cancel sibling steps
 			}
 			mu.Unlock()
-		}(stepID)
+
+			if sr.Status == StepStatusFailed {
+				return fmt.Errorf("step %q failed: %s", stepID, sr.Error)
+			}
+			return nil
+		})
 	}
 
-	wg.Wait()
-
-	if failed {
-		return &PlanResult{Usage: usage}, nil
-	}
-	return nil, nil
+	// Ignore the error from Wait — it only signals which step failed to
+	// cancel siblings. The actual failure info is in the StepResults.
+	_ = g.Wait()
+	return usage, failed, nil
 }
 
 // ── Single step execution ──
@@ -327,6 +319,7 @@ func (e *executor) executeStep(ctx context.Context, stepID string, state *PlanSt
 		sr.Status = StepStatusDone
 		sr.Summary = summary
 		sr.FinalOutput = result.FinalOutput
+		sr.Usage = result.Usage
 		sr.Error = ""
 		sr.EndTime = time.Now()
 
@@ -771,4 +764,3 @@ func affectedSteps(def *PlanDef, startID string) map[string]bool {
 
 	return affected
 }
-

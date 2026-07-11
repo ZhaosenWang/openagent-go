@@ -150,7 +150,7 @@ func detectType(data []byte) string {
 			return "binary data"
 		}
 	}
-	if data[0] == 0x7f && data[1] == 'E' && data[2] == 'L' && data[3] == 'F' {
+	if n >= 4 && data[0] == 0x7f && data[1] == 'E' && data[2] == 'L' && data[3] == 'F' {
 		return "ELF executable"
 	}
 	return "unknown binary"

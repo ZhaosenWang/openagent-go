@@ -218,6 +218,13 @@ func (h *Handler) handleChat(w http.ResponseWriter, r *http.Request) {
 		ch := s.agent.RunStream(ctx, oaSession, openagent.UserMessage(body.Message))
 		for evt := range ch {
 			se := streamToSSE(evt)
+			select {
+			case <-r.Context().Done():
+				// Client disconnected — stop publishing.
+				// Agent continues with its own ctx; timeout cleans up.
+				return
+			default:
+			}
 			h.bus.Publish(id, se)
 		}
 	}()

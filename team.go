@@ -450,10 +450,22 @@ func (tr *teamRunner) run(ctx context.Context, session Session, input Message, c
 		tr.runMessages = append(tr.runMessages, result.Messages...)
 		// Cap to prevent unbounded growth across handoffs.
 		// Trim oldest, skipping orphaned tool results at the boundary.
+		// Also handles the inverse: an orphaned assistant(tool_calls) whose
+		// tool_results were trimmed away, which would violate API message rules.
 		if len(tr.runMessages) > 128 {
 			tr.runMessages = tr.runMessages[len(tr.runMessages)-128:]
+			// Drop leading orphaned tool_results (no preceding tool_calls).
 			for len(tr.runMessages) > 0 && tr.runMessages[0].Role == RoleTool {
 				tr.runMessages = tr.runMessages[1:]
+			}
+			// Drop leading orphaned assistant(tool_calls) (their tool_results
+			// were trimmed away and are now lost).
+			for len(tr.runMessages) > 0 && tr.runMessages[0].Role == RoleAssistant && len(tr.runMessages[0].ToolCalls) > 0 {
+				tr.runMessages = tr.runMessages[1:]
+				// Also clean up any tool_results that now become orphaned.
+				for len(tr.runMessages) > 0 && tr.runMessages[0].Role == RoleTool {
+					tr.runMessages = tr.runMessages[1:]
+				}
 			}
 		}
 
@@ -540,11 +552,6 @@ func (tr *teamRunner) run(ctx context.Context, session Session, input Message, c
 				Role:    RoleUser,
 				Content: fmt.Sprintf("⚠️ Handoff blocked: %v\n\nYour last request was: %s\nPlease handle this yourself.", vetoErr, req.message),
 			}
-			tr.chain = append(tr.chain, HandoffEntry{
-				From:    tr.currentName,
-				To:      req.target,
-				Message: fmt.Sprintf("[vetoed: %v]", vetoErr),
-			})
 			continue
 		}
 
@@ -704,12 +711,16 @@ func (tr *teamRunner) detectLoop() string {
 		}
 	}
 
-	// L2: Frequency: same agent appears ≥ 3 times
+	// L2: Frequency: same agent appears ≥ 3 times in the chain.
+	// Each handoff entry contributes both a From and a To —
+	// both agents are involved in the handoff. The current
+	// entry was already appended to the chain, so no extra
+	// increment is needed.
 	counts := make(map[string]int)
 	for _, e := range tr.chain {
 		counts[e.From]++
+		counts[e.To]++
 	}
-	counts[tr.currentName]++ // current agent is about to appear again
 
 	for name, c := range counts {
 		if c >= 3 {

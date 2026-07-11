@@ -30,23 +30,23 @@ func (t *Grep) Definition() openagent.FunctionDefinition {
 			"Returns matching file paths, line numbers, and content. " +
 			"Use for finding usages, definitions, or patterns in the codebase.",
 		Parameters: json.RawMessage(`{
-			"type": "object",
-			"properties": {
-				"pattern": {
-					"type": "string",
-					"description": "Text or regex pattern to search for (case-sensitive unless (?i) flag used)"
+				"type": "object",
+				"properties": {
+					"pattern": {
+						"type": "string",
+						"description": "Text or regex pattern to search for (case-sensitive unless (?i) flag used)"
+					},
+					"path": {
+						"type": "string",
+						"description": "Subdirectory to search (default: entire workspace)"
+					},
+					"glob": {
+						"type": "string",
+						"description": "File pattern filter, e.g., '*.go' or '*.{go,md}' (default: all text files)"
+					}
 				},
-				"path": {
-					"type": "string",
-					"description": "Subdirectory to search (default: entire workspace)"
-				},
-				"glob": {
-					"type": "string",
-					"description": "File pattern filter, e.g., '*.go' or '*.{go,md}' (default: all text files)"
-				}
-			},
-			"required": ["pattern"]
-		}`),
+				"required": ["pattern"]
+			}`),
 	}
 }
 
@@ -94,9 +94,9 @@ func (t *Grep) Execute(ctx context.Context, args json.RawMessage) (string, error
 	}
 
 	const (
-		maxMatches   = 200
-		maxFileSize  = 1 * 1024 * 1024 // 1MB
-		maxFiles     = 2000
+		maxMatches  = 200
+		maxFileSize = 1 * 1024 * 1024 // 1MB
+		maxFiles    = 2000
 	)
 
 	var (
@@ -138,25 +138,16 @@ func (t *Grep) Execute(ctx context.Context, args json.RawMessage) (string, error
 
 		rel, _ := filepath.Rel(t.workDir, path)
 
-		file, err := os.Open(path)
+		// grepFile handles open/close so the file is released immediately,
+		// not deferred until WalkDir returns.
+		found, err := t.grepFile(path, re, rel, maxMatches-len(matches))
 		if err != nil {
 			return nil
 		}
-		defer file.Close()
-
-		scanner := bufio.NewScanner(file)
-		scanner.Buffer(make([]byte, 64*1024), 1024*1024) // 1MB max line
-		lineNum := 0
-		for scanner.Scan() {
-			lineNum++
-			line := scanner.Text()
-			if re.MatchString(line) {
-				if len(matches) >= maxMatches {
-					truncated = true
-					return filepath.SkipAll
-				}
-				matches = append(matches, fmt.Sprintf("%s:%d: %s", rel, lineNum, line))
-			}
+		matches = append(matches, found...)
+		if len(matches) >= maxMatches {
+			truncated = true
+			return filepath.SkipAll
 		}
 		return nil
 	})
@@ -178,4 +169,31 @@ func (t *Grep) Execute(ctx context.Context, args json.RawMessage) (string, error
 		b.WriteString("[results truncated]")
 	}
 	return b.String(), nil
+}
+
+// grepFile scans one file for re and returns formatted matches.
+// The file is opened and closed within this call — no defer accumulation.
+func (t *Grep) grepFile(path string, re *regexp.Regexp, rel string, remaining int) ([]string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024) // 1MB max line
+
+	var matches []string
+	lineNum := 0
+	for scanner.Scan() {
+		lineNum++
+		line := scanner.Text()
+		if re.MatchString(line) {
+			matches = append(matches, fmt.Sprintf("%s:%d: %s", rel, lineNum, line))
+			if len(matches) >= remaining {
+				break
+			}
+		}
+	}
+	return matches, nil
 }
