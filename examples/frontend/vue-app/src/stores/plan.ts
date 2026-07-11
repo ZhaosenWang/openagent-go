@@ -10,6 +10,7 @@ export const usePlanStore = defineStore('plan', () => {
   const executing = ref(false)
   const planError = ref<string | null>(null)
   const waitingRetry = ref<string | null>(null)
+  const gatePause = ref(false)
   const planDone = ref(false)
   const pendingApproval = ref<PendingApproval | null>(null)
   const _approvalQueue: PendingApproval[] = []
@@ -47,6 +48,7 @@ export const usePlanStore = defineStore('plan', () => {
     if (!planDef.value) return
     planError.value = null
     waitingRetry.value = null
+    gatePause.value = false
     planDone.value = false
 
     // Subscribe to events BEFORE triggering execution
@@ -159,8 +161,12 @@ export const usePlanStore = defineStore('plan', () => {
       }
 
       case 'plan_waiting_retry': {
-        waitingRetry.value = event.step_id || null
+        const sid = event.step_id || null
+        waitingRetry.value = sid
         executing.value = false
+        // Distinguish gate pause (step done, waiting for human approval)
+        // from failure pause (step failed, waiting for retry/replan).
+        gatePause.value = sid ? steps.value[sid]?.status === 'done' : false
         break
       }
 
@@ -229,6 +235,7 @@ export const usePlanStore = defineStore('plan', () => {
     try {
       await api.retryPlanStep(sessionId, stepId)
       waitingRetry.value = null
+    gatePause.value = false
       executing.value = true
     } catch (e: any) {
       planError.value = e.message
@@ -240,6 +247,7 @@ export const usePlanStore = defineStore('plan', () => {
       pendingApproval.value = null
       await api.replan(sessionId, feedback)
       waitingRetry.value = null
+    gatePause.value = false
       executing.value = true
     } catch (e: any) {
       planError.value = e.message
@@ -253,6 +261,7 @@ export const usePlanStore = defineStore('plan', () => {
     executing.value = false
     planError.value = null
     waitingRetry.value = null
+    gatePause.value = false
     planDone.value = false
     pendingApproval.value = null
     _approvalQueue.length = 0
@@ -262,6 +271,7 @@ export const usePlanStore = defineStore('plan', () => {
 
   return {
     planDef, steps, executing, planError, waitingRetry, planDone,
+    gatePause,
     pendingApproval, replanning, thinkingText,
     generatePlan, executePlan, approveTool, cancelExecution, retryStep, replan, clearPlan,
   }

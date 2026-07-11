@@ -77,8 +77,30 @@
         <!-- DAG -->
         <PlanDAG :steps="plan.planDef.steps" :step-state="stepState" />
 
-        <!-- Retry / Replan -->
-        <n-card v-if="plan.waitingRetry" class="retry-card">
+        <!-- Gate pause (step done, waiting for approval) -->
+        <n-card v-if="plan.waitingRetry && plan.gatePause" class="gate-card">
+          <n-text>Step "{{ plan.waitingRetry }}" completed. Review the output and continue.</n-text>
+          <n-space style="margin-top:8px">
+            <n-button type="primary" size="small" @click="handleRetry(plan.waitingRetry!)">Continue</n-button>
+            <n-button size="small" @click="showReplan = true">Replan</n-button>
+          </n-space>
+          <n-card v-if="showReplan" size="small" class="replan-card" style="margin-top:12px">
+            <n-text depth="2">What would you like to change?</n-text>
+            <n-input
+              v-model:value="feedback"
+              type="textarea"
+              :autosize="{ minRows: 2, maxRows: 4 }"
+              placeholder="e.g. Use HA database instead..."
+            />
+            <n-space style="margin-top:8px">
+              <n-button size="small" type="primary" :disabled="!feedback.trim()" @click="handleReplan">Replan with Feedback</n-button>
+              <n-button size="small" @click="showReplan = false; feedback = ''">Cancel</n-button>
+            </n-space>
+          </n-card>
+        </n-card>
+
+        <!-- Failed step pause (retry or replan) -->
+        <n-card v-if="plan.waitingRetry && !plan.gatePause" class="retry-card">
           <n-text>Step "{{ plan.waitingRetry }}" failed. What would you like to do?</n-text>
           <n-space style="margin-top:8px">
             <n-button size="small" @click="handleRetry(plan.waitingRetry!)">Retry</n-button>
@@ -213,6 +235,7 @@ onBeforeUnmount(() => { plan.clearPlan() })
 .goal-input { margin: 16px 0; }
 .plan-header { display: flex; justify-content: space-between; align-items: center; width: 100%; }
 .replan-alert { border-color: rgba(245,158,11,0.3); }
+.gate-card { border-color: #22c55e; }
 .retry-card { border-color: #ef4444; }
 .thinking-box { margin-top: 12px; }
 .thinking-text { font-size: 0.82em; white-space: pre-wrap; word-break: break-word; max-height: 300px; overflow-y: auto; background: rgba(255,255,255,0.04); padding: 10px; border-radius: 6px; }

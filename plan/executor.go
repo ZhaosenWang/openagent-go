@@ -62,7 +62,7 @@ func (e *executor) execute(ctx context.Context, def *PlanDef, state *PlanState, 
 		}
 
 		// Execute batches.
-		batchResult, err := e.executeBatches(ctx, def, state, finalSteps, &totalUsage, eventCh)
+		batchResult, gateStepID, err := e.executeBatches(ctx, def, state, finalSteps, &totalUsage, eventCh)
 		if err != nil {
 			state.Status = PlanStatusFailed
 			return nil, err
@@ -71,6 +71,18 @@ func (e *executor) execute(ctx context.Context, def *PlanDef, state *PlanState, 
 			totalUsage.PromptTokens = batchResult.Usage.PromptTokens
 			totalUsage.CompletionTokens = batchResult.Usage.CompletionTokens
 			totalUsage.TotalTokens = batchResult.Usage.TotalTokens
+		}
+
+		// Gate pause: a gate step completed successfully, pause for human approval.
+		if gateStepID != "" {
+			state.UpdatedAt = time.Now()
+			if eventCh != nil {
+				eventCh <- PlanEvent{
+					Type:   PlanEventWaitingRetry,
+					StepID: gateStepID,
+				}
+			}
+			return &PlanResult{Usage: totalUsage}, nil // paused — caller can resume via ExecuteWithState
 		}
 
 		// Check for failures.
@@ -130,7 +142,7 @@ func (e *executor) execute(ctx context.Context, def *PlanDef, state *PlanState, 
 
 // ── Batch execution ──
 
-func (e *executor) executeBatches(ctx context.Context, def *PlanDef, state *PlanState, finalSteps map[string]bool, totalUsage *openagent.Usage, eventCh chan<- PlanEvent) (*PlanResult, error) {
+func (e *executor) executeBatches(ctx context.Context, def *PlanDef, state *PlanState, finalSteps map[string]bool, totalUsage *openagent.Usage, eventCh chan<- PlanEvent) (*PlanResult, string, error) {
 	// Build adjacency and in-degree for remaining (pending) steps.
 	pending := make(map[string]StepDef)
 	for _, s := range def.Steps {
@@ -141,7 +153,7 @@ func (e *executor) executeBatches(ctx context.Context, def *PlanDef, state *Plan
 	}
 
 	if len(pending) == 0 {
-		return nil, nil
+		return nil, "", nil
 	}
 
 	// Topological sort of pending steps.
@@ -150,25 +162,37 @@ func (e *executor) executeBatches(ctx context.Context, def *PlanDef, state *Plan
 	for _, batch := range batches {
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, "", ctx.Err()
 		default:
 		}
 
 		// Run batch in parallel.
 		batchUsage, batchFailed, err := e.runBatch(ctx, batch, state, eventCh)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		totalUsage.PromptTokens += batchUsage.PromptTokens
 		totalUsage.CompletionTokens += batchUsage.CompletionTokens
 		totalUsage.TotalTokens += batchUsage.TotalTokens
 		if batchFailed {
 			// A step failed — stop batch execution, let caller check and replan.
-			return &PlanResult{Usage: *totalUsage}, nil
+			return &PlanResult{Usage: *totalUsage}, "", nil
+		}
+
+		// Check if any completed step in this batch is a gate.
+		for _, sid := range batch {
+			s, ok := pending[sid]
+			if !ok || !s.Gate {
+				continue
+			}
+			sr := state.Results[sid]
+			if sr != nil && sr.Status == StepStatusDone {
+				return &PlanResult{Usage: *totalUsage}, sid, nil
+			}
 		}
 	}
 
-	return nil, nil
+	return nil, "", nil
 }
 
 // runBatch executes a single topological batch concurrently via errgroup.

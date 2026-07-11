@@ -270,7 +270,8 @@ Output ONLY a JSON object:
       "agent": "agent_name",
       "task": "specific task for this step only",
       "depends_on": ["step_ids_this_must_wait_for"],
-      "final": false
+      "final": false,
+      "gate": false
     }
   ]
 }
@@ -279,6 +280,10 @@ Rules:
 - Every step that can run independently MUST run in parallel (no unnecessary depends_on).
 - agent must be from the available agents list.
 - final: true only for the last answer-producing step(s).
+- gate: true when this step requires human approval before proceeding. Use gate=true for steps
+  where the agent's description mentions "approval", "requires approval", "review", "gate",
+  or "approval gate". After a gate step completes, execution pauses so a human can review its
+  output before continuing.
 
 Reply with ONLY the JSON object. No markdown fences, no explanation.`
 

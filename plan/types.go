@@ -51,6 +51,7 @@ type StepDef struct {
 	Task       string   `json:"task"`                  // what this step should accomplish
 	DependsOn  []string `json:"depends_on,omitempty"`  // step IDs this step depends on
 	Final      bool     `json:"final,omitempty"`       // true if this step's output is the plan's final answer
+	Gate       bool     `json:"gate,omitempty"`        // true if executor pauses after this step for human approval
 	MaxRetries int      `json:"max_retries,omitempty"` // per-step retry limit (0 = use plan default of 3)
 }
 

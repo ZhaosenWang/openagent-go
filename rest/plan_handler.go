@@ -427,11 +427,14 @@ func (h *PlanHandler) handleExecute(w http.ResponseWriter, r *http.Request) {
 			case action := <-s.retryCh:
 				switch action.Action {
 				case "retry":
-					// Reset the failed step so executeBatches picks it up.
+					// Gate step: already done, just continue to next batch.
+					// Failed step: reset to pending so executeBatches re-runs it.
 					if sr := state.Results[action.StepID]; sr != nil {
-						sr.Status = plan.StepStatusPending
-						sr.Error = ""
-						sr.Retries = 0
+						if sr.Status != plan.StepStatusDone {
+							sr.Status = plan.StepStatusPending
+							sr.Error = ""
+							sr.Retries = 0
+						}
 					}
 				case "replan":
 					// Use the replanned definition (already merged by the replan endpoint).
@@ -543,6 +546,7 @@ func (h *PlanHandler) handleStepRetry(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	state := s.execState
 	retryCh := s.retryCh
+	curDef := s.currentDef
 	s.mu.Unlock()
 
 	if state == nil || retryCh == nil {
@@ -550,14 +554,29 @@ func (h *PlanHandler) handleStepRetry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify the step exists and is failed.
+	// Verify the step exists and is in a valid paused state:
+	// - Failed: can retry or replan.
+	// - Gate (done): completed successfully, awaits human approval.
 	sr := state.Results[stepID]
-	if sr == nil || sr.Status != plan.StepStatusFailed {
-		http.Error(w, `{"error":"step not found or not in failed state"}`, http.StatusBadRequest)
+	if sr == nil {
+		http.Error(w, `{"error":"step not found"}`, http.StatusBadRequest)
+		return
+	}
+	isGate := false
+	if curDef != nil {
+		for _, s := range curDef.Steps {
+			if s.ID == stepID && s.Gate {
+				isGate = true
+				break
+			}
+		}
+	}
+	if sr.Status != plan.StepStatusFailed && !(isGate && sr.Status == plan.StepStatusDone) {
+		http.Error(w, `{"error":"step is not in a paused state"}`, http.StatusBadRequest)
 		return
 	}
 
-	// Signal the execution goroutine to retry.
+	// Signal the execution goroutine to continue (retry / continue past gate).
 	retryCh <- plan.RetryAction{Action: "retry", StepID: stepID}
 
 	w.Header().Set("Content-Type", "application/json")
