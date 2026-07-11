@@ -24,6 +24,7 @@ export interface ChatRequest {
 
 export interface ApproveRequest {
   allowed: boolean
+  feedback?: string
 }
 
 // ── SSE Event (canonical REST format) ──

@@ -56,7 +56,8 @@ type ChatRequest struct {
 
 // ApproveRequest is the body for POST /sessions/{id}/approve.
 type ApproveRequest struct {
-	Allowed bool `json:"allowed"`
+	Allowed  bool   `json:"allowed"`
+	Feedback string `json:"feedback,omitempty"` // optional user feedback when denying
 }
 
 // ── SSE event ──

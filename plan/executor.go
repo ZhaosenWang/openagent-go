@@ -2,7 +2,6 @@ package plan
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -353,6 +352,8 @@ func (e *executor) runStepStreaming(ctx context.Context, runner openagent.AgentR
 	var result *openagent.RunResult
 	for evt := range ch {
 		switch evt.Type {
+		case openagent.StreamThought:
+			eventCh <- PlanEvent{Type: PlanEventTextDelta, StepID: stepID, Text: evt.Text}
 		case openagent.StreamTextDelta:
 			eventCh <- PlanEvent{Type: PlanEventTextDelta, StepID: stepID, Text: evt.Text}
 		case openagent.StreamToolCall:
@@ -629,36 +630,19 @@ func (e *executor) replanAfterFailure(ctx context.Context, def *PlanDef, state *
 	b.WriteString("Return ONLY the replacement steps as a JSON array (not a full plan):\n")
 	b.WriteString(`[{"id": "...", "agent": "...", "task": "...", "depends_on": [...], "final": false}]`)
 
-	resp, err := e.model.ChatCompletion(ctx, openagent.ChatCompletionRequest{
-		Messages: []openagent.Message{
-			{Role: openagent.RoleSystem, Content: plannerSystemPrompt},
-			{Role: openagent.RoleUser, Content: b.String()},
-		},
-		MaxTokens: 2048,
-	})
+	messages := []openagent.Message{
+		{Role: openagent.RoleSystem, Content: plannerSystemPrompt},
+		{Role: openagent.RoleUser, Content: b.String()},
+	}
+
+	fullText, err := modelSyncCall(ctx, e.model, messages)
 	if err != nil {
 		return nil, fmt.Errorf("replan model call failed: %w", err)
 	}
-	if len(resp.Choices) == 0 {
-		return nil, fmt.Errorf("replan: model returned no choices")
-	}
 
-	// Parse replacement steps.
-	raw := strings.TrimSpace(resp.Choices[0].Message.Content)
-	raw = strings.TrimPrefix(raw, "```json")
-	raw = strings.TrimPrefix(raw, "```")
-	if idx := strings.LastIndex(raw, "```"); idx >= 0 {
-		raw = raw[:idx]
-	}
-	raw = strings.TrimSpace(raw)
-
-	var newSteps []StepDef
-	if err := json.Unmarshal([]byte(raw), &newSteps); err != nil {
-		return nil, fmt.Errorf("replan: failed to parse replacement steps: %w\nRaw:\n%s", err, truncateStr(raw, 500))
-	}
-
-	if len(newSteps) == 0 {
-		return nil, fmt.Errorf("replan: no replacement steps generated")
+	newSteps, err := parseStepsJSON(fullText)
+	if err != nil {
+		return nil, fmt.Errorf("replan: %w", err)
 	}
 
 	// Merge: remove affected steps, add new ones.
@@ -682,131 +666,6 @@ func (e *executor) replanAfterFailure(ctx context.Context, def *PlanDef, state *
 	}
 
 	// Reset results for affected steps.
-	for id := range affected {
-		delete(state.Results, id)
-	}
-
-	return newDef, nil
-}
-
-// replanWithFeedback is like replanAfterFailure but incorporates user feedback
-// (natural language suggestions) into the replan prompt. The caller is responsible
-// for cleaning up affected step results in state before resuming execution.
-func (e *executor) replanWithFeedback(ctx context.Context, def *PlanDef, state *PlanState, failedID string, feedback string) (*PlanDef, error) {
-	affected := affectedSteps(def, failedID)
-
-	// Collect success context.
-	var successContext []string
-	for _, s := range def.Steps {
-		sr := state.Results[s.ID]
-		if sr == nil || sr.Status != StepStatusDone {
-			continue
-		}
-		if affected[s.ID] {
-			continue
-		}
-		successContext = append(successContext, fmt.Sprintf(
-			"Step %q (%s): %s", s.ID, s.Agent, sr.Summary,
-		))
-	}
-
-	// Build prompt with user feedback.
-	var b strings.Builder
-	b.WriteString("## Replanning with User Feedback\n\n")
-	b.WriteString(fmt.Sprintf("**Original goal:** %s\n\n", def.Goal))
-
-	sr := state.Results[failedID]
-	if sr != nil {
-		b.WriteString(fmt.Sprintf("**Failure:** Step %q failed: %s\n\n", failedID, sr.Error))
-	}
-
-	b.WriteString(fmt.Sprintf("**User feedback:** %s\n\n", feedback))
-
-	if len(successContext) > 0 {
-		b.WriteString("## Completed Steps (do not regenerate these)\n\n")
-		for _, sc := range successContext {
-			b.WriteString(fmt.Sprintf("- %s\n", sc))
-		}
-		b.WriteString("\n")
-	}
-
-	b.WriteString("## Steps that Need Replanning\n\n")
-	for _, s := range def.Steps {
-		if affected[s.ID] {
-			b.WriteString(fmt.Sprintf("- %s (agent: %s, original task: %s)\n", s.ID, s.Agent, s.Task))
-		}
-	}
-
-	var survivingIDs []string
-	for _, s := range def.Steps {
-		if !affected[s.ID] {
-			survivingIDs = append(survivingIDs, s.ID)
-		}
-	}
-	if len(survivingIDs) > 0 {
-		b.WriteString("\n## Surviving Step IDs (DO NOT reuse these)\n")
-		b.WriteString(strings.Join(survivingIDs, ", "))
-		b.WriteString("\n")
-	}
-
-	b.WriteString("\n**IMPORTANT**: The user has provided feedback above. Use it to guide your replanning — ")
-	b.WriteString("choose different agents, rephrase tasks, or restructure the approach based on their suggestions.\n\n")
-	b.WriteString("Generate a replacement plan for only the failed and affected steps. ")
-	b.WriteString("Return ONLY the replacement steps as a JSON array:\n")
-	b.WriteString(`[{"id": "...", "agent": "...", "task": "...", "depends_on": [...], "final": false}]`)
-
-	resp, err := e.model.ChatCompletion(ctx, openagent.ChatCompletionRequest{
-		Messages: []openagent.Message{
-			{Role: openagent.RoleSystem, Content: plannerSystemPrompt},
-			{Role: openagent.RoleUser, Content: b.String()},
-		},
-		MaxTokens: 2048,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("replan model call failed: %w", err)
-	}
-	if len(resp.Choices) == 0 {
-		return nil, fmt.Errorf("replan: model returned no choices")
-	}
-
-	// Parse replacement steps.
-	raw := strings.TrimSpace(resp.Choices[0].Message.Content)
-	raw = strings.TrimPrefix(raw, "```json")
-	raw = strings.TrimPrefix(raw, "```")
-	if idx := strings.LastIndex(raw, "```"); idx >= 0 {
-		raw = raw[:idx]
-	}
-	raw = strings.TrimSpace(raw)
-
-	var newSteps []StepDef
-	if err := json.Unmarshal([]byte(raw), &newSteps); err != nil {
-		return nil, fmt.Errorf("replan: failed to parse replacement steps: %w\nRaw:\n%s", err, truncateStr(raw, 500))
-	}
-
-	if len(newSteps) == 0 {
-		return nil, fmt.Errorf("replan: no replacement steps generated")
-	}
-
-	// Merge: remove affected steps, add new ones.
-	merged := make([]StepDef, 0, len(def.Steps)-len(affected)+len(newSteps))
-	for _, s := range def.Steps {
-		if !affected[s.ID] {
-			merged = append(merged, s)
-		}
-	}
-	merged = append(merged, newSteps...)
-
-	newDef := &PlanDef{Goal: def.Goal, Steps: merged}
-
-	agentNames := make(map[string]bool)
-	for _, a := range e.agentInfos {
-		agentNames[a.Name] = true
-	}
-	if err := Validate(newDef, agentNames); err != nil {
-		return nil, fmt.Errorf("replan validation failed: %w", err)
-	}
-
-	// Clean up affected results in state so the new steps start fresh.
 	for id := range affected {
 		delete(state.Results, id)
 	}

@@ -597,11 +597,13 @@ func (h *PlanHandler) handleReplan(w http.ResponseWriter, r *http.Request) {
 	// Emit replanning event so the UI knows.
 	h.bus.Publish(id, SSEEvent{Type: "replanning", StepID: failedID})
 
-	// Call planner with user feedback.
+	// Call planner with user feedback, streaming the LLM's thinking.
 	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
 	defer cancel()
 
-	newDef, err := s.plan.ReplanWithFeedback(ctx, def, state, failedID, body.Feedback)
+	newDef, err := s.plan.ReplanWithFeedbackStream(ctx, def, state, failedID, body.Feedback, func(chunk string) {
+		h.bus.Publish(id, SSEEvent{Type: "plan_thinking", Text: chunk})
+	})
 	if err != nil {
 		h.bus.Publish(id, SSEEvent{Type: "plan_error", Error: err.Error()})
 		http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusInternalServerError)
@@ -655,6 +657,9 @@ func (h *PlanHandler) handleApprove(w http.ResponseWriter, r *http.Request) {
 	}
 
 	reason := "denied"
+	if body.Feedback != "" {
+		reason = "denied: " + body.Feedback
+	}
 	if body.Allowed {
 		reason = "approved"
 	}

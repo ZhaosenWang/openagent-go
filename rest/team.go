@@ -248,6 +248,9 @@ func (h *TeamHandler) handleApprove(w http.ResponseWriter, r *http.Request) {
 	}
 
 	reason := "denied"
+	if body.Feedback != "" {
+		reason = "denied: " + body.Feedback
+	}
 	if body.Allowed {
 		reason = "approved"
 	}

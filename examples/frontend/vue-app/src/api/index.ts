@@ -39,8 +39,9 @@ export function deleteSession(id: string): Promise<void> {
   return request<void>(`/sessions/${id}`, { method: 'DELETE' })
 }
 
-export function approveTool(sessionId: string, allowed: boolean): Promise<{ status: string }> {
+export function approveTool(sessionId: string, allowed: boolean, feedback?: string): Promise<{ status: string }> {
   const body: ApproveRequest = { allowed }
+  if (feedback) body.feedback = feedback
   return request(`/sessions/${sessionId}/approve`, {
     method: 'POST',
     body: JSON.stringify(body),
@@ -81,10 +82,12 @@ export function removeTeamAgent(sessionId: string, name: string): Promise<void> 
   })
 }
 
-export function approveTeamTool(sessionId: string, allowed: boolean): Promise<{ status: string }> {
+export function approveTeamTool(sessionId: string, allowed: boolean, feedback?: string): Promise<{ status: string }> {
+  const body: ApproveRequest = { allowed }
+  if (feedback) body.feedback = feedback
   return request(`/team/sessions/${sessionId}/approve`, {
     method: 'POST',
-    body: JSON.stringify({ allowed }),
+    body: JSON.stringify(body),
   })
 }
 
@@ -105,10 +108,12 @@ export function deletePlanSession(id: string): Promise<void> {
   return request<void>(`/plan/sessions/${id}`, { method: 'DELETE' })
 }
 
-export function approvePlanTool(sessionId: string, allowed: boolean): Promise<{ status: string }> {
+export function approvePlanTool(sessionId: string, allowed: boolean, feedback?: string): Promise<{ status: string }> {
+  const body: ApproveRequest = { allowed }
+  if (feedback) body.feedback = feedback
   return request(`/plan/sessions/${sessionId}/approve`, {
     method: 'POST',
-    body: JSON.stringify({ allowed }),
+    body: JSON.stringify(body),
   })
 }
 

@@ -84,7 +84,7 @@ func main() {
 	)
 	coder := openagent.NewAgent("coder",
 		openagent.WithModel(llm),
-		openagent.WithInstructions("You are a software developer. Take the design and write clean, idiomatic Go code. Include error handling and comments. Hand off to the reviewer with your complete implementation. Use transfer_to_reviewer when done."),
+		openagent.WithInstructions("You are a software developer. Take the design and write clean, well-structured code. Include error handling and comments. Hand off to the reviewer with your complete implementation. Use transfer_to_reviewer when done."),
 		openagent.WithMaxTurns(5),
 	)
 	reviewer := openagent.NewAgent("reviewer",
@@ -95,7 +95,7 @@ func main() {
 	teamHandler := rest.NewTeamHandler(nil,
 		rest.TeamAgentTemplate{Name: "analyst", Description: "Understands requirements and produces specifications", Agent: analyst},
 		rest.TeamAgentTemplate{Name: "designer", Description: "Designs architecture, components, and data flow", Agent: designer},
-		rest.TeamAgentTemplate{Name: "coder", Description: "Writes clean, idiomatic Go code with error handling", Agent: coder},
+		rest.TeamAgentTemplate{Name: "coder", Description: "Writes clean, well-structured code with error handling", Agent: coder},
 		rest.TeamAgentTemplate{Name: "reviewer", Description: "Reviews code for correctness, style, and security", Agent: reviewer},
 	)
 
@@ -114,7 +114,7 @@ func main() {
 	)
 	planCoder := openagent.NewAgent("coder",
 		openagent.WithModel(llm),
-		openagent.WithInstructions("You write production-quality Go code. Use read/write to edit files, grep to search, shell to build and test. Output ONLY code — no explanations outside code comments."),
+		openagent.WithInstructions("You write production-quality code. Use read/write to edit files, grep to search, shell to build and test. Output ONLY code — no explanations outside code comments."),
 		openagent.WithMaxTurns(3),
 		openagent.WithTools(sandboxTools...),
 	)
@@ -133,7 +133,7 @@ func main() {
 	planHandler := rest.NewPlanHandler(nil, llm,
 		rest.PlanAgentTemplate{Name: "researcher", Description: "Researches technical topics — provides comprehensive analysis with pros/cons, alternatives, and data-driven recommendations", Runner: planResearcher},
 		rest.PlanAgentTemplate{Name: "architect", Description: "Designs software architecture — produces structured design documents with components, interfaces, and data flow", Runner: planArchitect},
-		rest.PlanAgentTemplate{Name: "coder", Description: "Writes production-quality Go code with error handling and comments", Runner: planCoder},
+		rest.PlanAgentTemplate{Name: "coder", Description: "Writes production-quality code with error handling and comments", Runner: planCoder},
 		rest.PlanAgentTemplate{Name: "reviewer", Description: "Reviews code for correctness, style, and potential bugs — produces a list of issues and suggestions", Runner: planReviewer},
 		rest.PlanAgentTemplate{Name: "writer", Description: "Writes clear, professional documentation: README, API docs, reports. Uses markdown formatting", Runner: planWriter},
 	)

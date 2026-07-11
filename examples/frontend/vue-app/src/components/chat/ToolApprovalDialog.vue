@@ -3,8 +3,18 @@
     <div class="approval-body">
       <div class="tool-name">{{ toolCall.function.name }}</div>
       <pre class="tool-args">{{ formattedArgs }}</pre>
+
+      <div class="feedback-row">
+        <n-input
+          v-model:value="feedback"
+          type="textarea"
+          :autosize="{ minRows: 1, maxRows: 3 }"
+          placeholder="Reason for denying (optional — the model will see this)"
+        />
+      </div>
+
       <div class="approval-actions">
-        <n-button type="error" @click="$emit('resolve', false)">Deny</n-button>
+        <n-button type="error" @click="$emit('resolve', false, feedback.trim() || undefined)">Deny</n-button>
         <n-button type="primary" @click="$emit('resolve', true)">Allow</n-button>
       </div>
     </div>
@@ -12,12 +22,14 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue'
-import { NModal, NButton } from 'naive-ui'
+import { ref, computed } from 'vue'
+import { NModal, NButton, NInput } from 'naive-ui'
 import type { SSEToolCall } from '@/types'
 
 const props = defineProps<{ toolCall: SSEToolCall }>()
-defineEmits<{ resolve: [allowed: boolean] }>()
+defineEmits<{ resolve: [allowed: boolean, feedback?: string] }>()
+
+const feedback = ref('')
 
 const formattedArgs = computed(() => {
   try {
@@ -31,13 +43,15 @@ const formattedArgs = computed(() => {
 <style scoped>
 .approval-body {
   padding: 16px;
-  min-width: 400px;
+  min-width: 420px;
 }
+
 .tool-name {
   font-size: 1.1em;
   font-weight: 600;
   margin-bottom: 12px;
 }
+
 .tool-args {
   background: rgba(0,0,0,0.15);
   padding: 12px;
@@ -48,6 +62,11 @@ const formattedArgs = computed(() => {
   white-space: pre-wrap;
   word-break: break-word;
 }
+
+.feedback-row {
+  margin-top: 12px;
+}
+
 .approval-actions {
   display: flex;
   justify-content: flex-end;

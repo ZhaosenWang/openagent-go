@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
-import type { PlanDef, StepState, SSEEvent } from '@/types'
+import type { PlanDef, StepState, SSEEvent, PendingApproval } from '@/types'
 import { connectSSE } from '@/api/sse'
 import * as api from '@/api'
 
@@ -11,6 +11,9 @@ export const usePlanStore = defineStore('plan', () => {
   const planError = ref<string | null>(null)
   const waitingRetry = ref<string | null>(null)
   const planDone = ref(false)
+  const pendingApproval = ref<PendingApproval | null>(null)
+  const replanning = ref(false)
+  const thinkingText = ref('')
 
   let eventCleanup: (() => void) | null = null
 
@@ -128,13 +131,51 @@ export const usePlanStore = defineStore('plan', () => {
         break
       }
 
+      case 'tool_approval': {
+        if (event.tool_call) {
+          pendingApproval.value = {
+            toolCall: event.tool_call,
+            sessionId: '',
+            sessionType: 'plan',
+          }
+        }
+        break
+      }
+
+      case 'replanning': {
+        replanning.value = true
+        thinkingText.value = ''
+        break
+      }
+
+      case 'plan_thinking': {
+        thinkingText.value += event.text || ''
+        break
+      }
+
       case 'plan_waiting_retry': {
         waitingRetry.value = event.step_id || null
         executing.value = false
         break
       }
 
+      case 'plan_generated': {
+        // Replan produced a new plan — update DAG and clear loading state.
+        replanning.value = false
+        thinkingText.value = ''
+        if (event.text) {
+          try {
+            const def = JSON.parse(event.text)
+            planDef.value = def
+            initSteps(def)
+          } catch { /* ignore */ }
+        }
+        break
+      }
+
       case 'plan_done': {
+        replanning.value = false
+        thinkingText.value = ''
         executing.value = false
         planDone.value = true
         eventCleanup?.()
@@ -142,6 +183,7 @@ export const usePlanStore = defineStore('plan', () => {
       }
 
       case 'plan_error': {
+        replanning.value = false
         planError.value = event.error || 'Plan error'
         executing.value = false
         eventCleanup?.()
@@ -149,10 +191,21 @@ export const usePlanStore = defineStore('plan', () => {
       }
 
       case 'plan_cancelled': {
+        replanning.value = false
         executing.value = false
         eventCleanup?.()
         break
       }
+    }
+  }
+
+  async function approveTool(sessionId: string, allowed: boolean, feedback?: string) {
+    if (!pendingApproval.value) return
+    try {
+      await api.approvePlanTool(sessionId, allowed, feedback)
+      pendingApproval.value = null
+    } catch (e) {
+      console.error('plan approveTool:', e)
     }
   }
 
@@ -178,6 +231,7 @@ export const usePlanStore = defineStore('plan', () => {
 
   async function replan(sessionId: string, feedback: string) {
     try {
+      pendingApproval.value = null
       await api.replan(sessionId, feedback)
       waitingRetry.value = null
       executing.value = true
@@ -194,10 +248,14 @@ export const usePlanStore = defineStore('plan', () => {
     planError.value = null
     waitingRetry.value = null
     planDone.value = false
+    pendingApproval.value = null
+    replanning.value = false
+    thinkingText.value = ''
   }
 
   return {
     planDef, steps, executing, planError, waitingRetry, planDone,
-    generatePlan, executePlan, cancelExecution, retryStep, replan, clearPlan,
+    pendingApproval, replanning, thinkingText,
+    generatePlan, executePlan, approveTool, cancelExecution, retryStep, replan, clearPlan,
   }
 })

@@ -35,9 +35,9 @@ function handleSend(text: string) {
   if (!sid) return
   chat.sendMessage(sid, text, 'team')
 }
-function handleApprove(allowed: boolean) {
+function handleApprove(allowed: boolean, feedback?: string) {
   const sid = sessionId.value
   if (!sid) return
-  chat.approveTool(sid, 'team', allowed)
+  chat.approveTool(sid, 'team', allowed, feedback)
 }
 </script>

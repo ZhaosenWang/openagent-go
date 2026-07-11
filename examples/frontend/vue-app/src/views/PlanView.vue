@@ -42,6 +42,15 @@
           </template>
         </n-card>
 
+        <!-- Replanning thinking -->
+        <n-card v-if="plan.replanning" size="small" class="replan-alert">
+          <n-collapse>
+            <n-collapse-item title="Replanning...">
+              <pre class="thinking-text">{{ plan.thinkingText || '(thinking...)' }}</pre>
+            </n-collapse-item>
+          </n-collapse>
+        </n-card>
+
         <!-- Pre-execution replan -->
         <n-card v-if="showReplan" size="small" class="replan-card">
           <n-text depth="2">What would you like to change about this plan?</n-text>
@@ -52,40 +61,21 @@
             placeholder="e.g. Add a testing step, use researcher instead of architect..."
             style="margin:8px 0"
           />
+          <div v-if="replanning && thinkingOutput" class="thinking-box">
+            <n-collapse>
+              <n-collapse-item title="Regenerating...">
+                <pre class="thinking-text">{{ thinkingOutput }}</pre>
+              </n-collapse-item>
+            </n-collapse>
+          </div>
           <n-space>
             <n-button size="small" type="primary" :loading="replanning" :disabled="!preExecFeedback.trim()" @click="handlePreReplan">Regenerate</n-button>
             <n-button size="small" @click="showReplan = false; preExecFeedback = ''">Cancel</n-button>
           </n-space>
         </n-card>
 
-        <!-- Step cards -->
-        <div class="step-grid">
-          <n-card
-            v-for="step in plan.planDef.steps" :key="step.id"
-            size="small"
-            :class="['step-card', stepState(step.id).status]"
-            :title="step.agent"
-          >
-            <template #header-extra>
-              <n-space align="center" :size="6">
-                <n-tag v-if="step.final" type="warning" size="tiny" :bordered="false">FINAL</n-tag>
-                <n-tag :type="statusType(stepState(step.id).status)" size="tiny" :bordered="false">
-                  {{ stepState(step.id).status }}
-                </n-tag>
-              </n-space>
-            </template>
-            <n-text depth="2">{{ step.task }}</n-text>
-            <n-text v-if="step.depends_on?.length" depth="3" class="step-deps">
-              Depends on: {{ step.depends_on.join(', ') }}
-            </n-text>
-            <n-collapse v-if="stepState(step.id).output || stepState(step.id).summary" class="step-detail">
-              <n-collapse-item title="Output">
-                <pre class="step-output">{{ stepState(step.id).output.slice(-800) }}</pre>
-                <n-text v-if="stepState(step.id).summary" depth="2">{{ stepState(step.id).summary }}</n-text>
-              </n-collapse-item>
-            </n-collapse>
-          </n-card>
-        </div>
+        <!-- DAG -->
+        <PlanDAG :steps="plan.planDef.steps" :step-state="stepState" />
 
         <!-- Retry / Replan -->
         <n-card v-if="plan.waitingRetry" class="retry-card">
@@ -101,6 +91,12 @@
         <n-alert v-if="plan.planError" type="error" :title="plan.planError" />
       </n-space>
     </template>
+    <!-- Tool approval (during plan execution) -->
+    <ToolApprovalDialog
+      v-if="plan.pendingApproval"
+      :tool-call="plan.pendingApproval.toolCall"
+      @resolve="handleApprove"
+    />
   </n-scrollbar>
 </template>
 
@@ -110,7 +106,9 @@ import { useRoute, useRouter } from 'vue-router'
 import { NScrollbar, NCard, NInput, NButton, NSpace, NText, NTag, NCollapse, NCollapseItem, NAlert } from 'naive-ui'
 import { usePlanStore } from '@/stores/plan'
 import { useSessionsStore } from '@/stores/sessions'
-import type { StepState, StepStatus } from '@/types'
+import type { StepState } from '@/types'
+import PlanDAG from '@/components/plan/PlanDAG.vue'
+import ToolApprovalDialog from '@/components/chat/ToolApprovalDialog.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -141,15 +139,6 @@ onMounted(async () => {
 
 function stepState(id: string): StepState {
   return plan.steps[id] || { status: 'pending', output: '', summary: '', toolCalls: [] }
-}
-
-function statusType(s: StepStatus): 'default' | 'info' | 'warning' | 'error' | 'success' {
-  switch (s) {
-    case 'running': return 'warning'
-    case 'done': return 'success'
-    case 'failed': return 'error'
-    default: return 'default'
-  }
 }
 
 async function handleGenerate() {
@@ -207,6 +196,11 @@ async function handleReplan() {
   await plan.replan(sessionId.value, feedback.value)
   feedback.value = ''
 }
+function handleApprove(allowed: boolean, feedback?: string) {
+  const sid = sessionId.value
+  if (!sid) return
+  plan.approveTool(sid, allowed, feedback)
+}
 
 watch(sessionId, () => { plan.clearPlan() })
 onBeforeUnmount(() => { plan.clearPlan() })
@@ -217,14 +211,7 @@ onBeforeUnmount(() => { plan.clearPlan() })
 .plan-create { max-width: 560px; margin: 60px auto; }
 .goal-input { margin: 16px 0; }
 .plan-header { display: flex; justify-content: space-between; align-items: center; width: 100%; }
-.step-grid { display: flex; flex-wrap: wrap; gap: 12px; }
-.step-card { flex: 1 1 240px; max-width: 380px; transition: border-color 0.2s; }
-.step-card.running { border-color: #f59e0b; }
-.step-card.done { border-color: #22c55e; }
-.step-card.failed { border-color: #ef4444; }
-.step-deps { font-size: 0.78em; display: block; margin-top: 4px; }
-.step-detail { margin-top: 8px; }
-.step-output { font-size: 0.8em; white-space: pre-wrap; word-break: break-word; max-height: 200px; overflow-y: auto; background: rgba(255,255,255,0.04); padding: 10px; border-radius: 6px; }
+.replan-alert { border-color: rgba(245,158,11,0.3); }
 .retry-card { border-color: #ef4444; }
 .thinking-box { margin-top: 12px; }
 .thinking-text { font-size: 0.82em; white-space: pre-wrap; word-break: break-word; max-height: 300px; overflow-y: auto; background: rgba(255,255,255,0.04); padding: 10px; border-radius: 6px; }

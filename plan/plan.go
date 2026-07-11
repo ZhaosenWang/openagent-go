@@ -241,20 +241,89 @@ func (p *Plan) ExecuteWithState(ctx context.Context, session openagent.Session, 
 }
 
 // ReplanWithFeedback calls the Planner to regenerate the affected subtree of a
-// failed plan, incorporating user feedback (natural language suggestions for
-// how to approach the replan). It returns a new PlanDef with surviving steps
-// merged with the replacement subtree.
-//
-// The caller should update the session's currentDef with the returned PlanDef
-// and call [Plan.ExecuteWithState] to resume execution.
+// failed plan, incorporating user feedback. Returns a new PlanDef with surviving
+// steps merged with the replacement subtree.
 func (p *Plan) ReplanWithFeedback(ctx context.Context, def *PlanDef, state *PlanState, failedID string, feedback string) (*PlanDef, error) {
-	ex := &executor{
-		config:     p.config,
-		agents:     p.agents,
-		agentInfos: p.agentInfos,
-		model:      p.model,
+	return p.ReplanWithFeedbackStream(ctx, def, state, failedID, feedback, nil)
+}
+
+// ReplanWithFeedbackStream is like [Plan.ReplanWithFeedback] but streams the
+// LLM response via onChunk for real-time progress display.
+func (p *Plan) ReplanWithFeedbackStream(ctx context.Context, def *PlanDef, state *PlanState, failedID string, feedback string, onChunk func(string)) (*PlanDef, error) {
+	if p.planner == nil {
+		return nil, fmt.Errorf("plan: no Planner configured")
 	}
-	return ex.replanWithFeedback(ctx, def, state, failedID, feedback)
+
+	affected := affectedSteps(def, failedID)
+
+	// Collect done steps the replanner needs to know about.
+	var doneSteps []ReplanDoneStep
+	for _, s := range def.Steps {
+		sr := state.Results[s.ID]
+		if sr == nil || sr.Status != StepStatusDone || affected[s.ID] {
+			continue
+		}
+		doneSteps = append(doneSteps, ReplanDoneStep{
+			ID:      s.ID,
+			Agent:   s.Agent,
+			Summary: sr.Summary,
+		})
+	}
+
+	// Collect surviving step IDs.
+	var survivingIDs []string
+	for _, s := range def.Steps {
+		if !affected[s.ID] {
+			survivingIDs = append(survivingIDs, s.ID)
+		}
+	}
+
+	// Build affected slice.
+	affectedSteps := make([]StepDef, 0, len(affected))
+	for _, s := range def.Steps {
+		if affected[s.ID] {
+			affectedSteps = append(affectedSteps, s)
+		}
+	}
+
+	failureError := ""
+	if sr := state.Results[failedID]; sr != nil {
+		failureError = sr.Error
+	}
+
+	input := ReplanInput{
+		Goal:         def.Goal,
+		FailedStepID: failedID,
+		FailureError: failureError,
+		Feedback:     feedback,
+		DoneSteps:    doneSteps,
+		Affected:     affectedSteps,
+		Agents:       p.agentInfos,
+		SurvivingIDs: survivingIDs,
+	}
+
+	newSteps, err := p.planner.Replan(ctx, input, onChunk)
+	if err != nil {
+		return nil, err
+	}
+
+	// Merge: keep surviving steps, replace affected subtree.
+	merged := make([]StepDef, 0, len(def.Steps)-len(affected)+len(newSteps))
+	for _, s := range def.Steps {
+		if !affected[s.ID] {
+			merged = append(merged, s)
+		}
+	}
+	merged = append(merged, newSteps...)
+
+	newDef := &PlanDef{Goal: def.Goal, Steps: merged}
+
+	// Clean up affected results so the new steps start fresh.
+	for id := range affected {
+		delete(state.Results, id)
+	}
+
+	return newDef, nil
 }
 
 // ── Run (plan + execute in one call) ──

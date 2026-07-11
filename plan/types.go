@@ -199,15 +199,40 @@ type PlanEvent struct {
 	ToolID   string `json:"tool_id,omitempty"`   // tool call ID from model
 }
 
+// ── Replanning ──
+
+// ReplanDoneStep summarises a completed step for the Planner.
+// It is the minimal information the Planner needs to understand what
+// has been accomplished, without exposing internal executor state.
+type ReplanDoneStep struct {
+	ID      string
+	Agent   string
+	Summary string
+}
+
+// ReplanInput is the context the Planner needs to regenerate a failed plan.
+// The executor builds this from its internal state; the Planner consumes it
+// without knowing anything about the executor.
+type ReplanInput struct {
+	Goal         string           // original plan goal
+	FailedStepID string           // which step failed
+	FailureError string           // why it failed
+	Feedback     string           // user's natural language suggestions
+	DoneSteps    []ReplanDoneStep // completed steps (context, do not regenerate)
+	Affected     []StepDef        // steps that need replacing
+	Agents       []openagent.AgentInfo
+	SurvivingIDs []string // step IDs that must NOT be reused
+}
+
 // ── Manual intervention (retry / replan-with-feedback) ──
 
 // RetryAction is a command from the caller to resume a paused plan execution.
 // It is sent to the channel returned by [Plan.ResumeChan] when the executor
 // pauses with [PlanEventWaitingRetry].
 type RetryAction struct {
-	Action   string  // "retry" or "replan"
-	StepID   string  // step to retry (for "retry")
-	Feedback string  // user feedback for replan (for "replan")
+	Action   string   // "retry" or "replan"
+	StepID   string   // step to retry (for "retry")
+	Feedback string   // user feedback for replan (for "replan")
 	NewDef   *PlanDef // replacement plan def (for "replan", pre-computed by caller)
 }
 

@@ -240,13 +240,13 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
-  async function approveTool(sessionId: string, sessionType: 'single' | 'team' | 'plan', allowed: boolean) {
+  async function approveTool(sessionId: string, sessionType: 'single' | 'team' | 'plan', allowed: boolean, feedback?: string) {
     if (!pendingApproval.value) return
     try {
       switch (sessionType) {
-        case 'single': await api.approveTool(sessionId, allowed); break
-        case 'team': await api.approveTeamTool(sessionId, allowed); break
-        case 'plan': await api.approvePlanTool(sessionId, allowed); break
+        case 'single': await api.approveTool(sessionId, allowed, feedback); break
+        case 'team': await api.approveTeamTool(sessionId, allowed, feedback); break
+        case 'plan': await api.approvePlanTool(sessionId, allowed, feedback); break
       }
       pendingApproval.value = null
     } catch (e) {
