@@ -15,8 +15,8 @@ import (
 
 // Summarizer implements openagent.Summarizer via OpenAI ChatCompletion.
 type Summarizer struct {
-	client   openaisdk.Client
-	modelID  string
+	client    openaisdk.Client
+	modelID   string
 	maxTokens int // 0 = default (1024)
 }
 
@@ -136,23 +136,34 @@ Rules:
 // existing summary with new messages, rather than starting from scratch.
 // This enables rolling/incremental compression without information decay.
 func summarizerIncrementalPrompt(previous *openagent.CompressedContext) string {
+	// The key design constraint: the existing summary is IMMUTABLE unless new
+	// messages explicitly contradict it. The model is an APPENDER, not an EDITOR.
+	// This prevents information decay across many incremental passes — facts
+	// from turn 1 survive to turn 200 without being "merged away" by a model
+	// trying to be concise.
 	hintsJSON, _ := json.Marshal(previous.Hints)
-	return fmt.Sprintf(`You are a conversation summarizer updating an existing summary.
+	return fmt.Sprintf(`You are a conversation summarizer maintaining a rolling summary.
 
-EXISTING SUMMARY (from earlier in the conversation):
+EXISTING SUMMARY — DO NOT remove, shorten, or rephrase ANY part of this.
+Copy it VERBATIM into your output, then append new information below it:
+
 %s
 
-EXISTING RETRIEVAL HINTS:
+EXISTING RETRIEVAL HINTS — keep ALL of these, they are proven useful:
 %s
 
-Below are NEW messages that occurred after the existing summary. Update the summary to incorporate the new information.
+Below are NEW messages that occurred after the existing summary.
 
-Rules:
-- PRESERVE all key facts from the existing summary. Only add or modify to reflect new info.
-- Merge related facts rather than duplicating.
-- If new messages contradict old ones, prefer the newer information.
-- Produce 0-5 retrieval hints total (merge old + new, keep the most useful).
-- If the new messages are trivial, keep the existing summary unchanged.
+Rules — follow these EXACTLY:
+1. Start your output by copying the EXISTING SUMMARY WORD-FOR-WORD.
+   Do not rephrase, shorten, merge, or delete anything. It is immutable truth.
+2. After the copied text, add 1-2 sentences describing what happened in the
+   NEW messages — key decisions, facts produced, files written, errors.
+3. The ONLY time you may remove or modify existing summary text is when a new
+   message EXPLICITLY contradicts it (e.g. user says "my colour is blue" when
+   the summary says cerulean). In that case, replace only the contradicted
+   sentence — leave everything else intact.
+4. Keep ALL existing retrieval hints. Add 0-3 new ones from the new messages.
 
 Respond with ONLY valid JSON (no markdown, no commentary):
 {

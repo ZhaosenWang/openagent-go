@@ -24,6 +24,14 @@ type runner struct {
 	compressed   *CompressedContext  // Memory.Compressed result, set once per Run()
 }
 
+// compactionInfo carries compaction outcome from prepareMemory back to run().
+type compactionInfo struct {
+	err   error
+	count int // new messages compacted this run (0 = none)
+	from  int // global index of first new compacted message
+	to    int // global index after compaction (ThroughIndex)
+}
+
 // observe emits a stage event to the agent's RunObserver if configured.
 func (r *runner) observe(ctx context.Context, name string, phase string, detail map[string]any, start time.Time, err error) {
 	if r.agent.Observer == nil {
@@ -121,9 +129,9 @@ func (r *runner) run(ctx context.Context, session Session, prefix []Message, inp
 
 			var history []Message
 			var compressedErr error // fetching Compressed() context (Layer 2)
-			var compactErr error    // writing compaction (Compact())
+			var ci compactionInfo
 			if r.agent.Memory != nil {
-				history, compactErr = r.prepareMemory(ctx, session)
+				history, ci = r.prepareMemory(ctx, session)
 				// The input was just appended to memory — strip it
 				// from history since we add it back after prefix.
 				if len(history) > 0 && history[len(history)-1].Role == RoleUser {
@@ -151,8 +159,15 @@ func (r *runner) run(ctx context.Context, session Session, prefix []Message, inp
 			if compressedErr != nil {
 				mfDetail["compressed_error"] = compressedErr.Error()
 			}
-			if compactErr != nil {
-				mfDetail["compaction_error"] = compactErr.Error()
+			if ci.err != nil {
+				mfDetail["compaction_error"] = ci.err.Error()
+			} else if ci.count > 0 {
+				mfDetail["compacted_count"] = ci.count
+				mfDetail["compacted_from"] = ci.from
+				mfDetail["compacted_to"] = ci.to
+				if r.compressed != nil && r.compressed.Summary != "" {
+					mfDetail["compacted_summary"] = r.compressed.Summary
+				}
 			}
 			r.observe(ctx, StageMemoryFetch, "leave", mfDetail, mfStart, nil)
 
@@ -403,13 +418,13 @@ func (r *runner) workingTokenBudget() int {
 //
 // The returned error carries a compaction failure if one occurred
 // (observability only; the working set is still usable).
-func (r *runner) prepareMemory(ctx context.Context, session Session) ([]Message, error) {
+func (r *runner) prepareMemory(ctx context.Context, session Session) ([]Message, compactionInfo) {
 	if r.agent.Memory == nil {
-		return nil, nil
+		return nil, compactionInfo{}
 	}
 
 	budget := r.workingTokenBudget()
-	var compactErr error
+	var ci compactionInfo
 
 	// Fetch total count and recent messages — one Recent() call for both
 	// compaction and working-set trimming.
@@ -417,10 +432,10 @@ func (r *runner) prepareMemory(ctx context.Context, session Session) ([]Message,
 	if err != nil {
 		r.observe(ctx, StageMemoryFetch, "leave",
 			map[string]any{"error": err.Error()}, time.Now(), err)
-		return nil, nil
+		return nil, ci
 	}
 	if totalCount == 0 {
-		return nil, nil
+		return nil, ci
 	}
 	fetchN := totalCount
 	if fetchN > 5000 {
@@ -428,33 +443,48 @@ func (r *runner) prepareMemory(ctx context.Context, session Session) ([]Message,
 	}
 	msgs, err := r.agent.Memory.Recent(ctx, session.ID, fetchN)
 	if err != nil || len(msgs) == 0 {
-		return nil, nil
+		return nil, ci
 	}
 	globalOffset := totalCount - len(msgs)
 
 	// ── Compaction pass: compress overflow messages ──
+	// Count tokens backwards from the latest message. Messages before the
+	// overflow point dont fit in the budget and are candidates for compaction.
 	overflow := len(msgs)
 	tokens := 0
 	for i := len(msgs) - 1; i >= 0; i-- {
 		tokens += countMessageTokens(session.ModelID, msgs[i])
 		if tokens > budget {
-			overflow = i + 1 // messages before this index overflow the budget
+			overflow = i + 1 // messages[0:i] overflow, messages[i+1:] fit
 			break
 		}
 	}
 	if overflow < len(msgs) {
-			overflow = SafeCompressionBoundary(msgs, overflow)
-			globalCutoff := globalOffset + overflow
-			compactErr = r.agent.Memory.Compact(ctx, session.ID, globalCutoff, msgs)
+		overflow = SafeCompressionBoundary(msgs, overflow)
+		// Record pre-compaction ThroughIndex so we can detect whether
+		// Compact() actually covered new messages.
+		oldTI := 0
+		if cc, _ := r.agent.Memory.Compressed(ctx, session.ID); cc != nil {
+			oldTI = cc.ThroughIndex
 		}
+		globalCutoff := globalOffset + overflow
+		ci.err = r.agent.Memory.Compact(ctx, session.ID, globalCutoff, msgs)
+		if ci.err == nil {
+			// Only report compaction if ThroughIndex advanced.
+			if cc, _ := r.agent.Memory.Compressed(ctx, session.ID); cc != nil && cc.ThroughIndex > oldTI {
+				ci.count = cc.ThroughIndex - oldTI
+				ci.from = globalOffset + oldTI
+				ci.to = globalOffset + cc.ThroughIndex
+			}
+		}
+	}
 
-		// ── Working set: trim to token budget ──
-		// Re-use overflow from compaction pass — same token counting.
-		keep := overflow
-		if keep >= len(msgs) {
-			return msgs, compactErr
-		}
-		return msgs[keep:], compactErr
+	// ── Working set: trim to token budget ──
+	keep := overflow
+	if keep >= len(msgs) {
+		return msgs, ci
+	}
+	return msgs[keep:], ci
 	}
 func (r *runner) buildPrompt(ctx context.Context, session Session, working []Message) []Message {
 	input := PromptInput{
