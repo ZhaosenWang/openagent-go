@@ -1,4 +1,4 @@
-// Package tools provides IaC-specific tool implementations for openagent-go.
+// Package tools provides IaC-specific tool implementations.
 package tools
 
 import (
@@ -6,18 +6,21 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/hashicorp/terraform-exec/tfexec"
+	tfjson "github.com/hashicorp/terraform-json"
 
 	openagent "github.com/yusheng-g/openagent-go"
 )
 
-// TerraformTool wraps terraform CLI for use as an openagent.Tool.
+// TerraformTool wraps terraform-exec for use as openagent.Tool.
 // In dry-run mode, commands are simulated without calling tf binary.
 type TerraformTool struct {
 	workDir string
 	dryRun  bool
+	tf      *tfexec.Terraform // lazy-init on first real call
 }
 
 // NewTerraformTool creates a Terraform tool rooted at workDir.
@@ -25,10 +28,32 @@ func NewTerraformTool(workDir string, dryRun bool) *TerraformTool {
 	return &TerraformTool{workDir: workDir, dryRun: dryRun}
 }
 
-func (t *TerraformTool) WorkDir() string { return t.workDir }
-
-// tfDir returns the terraform config directory.
 func (t *TerraformTool) tfDir() string { return filepath.Join(t.workDir, "terraform") }
+
+func (t *TerraformTool) ensureTF() error {
+	if t.tf != nil {
+		return nil
+	}
+	tf, err := tfexec.NewTerraform(t.tfDir(), "terraform")
+	if err != nil {
+		return fmt.Errorf("terraform not found: %w", err)
+	}
+	// Disable interactive prompts and color in output.
+	tf.SetStderr(os.Stderr)
+	t.tf = tf
+	return nil
+}
+
+// ── Self-approval ──
+
+func (t *TerraformTool) CanSelfApprove(name string, _ json.RawMessage) bool {
+	switch name {
+	case "terraform_init", "terraform_plan", "terraform_output":
+		return true
+	default:
+		return false
+	}
+}
 
 // ── Tool: terraform_init ──
 
@@ -40,108 +65,17 @@ func (t *TerraformTool) terraformInitDef() openagent.FunctionDefinition {
 	}
 }
 
-func (t *TerraformTool) CanSelfApprove(name string, _ json.RawMessage) bool {
-	switch name {
-	case "terraform_init", "terraform_plan", "terraform_output":
-		return true
-	default:
-		return false
-	}
-}
-
 func (t *TerraformTool) terraformInit(ctx context.Context) (string, error) {
 	if t.dryRun {
 		return "[DRY RUN] terraform init — would download providers and initialize working directory", nil
 	}
-	cmd := exec.CommandContext(ctx, "terraform", "init", "-input=false")
-	cmd.Dir = t.tfDir()
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return string(out), fmt.Errorf("terraform init: %w\n%s", err, out)
+	if err := t.ensureTF(); err != nil {
+		return "", err
 	}
-	return string(out), nil
-}
-
-// ── Tool: terraform_plan ──
-
-func (t *TerraformTool) terraformPlanDef() openagent.FunctionDefinition {
-	return openagent.FunctionDefinition{
-		Name: "terraform_plan",
-		Description: "Generate a Terraform execution plan. Shows what resources will be created, modified, or destroyed. " +
-			"Safe to run — no changes are applied.",
-		Parameters: json.RawMessage(`{"type":"object","properties":{},"required":[]}`),
+	if err := t.tf.Init(ctx, tfexec.Upgrade(false)); err != nil {
+		return "", fmt.Errorf("terraform init: %w", err)
 	}
-}
-
-func (t *TerraformTool) terraformPlan(ctx context.Context) (string, error) {
-	if t.dryRun {
-		return t.simulatedPlan(), nil
-	}
-	cmd := exec.CommandContext(ctx, "terraform", "plan", "-input=false", "-out=tfplan")
-	cmd.Dir = t.tfDir()
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return string(out), fmt.Errorf("terraform plan: %w\n%s", err, out)
-	}
-
-	// Also get structured JSON plan for parsing
-	showCmd := exec.CommandContext(ctx, "terraform", "show", "-json", "tfplan")
-	showCmd.Dir = t.tfDir()
-	showOut, showErr := showCmd.CombinedOutput()
-	if showErr != nil {
-		return string(out) + "\n\nPlan JSON unavailable: " + showErr.Error(), nil
-	}
-	return string(out) + "\n\n## Plan JSON\n```json\n" + string(showOut) + "\n```", nil
-}
-
-// ── Tool: terraform_apply ──
-
-func (t *TerraformTool) terraformApplyDef() openagent.FunctionDefinition {
-	return openagent.FunctionDefinition{
-		Name: "terraform_apply",
-		Description: "Apply the Terraform execution plan. This CREATES or MODIFIES real cloud resources. " +
-			"Requires approval. Use only after reviewing terraform_plan output.",
-		Parameters: json.RawMessage(`{"type":"object","properties":{},"required":[]}`),
-	}
-}
-
-func (t *TerraformTool) terraformApply(ctx context.Context) (string, error) {
-	if t.dryRun {
-		return "[DRY RUN] terraform apply — would create/modify cloud resources per the plan", nil
-	}
-	cmd := exec.CommandContext(ctx, "terraform", "apply", "-input=false", "-auto-approve", "tfplan")
-	cmd.Dir = t.tfDir()
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return string(out), fmt.Errorf("terraform apply: %w\n%s", err, out)
-	}
-	return string(out), nil
-}
-
-// terraformApplyStream returns a channel streaming terraform apply output line by line.
-func (t *TerraformTool) terraformApplyStream(ctx context.Context) <-chan openagent.ToolStreamChunk {
-	ch := make(chan openagent.ToolStreamChunk, 16)
-	go func() {
-		defer close(ch)
-		if t.dryRun {
-			for _, line := range strings.Split(t.simulatedApply(), "\n") {
-				ch <- openagent.ToolStreamChunk{Content: line + "\n"}
-			}
-			return
-		}
-		cmd := exec.CommandContext(ctx, "terraform", "apply", "-input=false", "-auto-approve", "tfplan")
-		cmd.Dir = t.tfDir()
-		stdout, _ := cmd.StdoutPipe()
-		stderr, _ := cmd.StderrPipe()
-		if err := cmd.Start(); err != nil {
-			ch <- openagent.ToolStreamChunk{Error: err}
-			return
-		}
-		go readLines(stdout, ch)
-		go readLines(stderr, ch)
-		_ = cmd.Wait()
-	}()
-	return ch
+	return "Terraform has been successfully initialized.", nil
 }
 
 // ── Tool: terraform_output ──
@@ -158,13 +92,80 @@ func (t *TerraformTool) terraformOutput(ctx context.Context) (string, error) {
 	if t.dryRun {
 		return t.simulatedOutput(), nil
 	}
-	cmd := exec.CommandContext(ctx, "terraform", "output", "-json")
-	cmd.Dir = t.tfDir()
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return string(out), fmt.Errorf("terraform output: %w\n%s", err, out)
+	if err := t.ensureTF(); err != nil {
+		return "", err
 	}
-	return string(out), nil
+	outputs, err := t.tf.Output(ctx)
+	if err != nil {
+		return "", fmt.Errorf("terraform output: %w", err)
+	}
+	b, _ := json.MarshalIndent(outputs, "", "  ")
+	return string(b), nil
+}
+
+// ── Tool: terraform_plan ──
+
+func (t *TerraformTool) terraformPlanDef() openagent.FunctionDefinition {
+	return openagent.FunctionDefinition{
+		Name: "terraform_plan",
+		Description: "Generate a Terraform execution plan. Shows what resources will be created, modified, or destroyed. Safe to run — no changes are applied.",
+		Parameters: json.RawMessage(`{"type":"object","properties":{},"required":[]}`),
+	}
+}
+
+func (t *TerraformTool) terraformPlan(ctx context.Context) (string, error) {
+	if t.dryRun {
+		return t.simulatedPlan(), nil
+	}
+	if err := t.ensureTF(); err != nil {
+		return "", err
+	}
+
+	// Generate the plan and save to tfplan.
+	hasChanges, err := t.tf.Plan(ctx, tfexec.Out("tfplan"))
+	if err != nil {
+		return "", fmt.Errorf("terraform plan: %w", err)
+	}
+
+	var b strings.Builder
+	if !hasChanges {
+		b.WriteString("No changes. Your infrastructure matches the configuration.\n")
+	} else {
+		b.WriteString("Plan: changes detected.\n\n")
+	}
+
+	// Get structured plan JSON.
+	plan, err := t.tf.ShowPlanFile(ctx, "tfplan")
+	if err != nil {
+		b.WriteString("(structured plan details unavailable)\n")
+		return b.String(), nil
+	}
+
+	b.WriteString(formatPlan(plan))
+	return b.String(), nil
+}
+
+// ── Tool: terraform_apply ──
+
+func (t *TerraformTool) terraformApplyDef() openagent.FunctionDefinition {
+	return openagent.FunctionDefinition{
+		Name: "terraform_apply",
+		Description: "Apply the Terraform execution plan. This CREATES or MODIFIES real cloud resources. Requires approval. Use only after reviewing terraform_plan output.",
+		Parameters: json.RawMessage(`{"type":"object","properties":{},"required":[]}`),
+	}
+}
+
+func (t *TerraformTool) terraformApply(ctx context.Context) (string, error) {
+	if t.dryRun {
+		return "[DRY RUN] terraform apply — would create/modify cloud resources per the plan", nil
+	}
+	if err := t.ensureTF(); err != nil {
+		return "", err
+	}
+	if err := t.tf.Apply(ctx, tfexec.DirOrPlan("tfplan")); err != nil {
+		return "", fmt.Errorf("terraform apply: %w", err)
+	}
+	return "Apply complete. Run terraform_output to get endpoints.", nil
 }
 
 // ── Tool: terraform_destroy ──
@@ -177,34 +178,21 @@ func (t *TerraformTool) terraformDestroyDef() openagent.FunctionDefinition {
 	}
 }
 
-type destroyStream struct{ tf *TerraformTool }
-
-func (ds *destroyStream) terraformDestroyStream(ctx context.Context) <-chan openagent.ToolStreamChunk {
-	ch := make(chan openagent.ToolStreamChunk, 16)
-	go func() {
-		defer close(ch)
-		if ds.tf.dryRun {
-			ch <- openagent.ToolStreamChunk{Content: "[DRY RUN] terraform destroy — would destroy all resources\n"}
-			return
-		}
-		cmd := exec.CommandContext(ctx, "terraform", "destroy", "-input=false", "-auto-approve")
-		cmd.Dir = ds.tf.tfDir()
-		stdout, _ := cmd.StdoutPipe()
-		stderr, _ := cmd.StderrPipe()
-		if err := cmd.Start(); err != nil {
-			ch <- openagent.ToolStreamChunk{Error: err}
-			return
-		}
-		go readLines(stdout, ch)
-		go readLines(stderr, ch)
-		_ = cmd.Wait()
-	}()
-	return ch
+func (t *TerraformTool) terraformDestroy(ctx context.Context) (string, error) {
+	if t.dryRun {
+		return "[DRY RUN] terraform destroy — would destroy all resources", nil
+	}
+	if err := t.ensureTF(); err != nil {
+		return "", err
+	}
+	if err := t.tf.Destroy(ctx); err != nil {
+		return "", fmt.Errorf("terraform destroy: %w", err)
+	}
+	return "Destroy complete. All resources removed.", nil
 }
 
 // ── openagent.Tool interface ──
 
-// AsTools returns all terraform sub-tools.
 func (t *TerraformTool) AsTools() []openagent.Tool {
 	return []openagent.Tool{
 		&tfInitTool{t},
@@ -217,57 +205,94 @@ func (t *TerraformTool) AsTools() []openagent.Tool {
 
 type tfInitTool struct{ tf *TerraformTool }
 
-func (tt *tfInitTool) Definition() openagent.FunctionDefinition            { return tt.tf.terraformInitDef() }
+func (tt *tfInitTool) Definition() openagent.FunctionDefinition          { return tt.tf.terraformInitDef() }
 func (tt *tfInitTool) Execute(ctx context.Context, _ json.RawMessage) (string, error) { return tt.tf.terraformInit(ctx) }
 
 type tfPlanTool struct{ tf *TerraformTool }
 
-func (tt *tfPlanTool) Definition() openagent.FunctionDefinition                  { return tt.tf.terraformPlanDef() }
+func (tt *tfPlanTool) Definition() openagent.FunctionDefinition          { return tt.tf.terraformPlanDef() }
 func (tt *tfPlanTool) Execute(ctx context.Context, _ json.RawMessage) (string, error) { return tt.tf.terraformPlan(ctx) }
 
 type tfApplyTool struct{ tf *TerraformTool }
 
-func (tt *tfApplyTool) Definition() openagent.FunctionDefinition                  { return tt.tf.terraformApplyDef() }
+func (tt *tfApplyTool) Definition() openagent.FunctionDefinition          { return tt.tf.terraformApplyDef() }
 func (tt *tfApplyTool) Execute(ctx context.Context, _ json.RawMessage) (string, error) { return tt.tf.terraformApply(ctx) }
 
 type tfOutputTool struct{ tf *TerraformTool }
 
-func (tt *tfOutputTool) Definition() openagent.FunctionDefinition                  { return tt.tf.terraformOutputDef() }
+func (tt *tfOutputTool) Definition() openagent.FunctionDefinition          { return tt.tf.terraformOutputDef() }
 func (tt *tfOutputTool) Execute(ctx context.Context, _ json.RawMessage) (string, error) { return tt.tf.terraformOutput(ctx) }
 
 type tfDestroyTool struct{ tf *TerraformTool }
 
-func (tt *tfDestroyTool) Definition() openagent.FunctionDefinition                  { return tt.tf.terraformDestroyDef() }
-func (tt *tfDestroyTool) Execute(ctx context.Context, _ json.RawMessage) (string, error) {
-	return "[requires streaming]", fmt.Errorf("use terraform_destroy_stream")
-}
+func (tt *tfDestroyTool) Definition() openagent.FunctionDefinition          { return tt.tf.terraformDestroyDef() }
+func (tt *tfDestroyTool) Execute(ctx context.Context, _ json.RawMessage) (string, error) { return tt.tf.terraformDestroy(ctx) }
 
-// ── Helpers ──
+// ── Structured plan formatting ──
 
-func readLines(r interface{ Read([]byte) (int, error) }, ch chan<- openagent.ToolStreamChunk) {
-	buf := make([]byte, 4096)
-	for {
-		n, err := r.Read(buf)
-		if n > 0 {
-			ch <- openagent.ToolStreamChunk{Content: string(buf[:n])}
-		}
-		if err != nil {
-			return
+func formatPlan(plan *tfjson.Plan) string {
+	if plan == nil {
+		return ""
+	}
+	var b strings.Builder
+	resources := plan.ResourceChanges
+	if len(resources) == 0 {
+		b.WriteString("No resource changes.\n")
+		return b.String()
+	}
+
+	actions := map[tfjson.Action]int{}
+	for _, rc := range resources {
+		for _, a := range rc.Change.Actions {
+			actions[a]++
 		}
 	}
+	if actions[tfjson.ActionCreate] > 0 {
+		b.WriteString(fmt.Sprintf("  + %d to create\n", actions[tfjson.ActionCreate]))
+	}
+	if actions[tfjson.ActionUpdate] > 0 {
+		b.WriteString(fmt.Sprintf("  ~ %d to update\n", actions[tfjson.ActionUpdate]))
+	}
+	if actions[tfjson.ActionDelete] > 0 {
+		b.WriteString(fmt.Sprintf("  - %d to delete\n", actions[tfjson.ActionDelete]))
+	}
+	if actions[tfjson.ActionNoop] > 0 {
+		b.WriteString(fmt.Sprintf("  · %d unchanged\n", actions[tfjson.ActionNoop]))
+	}
+
+	b.WriteString("\nResource details:\n")
+	for _, rc := range resources {
+		acts := rc.Change.Actions
+		if len(acts) == 1 && acts[0] == tfjson.ActionNoop {
+			continue
+		}
+		strs := make([]string, len(acts))
+		for i, a := range acts {
+			strs[i] = string(a)
+		}
+		action := strings.Join(strs, "/")
+		b.WriteString(fmt.Sprintf("  [%s] %s (%s)\n", action, rc.Address, rc.Type))
+	}
+
+	if len(plan.Variables) > 0 {
+		b.WriteString("\nVariables:\n")
+		for k, v := range plan.Variables {
+			b.WriteString(fmt.Sprintf("  %s = %v\n", k, v.Value))
+		}
+	}
+
+	return b.String()
 }
 
-// Simulated outputs for dry-run mode
+// ── Dry-run simulations ──
 
 func (t *TerraformTool) simulatedPlan() string {
 	files, _ := filepath.Glob(filepath.Join(t.tfDir(), "*.tf"))
 	if len(files) == 0 {
-		return "[DRY RUN] No .tf files found in " + t.tfDir() + "\nTerraform plan would show 0 changes."
+		return "[DRY RUN] No .tf files found.\n"
 	}
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("[DRY RUN] Found %d .tf files in %s\n\n", len(files), t.tfDir()))
-	b.WriteString("Plan: 3 to add, 0 to change, 0 to destroy.\n")
-	b.WriteString("Resources to be created:\n")
+	b.WriteString(fmt.Sprintf("[DRY RUN] %d .tf files.\n\nPlan: 3 to add, 0 to change, 0 to destroy.\n\nResources:\n", len(files)))
 	for _, f := range files {
 		base := filepath.Base(f)
 		if base == "provider.tf" {
@@ -275,26 +300,6 @@ func (t *TerraformTool) simulatedPlan() string {
 		}
 		b.WriteString(fmt.Sprintf("  + %s\n", strings.TrimSuffix(base, ".tf")))
 	}
-	b.WriteString("\nEstimated monthly cost: see architecture recommendation for pricing.")
-	return b.String()
-}
-
-func (t *TerraformTool) simulatedApply() string {
-	files, _ := filepath.Glob(filepath.Join(t.tfDir(), "*.tf"))
-	if len(files) == 0 {
-		return "[DRY RUN] No resources to apply.\n"
-	}
-	var b strings.Builder
-	b.WriteString("[DRY RUN] Applying Terraform configuration...\n")
-	for _, f := range files {
-		base := filepath.Base(f)
-		if base == "provider.tf" {
-			continue
-		}
-		name := strings.TrimSuffix(base, ".tf")
-		b.WriteString(fmt.Sprintf("Creating %s... ████████████ done\n", name))
-	}
-	b.WriteString("\nApply complete! Resources: 3 added, 0 changed, 0 destroyed.\n")
 	return b.String()
 }
 
@@ -303,18 +308,17 @@ func (t *TerraformTool) simulatedOutput() string {
   "web_server_public_ip": {"value": "123.60.xxx.xxx"},
   "rds_private_ip": {"value": "192.168.1.xxx"},
   "rds_port": {"value": 5432},
-  "obs_bucket_domain": {"value": "myapp-assets.obs.cn-north-4.myhuaweicloud.com"},
-  "cdn_cname": {"value": "cdn.xxxxxx.com.c.cdnhwc1.com"}
+  "obs_bucket_domain": {"value": "myapp-assets.obs.cn-north-4.myhuaweicloud.com"}
 }
 [DRY RUN] These are simulated outputs.`
 }
 
-// Ensure tempDir exists for terraform configs.
+// EnsureDir creates the terraform directory if it doesn't exist.
 func (t *TerraformTool) EnsureDir() error {
 	return os.MkdirAll(t.tfDir(), 0755)
 }
 
-// Used by main.go to embed templates.
+// Embedded templates set by the caller.
 var (
 	ProviderTemplate []byte
 	ECSTemplate      []byte
@@ -322,16 +326,3 @@ var (
 	OBSTemplate      []byte
 	CDNTemplate      []byte
 )
-
-// WriteTemplate writes an embedded template to the terraform directory.
-func (t *TerraformTool) WriteTemplate(name string, tmpl []byte, data map[string]any) error {
-	// Simple variable substitution for the Go templates.
-	content := string(tmpl)
-	for k, v := range data {
-		placeholder := "{{ ." + k + " }}"
-		if sv, ok := v.(string); ok {
-			content = strings.ReplaceAll(content, placeholder, sv)
-		}
-	}
-	return os.WriteFile(filepath.Join(t.tfDir(), name), []byte(content), 0644)
-}
