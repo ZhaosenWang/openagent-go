@@ -47,7 +47,7 @@ func main() {
 	session := openagent.Session{
 		ID:        fmt.Sprintf("tui-%d", time.Now().Unix()),
 		UserID:    "user",
-		AgentName: "assistant",
+
 		ModelID:   modelID,
 		CreatedAt: time.Now(),
 	}

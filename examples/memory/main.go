@@ -89,7 +89,7 @@ func main() {
 	}
 
 	session := openagent.Session{
-		ID: "demo", UserID: "user-1", AgentName: "memory-demo",
+
 		ModelID: modelID, CreatedAt: time.Now(),
 	}
 	ctx := context.Background()
@@ -159,7 +159,7 @@ You have access to a workspace where you can create and modify files.`),
 	// ── Evidence ──
 	fmt.Println("\n━━━ Evidence ━━━")
 	total, _ := mem.Count(ctx, session.ID)
-	all, _ := mem.Recent(ctx, session.ID, total)
+	all, _ := mem.Recent(ctx, session.ID, total, 0)
 	fmt.Printf("Total messages in archive: %d\n\n", len(all))
 	for i, m := range all {
 		marker := ""

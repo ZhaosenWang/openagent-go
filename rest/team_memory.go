@@ -51,9 +51,9 @@ func (m *teamAgentMemory) Append(ctx context.Context, sessionID string, msg open
 	return m.shared.Append(ctx, sessionID, msg)
 }
 
-func (m *teamAgentMemory) Recent(ctx context.Context, sessionID string, n int) ([]openagent.Message, error) {
-	shared, _ := m.shared.Recent(ctx, sessionID, n)
-	priv, _ := m.private.Recent(ctx, m.privateKey(sessionID), n)
+func (m *teamAgentMemory) Recent(ctx context.Context, sessionID string, n int, offset int) ([]openagent.Message, error) {
+	shared, _ := m.shared.Recent(ctx, sessionID, n, offset)
+	priv, _ := m.private.Recent(ctx, m.privateKey(sessionID), n, offset)
 
 	// Concatenate: shared (narrative) first, then private (own work).
 	// This gives the agent: "here's the conversation so far, and here's

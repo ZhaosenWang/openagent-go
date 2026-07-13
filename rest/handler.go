@@ -44,6 +44,8 @@ type Handler struct {
 
 	sessionIdleTTL time.Duration // 0 = sessions never expire
 
+	store SessionStore // nil = in-memory only
+
 	bus *eventbus.Bus[SSEEvent]
 
 	mu       sync.RWMutex
@@ -58,8 +60,8 @@ type Handler struct {
 func NewHandler(agent *openagent.Agent) *Handler {
 	return &Handler{
 		defaultModel: agent.Model,
-		models:       map[string]openagent.Model{"default": agent.Model},
-		modelList:    []ModelInfo{{ID: "default", Provider: ""}},
+		models:    make(map[string]openagent.Model),
+		modelList: nil,
 		memory:       agent.Memory,
 		tools:        agent.Tools,
 		instructions: agent.Instructions,
@@ -104,15 +106,21 @@ func (h *Handler) WithSessionTTL(idle time.Duration) *Handler {
 	return h
 }
 
+// WithSessionStore attaches a persistent session metadata store.
+// nil (the default) preserves the current in-memory-only behavior.
+func (h *Handler) WithSessionStore(s SessionStore) *Handler {
+	h.store = s
+	return h
+}
+
 // ── sessionState ──
 
 // sessionState holds the per-session runtime state.
 // Events are published to the Handler-level bus so that multiple
 // SSE connections (e.g. browser tabs) all receive the full stream.
 type sessionState struct {
-	info       SessionInfo
+	info       SessionInfo // ModelID is the session's model preference; empty → handler default
 	agent      *openagent.Agent
-	modelID    string // session default model (empty = use agent's model)
 	lastAccess time.Time
 
 	mu              sync.Mutex
@@ -138,23 +146,28 @@ func (h *Handler) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 
 	id := generateID()
 	now := time.Now()
-	agentName := req.AgentName
-	if agentName == "" {
-		agentName = h.name
-	}
-
 	info := SessionInfo{
 		ID:        id,
 		Title:     req.Title,
-		AgentName: agentName,
+		Kind:      "single",
 		ModelID:   req.ModelID,
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
 
 	h.mu.Lock()
-	h.sessions[id] = h.newSession(info, req.ModelID)
+	h.sessions[id] = h.newSession(info)
 	h.mu.Unlock()
+
+	if h.store != nil {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := h.store.Save(ctx, info); err != nil {
+				log.Printf("rest: failed to persist session %s: %v", id, err)
+			}
+		}()
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
@@ -162,6 +175,22 @@ func (h *Handler) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleListSessions(w http.ResponseWriter, r *http.Request) {
+	if h.store != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		list, err := h.store.List(ctx, "single")
+		if err != nil {
+			http.Error(w, `{"error":"failed to list sessions"}`, http.StatusInternalServerError)
+			return
+		}
+		if list == nil {
+			list = []SessionInfo{}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(list)
+		return
+	}
+
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
@@ -181,23 +210,44 @@ func (h *Handler) handleGetSession(w http.ResponseWriter, r *http.Request) {
 	s, ok := h.sessions[id]
 	h.mu.RUnlock()
 
-	if !ok {
-		http.Error(w, `{"error":"session not found"}`, http.StatusNotFound)
+	if ok {
+		detail := SessionDetail{SessionInfo: s.info}
+		if s.agent != nil && s.agent.Model != nil {
+			detail.ContextWindow = s.agent.Model.ContextWindow()
+		}
+		if h.memory != nil {
+			if n, err := h.memory.Count(context.Background(), s.info.ID); err == nil {
+				detail.MessageCount = n
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(detail)
 		return
 	}
 
-	detail := SessionDetail{SessionInfo: s.info}
-	if s.agent != nil && s.agent.Model != nil {
-		detail.ContextWindow = s.agent.Model.ContextWindow()
-	}
-	if h.memory != nil {
-		if n, err := h.memory.Count(context.Background(), s.info.ID); err == nil {
-			detail.MessageCount = n
+	// Not in memory — try persistent store (e.g. after restart).
+	if h.store != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		info, err := h.store.Get(ctx, id)
+		if err != nil {
+			http.Error(w, `{"error":"failed to get session"}`, http.StatusInternalServerError)
+			return
+		}
+		if info != nil {
+			detail := SessionDetail{SessionInfo: *info}
+			if h.memory != nil {
+				if n, err := h.memory.Count(context.Background(), id); err == nil {
+					detail.MessageCount = n
+				}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(detail)
+			return
 		}
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(detail)
+	http.Error(w, `{"error":"session not found"}`, http.StatusNotFound)
 }
 
 func (h *Handler) handleUpdateSession(w http.ResponseWriter, r *http.Request) {
@@ -224,10 +274,21 @@ func (h *Handler) handleUpdateSession(w http.ResponseWriter, r *http.Request) {
 	if body.Title != "" {
 		s.info.UpdatedAt = time.Now()
 	}
+	currentInfo := s.info
 	s.mu.Unlock()
 
+	if h.store != nil {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := h.store.Save(ctx, currentInfo); err != nil {
+				log.Printf("rest: failed to persist session %s: %v", id, err)
+			}
+		}()
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(s.info)
+	json.NewEncoder(w).Encode(currentInfo)
 }
 
 func (h *Handler) handleListMessages(w http.ResponseWriter, r *http.Request) {
@@ -250,11 +311,15 @@ func (h *Handler) handleListMessages(w http.ResponseWriter, r *http.Request) {
 	if l, err := parseIntParam(r, "limit", 1, 200); err == nil {
 		limit = l
 	}
+	before := 0
+	if b, err := parseIntParam(r, "before", 0, 100000); err == nil {
+		before = b
+	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	msgs, err := h.memory.Recent(ctx, id, limit)
+	msgs, err := h.memory.Recent(ctx, id, limit, before)
 	if err != nil {
 		http.Error(w, `{"error":"failed to fetch messages"}`, http.StatusInternalServerError)
 		return
@@ -266,6 +331,7 @@ func (h *Handler) handleListMessages(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(msgs)
 }
+
 
 // parseIntParam parses an integer query parameter with bounds.
 func parseIntParam(r *http.Request, name string, min, max int) (int, error) {
@@ -288,6 +354,16 @@ func parseIntParam(r *http.Request, name string, min, max int) (int, error) {
 
 func (h *Handler) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+
+	// Delete from store first — if it fails, don't touch the in-memory map.
+	if h.store != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		if err := h.store.Delete(ctx, id); err != nil {
+			http.Error(w, `{"error":"failed to delete session"}`, http.StatusInternalServerError)
+			return
+		}
+	}
 
 	h.mu.Lock()
 	delete(h.sessions, id)
@@ -338,7 +414,7 @@ func (h *Handler) handleChat(w http.ResponseWriter, r *http.Request) {
 	// Resolve model: chat-level override > session default > handler default.
 	modelID := body.ModelID
 	if modelID == "" {
-		modelID = s.modelID
+		modelID = s.info.ModelID
 	}
 	h.mu.RLock()
 	model := h.models[modelID]
@@ -350,9 +426,19 @@ func (h *Handler) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	// Persist the resolved model so GET /sessions reflects the actual model.
 	s.mu.Lock()
-	s.modelID = modelID
 	s.info.ModelID = modelID
+	currentInfo := s.info
 	s.mu.Unlock()
+
+	if h.store != nil {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := h.store.Save(ctx, currentInfo); err != nil {
+				log.Printf("rest: failed to sync modelID for session %s: %v", id, err)
+			}
+		}()
+	}
 
 	// Start the agent run in a background goroutine.
 	go func() {
@@ -361,7 +447,7 @@ func (h *Handler) handleChat(w http.ResponseWriter, r *http.Request) {
 
 		oaSession := openagent.Session{
 			ID:        id,
-			AgentName: s.info.AgentName,
+
 			ModelID:   modelID,
 			Model:     model,
 			CreatedAt: s.info.CreatedAt,
@@ -451,31 +537,65 @@ func (h *Handler) handleListModels(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) getOrCreateSession(id string) *sessionState {
 	h.mu.Lock()
+	if s, ok := h.sessions[id]; ok {
+		s.lastAccess = time.Now()
+		h.mu.Unlock()
+		return s
+	}
+	h.mu.Unlock()
+
+	// Try to restore from persistent store.
+	var info SessionInfo
+	restored := false
+	if h.store != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if stored, err := h.store.Get(ctx, id); err == nil && stored != nil {
+			info = *stored
+			restored = true
+		}
+	}
+
+	if !restored {
+		info = SessionInfo{
+			ID:        id,
+			Kind:      "single",
+			CreatedAt: time.Now(),
+			UpdatedAt: time.Now(),
+		}
+	}
+
+	h.mu.Lock()
 	defer h.mu.Unlock()
+
+	// Double-check: someone else might have created it while we were querying the store.
 	if s, ok := h.sessions[id]; ok {
 		s.lastAccess = time.Now()
 		return s
 	}
-	info := SessionInfo{
-		ID:        id,
-		AgentName: h.name,
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
-	}
-	s := h.newSession(info, "")
+
+	s := h.newSession(info)
 	s.lastAccess = time.Now()
 	h.sessions[id] = s
 	h.maybeStartReaper()
+
+	if !restored && h.store != nil {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := h.store.Save(ctx, info); err != nil {
+				log.Printf("rest: failed to persist session %s: %v", id, err)
+			}
+		}()
+	}
+
 	return s
 }
 
-func (h *Handler) newSession(info SessionInfo, modelID string) *sessionState {
-	s := &sessionState{
-		info:    info,
-		modelID: modelID,
-	}
+func (h *Handler) newSession(info SessionInfo) *sessionState {
+	s := &sessionState{info: info}
 
-	s.agent = openagent.NewAgent(info.AgentName,
+	s.agent = openagent.NewAgent(h.name,
 		openagent.WithModel(h.defaultModel),
 		openagent.WithMemory(h.memory),
 		openagent.WithTools(h.tools...),

@@ -78,9 +78,7 @@ func (r *runner) run(ctx context.Context, session Session, prefix []Message, inp
 		r.builtinTools = append(r.builtinTools, builtinRecallDef)
 	}
 
-	result := &RunResult{
-		AgentName: r.agent.Name,
-	}
+	result := &RunResult{}
 
 	// Append initial user input to memory
 	r.appendMemory(ctx, session, input)
@@ -450,7 +448,7 @@ func (r *runner) prepareMemory(ctx context.Context, session Session) ([]Message,
 	if fetchN > 5000 {
 		fetchN = 5000
 	}
-	msgs, err := r.agent.Memory.Recent(ctx, session.ID, fetchN)
+	msgs, err := r.agent.Memory.Recent(ctx, session.ID, fetchN, 0)
 	if err != nil || len(msgs) == 0 {
 		return nil, ci
 	}
@@ -497,7 +495,6 @@ func (r *runner) prepareMemory(ctx context.Context, session Session) ([]Message,
 	}
 func (r *runner) buildPrompt(ctx context.Context, session Session, working []Message) []Message {
 	input := PromptInput{
-		AgentName:        r.agent.Name,
 		AgentDescription: r.agent.Description,
 		Instructions:     r.agent.Instructions,
 		WorkingMessages:  working,

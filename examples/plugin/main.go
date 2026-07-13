@@ -64,7 +64,7 @@ func main() {
 	session := openagent.Session{
 		ID:        "plugin-session-1",
 		UserID:    "user-1",
-		AgentName: "assistant",
+
 		ModelID:   modelID,
 		CreatedAt: time.Now(),
 	}

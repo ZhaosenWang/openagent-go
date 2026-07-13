@@ -362,7 +362,7 @@ export const useChatStore = defineStore('chat', () => {
       const fn = t === 'team' ? api.listTeamMessages :
                 t === 'plan' ? api.listPlanMessages :
                 api.listMessages
-      const msgs = await fn(sessionId, 100, 0)
+      const msgs = await fn(sessionId, 100)
       const converted: ChatMessage[] = []
       for (const m of msgs) {
         const role = m.role === 'user' ? 'user' :

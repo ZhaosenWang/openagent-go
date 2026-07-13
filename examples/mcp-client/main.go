@@ -102,7 +102,7 @@ Step 6: Do NOT call iac_apply unless the user explicitly asks for it.`),
 
 	sess := openagent.Session{
 		ID: "iac-mcp-demo", UserID: "user-1",
-		AgentName: "iac-coordinator", ModelID: modelID,
+
 		CreatedAt: time.Now(),
 	}
 

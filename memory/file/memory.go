@@ -100,9 +100,9 @@ func (m *Memory) Append(ctx context.Context, sessionID string, msg openagent.Mes
 	return nil
 }
 
-// Recent returns the last n messages for a session, oldest first.
-// Pure query — compaction is triggered separately via Compact() by the Runner.
-func (m *Memory) Recent(ctx context.Context, sessionID string, n int) ([]openagent.Message, error) {
+// Recent returns up to n messages for a session, skipping the offset most
+// recent, oldest first. offset=0 returns the latest n.
+func (m *Memory) Recent(ctx context.Context, sessionID string, n int, offset int) ([]openagent.Message, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -115,6 +115,11 @@ func (m *Memory) Recent(ctx context.Context, sessionID string, n int) ([]openage
 		return nil, err
 	}
 
+	if offset > 0 && len(all) > offset {
+		all = all[:len(all)-offset]
+	} else if offset > 0 {
+		return nil, nil
+	}
 	if len(all) <= n {
 		return all, nil
 	}

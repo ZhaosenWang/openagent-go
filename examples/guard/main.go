@@ -39,7 +39,7 @@ func main() {
 	session := openagent.Session{
 		ID:        "guard-session-1",
 		UserID:    "user-1",
-		AgentName: "assistant",
+
 		ModelID:   modelID,
 		CreatedAt: time.Now(),
 	}
@@ -60,7 +60,7 @@ func main() {
 	session2 := openagent.Session{
 		ID:        "guard-session-2",
 		UserID:    "user-1",
-		AgentName: "assistant",
+
 		ModelID:   modelID,
 		CreatedAt: time.Now(),
 	}

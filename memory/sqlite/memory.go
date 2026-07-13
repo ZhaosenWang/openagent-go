@@ -51,6 +51,10 @@ func New(path string) (*Memory, error) {
 	return m, nil
 }
 
+// DB returns the underlying *sql.DB so callers can share the connection
+// (e.g., for co-located session metadata storage).
+func (m *Memory) DB() *sql.DB { return m.db }
+
 // WithEmbedder enables semantic (vector) search.
 func (m *Memory) WithEmbedder(e openagent.Embedder) *Memory {
 	m.embedder = e
@@ -186,11 +190,11 @@ func (m *Memory) Append(ctx context.Context, sessionID string, msg openagent.Mes
 	return nil
 }
 
-func (m *Memory) Recent(ctx context.Context, sessionID string, n int) ([]openagent.Message, error) {
+func (m *Memory) Recent(ctx context.Context, sessionID string, n int, offset int) ([]openagent.Message, error) {
 	// Fetch most recent messages in reverse-chronological order,
 	// then reverse to chronological. Fetch 2×n so we can trim
 	// incomplete tool_call/tool_result pairs at boundaries.
-	fetchN := n * 2
+	fetchN := n*2 + offset
 	if fetchN < 20 {
 		fetchN = 20
 	}
@@ -222,8 +226,13 @@ func (m *Memory) Recent(ctx context.Context, sessionID string, n int) ([]openage
 		msgs = msgs[1:]
 	}
 
-	// Return up to n most recent messages.
-	if len(msgs) > n {
+	// Skip 'offset' most recent messages, then return up to n.
+	if offset > 0 && len(msgs) > offset {
+		msgs = msgs[:len(msgs)-offset]
+	} else if offset > 0 {
+		msgs = nil
+	}
+	if n > 0 && len(msgs) > n {
 		msgs = msgs[len(msgs)-n:]
 	}
 

@@ -74,7 +74,7 @@ IMPORTANT: Call both tools in a single response so they run in parallel.`),
 	session := openagent.Session{
 		ID:        "delegate-session-1",
 		UserID:    "user-1",
-		AgentName: "coordinator",
+
 		ModelID:   modelID,
 		CreatedAt: time.Now(),
 	}

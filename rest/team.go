@@ -31,6 +31,8 @@ type TeamHandler struct {
 
 	sessionIdleTTL time.Duration // 0 = sessions never expire
 
+	store SessionStore // nil = in-memory only
+
 	bus *eventbus.Bus[SSEEvent]
 
 	mu       sync.RWMutex
@@ -88,6 +90,12 @@ func (h *TeamHandler) WithSessionTTL(idle time.Duration) *TeamHandler {
 	return h
 }
 
+// WithSessionStore attaches a persistent session metadata store.
+func (h *TeamHandler) WithSessionStore(s SessionStore) *TeamHandler {
+	h.store = s
+	return h
+}
+
 // ── teamSessionState ──
 
 type teamSessionState struct {
@@ -121,7 +129,7 @@ func (h *TeamHandler) handleCreateSession(w http.ResponseWriter, r *http.Request
 	info := SessionInfo{
 		ID:        id,
 		Title:     req.Title,
-		AgentName: "team",
+		Kind:      "team",
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
@@ -130,12 +138,38 @@ func (h *TeamHandler) handleCreateSession(w http.ResponseWriter, r *http.Request
 	h.sessions[id] = h.newSession(info)
 	h.mu.Unlock()
 
+	if h.store != nil {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := h.store.Save(ctx, info); err != nil {
+				log.Printf("rest: failed to persist team session %s: %v", id, err)
+			}
+		}()
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(info)
 }
 
 func (h *TeamHandler) handleListSessions(w http.ResponseWriter, r *http.Request) {
+	if h.store != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		list, err := h.store.List(ctx, "team")
+		if err != nil {
+			http.Error(w, `{"error":"failed to list sessions"}`, http.StatusInternalServerError)
+			return
+		}
+		if list == nil {
+			list = []SessionInfo{}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(list)
+		return
+	}
+
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 
@@ -155,19 +189,41 @@ func (h *TeamHandler) handleGetSession(w http.ResponseWriter, r *http.Request) {
 	s, ok := h.sessions[id]
 	h.mu.RUnlock()
 
-	if !ok {
-		http.Error(w, `{"error":"session not found"}`, http.StatusNotFound)
+	if ok {
+		w.Header().Set("Content-Type", "application/json")
+		detail := SessionDetail{SessionInfo: s.info}
+		if h.memory != nil {
+			if n, err := h.memory.Count(context.Background(), s.info.ID); err == nil {
+				detail.MessageCount = n
+			}
+		}
+		json.NewEncoder(w).Encode(detail)
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	detail := SessionDetail{SessionInfo: s.info}
-	if h.memory != nil {
-		if n, err := h.memory.Count(context.Background(), s.info.ID); err == nil {
-			detail.MessageCount = n
+	// Not in memory — try persistent store.
+	if h.store != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		info, err := h.store.Get(ctx, id)
+		if err != nil {
+			http.Error(w, `{"error":"failed to get session"}`, http.StatusInternalServerError)
+			return
+		}
+		if info != nil {
+			detail := SessionDetail{SessionInfo: *info}
+			if h.memory != nil {
+				if n, err := h.memory.Count(context.Background(), id); err == nil {
+					detail.MessageCount = n
+				}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(detail)
+			return
 		}
 	}
-	json.NewEncoder(w).Encode(detail)
+
+	http.Error(w, `{"error":"session not found"}`, http.StatusNotFound)
 }
 
 func (h *TeamHandler) handleUpdateSession(w http.ResponseWriter, r *http.Request) {
@@ -194,14 +250,35 @@ func (h *TeamHandler) handleUpdateSession(w http.ResponseWriter, r *http.Request
 	if body.Title != "" {
 		s.info.UpdatedAt = time.Now()
 	}
+	currentInfo := s.info
 	s.mu.Unlock()
 
+	if h.store != nil {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := h.store.Save(ctx, currentInfo); err != nil {
+				log.Printf("rest: failed to persist team session %s: %v", id, err)
+			}
+		}()
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(s.info)
+	json.NewEncoder(w).Encode(currentInfo)
 }
 
 func (h *TeamHandler) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+
+	// Delete from store first — if it fails, don't touch the in-memory map.
+	if h.store != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		if err := h.store.Delete(ctx, id); err != nil {
+			http.Error(w, `{"error":"failed to delete session"}`, http.StatusInternalServerError)
+			return
+		}
+	}
 
 	h.mu.Lock()
 	s := h.sessions[id]
@@ -250,11 +327,15 @@ func (h *TeamHandler) handleListMessages(w http.ResponseWriter, r *http.Request)
 	if l, err := parseIntParam(r, "limit", 1, 200); err == nil {
 		limit = l
 	}
+	before := 0
+	if b, err := parseIntParam(r, "before", 0, 100000); err == nil {
+		before = b
+	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	msgs, err := h.memory.Recent(ctx, id, limit)
+	msgs, err := h.memory.Recent(ctx, id, limit, before)
 	if err != nil {
 		http.Error(w, `{"error":"failed to fetch messages"}`, http.StatusInternalServerError)
 		return
@@ -300,7 +381,6 @@ func (h *TeamHandler) handleChat(w http.ResponseWriter, r *http.Request) {
 
 		oaSession := openagent.Session{
 			ID:        id,
-			AgentName: "team",
 			CreatedAt: s.info.CreatedAt,
 		}
 
@@ -505,21 +585,58 @@ func (h *TeamHandler) handleRemoveAgent(w http.ResponseWriter, r *http.Request) 
 
 func (h *TeamHandler) getOrCreateSession(id string) *teamSessionState {
 	h.mu.Lock()
+	if s, ok := h.sessions[id]; ok {
+		s.lastAccess = time.Now()
+		h.mu.Unlock()
+		return s
+	}
+	h.mu.Unlock()
+
+	// Try to restore from persistent store.
+	var info SessionInfo
+	restored := false
+	if h.store != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if stored, err := h.store.Get(ctx, id); err == nil && stored != nil {
+			info = *stored
+			restored = true
+		}
+	}
+
+	if !restored {
+		info = SessionInfo{
+			ID:        id,
+			Kind:      "team",
+			CreatedAt: time.Now(),
+			UpdatedAt: time.Now(),
+		}
+	}
+
+	h.mu.Lock()
 	defer h.mu.Unlock()
+
+	// Double-check: someone else might have created it while we were querying the store.
 	if s, ok := h.sessions[id]; ok {
 		s.lastAccess = time.Now()
 		return s
 	}
-	info := SessionInfo{
-		ID:        id,
-		AgentName: "team",
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
-	}
+
 	s := h.newSession(info)
 	s.lastAccess = time.Now()
 	h.sessions[id] = s
 	h.maybeStartReaper()
+
+	if !restored && h.store != nil {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := h.store.Save(ctx, info); err != nil {
+				log.Printf("rest: failed to persist team session %s: %v", id, err)
+			}
+		}()
+	}
+
 	return s
 }
 
@@ -612,8 +729,8 @@ func teamEventToSSE(evt openagent.TeamEvent) SSEEvent {
 			se.Error = evt.Error.Error()
 		}
 		return se
-		case openagent.TeamThought:
-			return SSEEvent{Type: "thought", Agent: evt.Agent, Text: evt.Text}
+	case openagent.TeamThought:
+		return SSEEvent{Type: "thought", Agent: evt.Agent, Text: evt.Text}
 
 	case openagent.TeamTextDelta:
 		return SSEEvent{Type: "text_delta", Agent: evt.Agent, Text: evt.Text}

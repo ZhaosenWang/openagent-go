@@ -93,7 +93,7 @@ func main() {
 
 	sess := openagent.Session{
 		ID: "browser-demo", UserID: "user-1",
-		AgentName: "browser-agent", ModelID: modelID,
+
 		CreatedAt: time.Now(),
 	}
 

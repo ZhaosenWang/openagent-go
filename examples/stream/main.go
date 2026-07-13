@@ -39,7 +39,7 @@ func main() {
 	session := openagent.Session{
 		ID:        "stream-session-1",
 		UserID:    "user-1",
-		AgentName: "calculator",
+
 		ModelID:   modelID,
 		CreatedAt: time.Now(),
 	}

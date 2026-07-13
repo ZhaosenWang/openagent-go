@@ -20,6 +20,7 @@ import (
 	"github.com/yusheng-g/openagent-go/memory/sqlite"
 	"github.com/yusheng-g/openagent-go/model/openai"
 	"github.com/yusheng-g/openagent-go/rest"
+	sessionsqlite "github.com/yusheng-g/openagent-go/rest/sessionstore/sqlite"
 	"github.com/yusheng-g/openagent-go/sandbox/native"
 	"github.com/yusheng-g/openagent-go/tool"
 )
@@ -67,6 +68,13 @@ func main() {
 	}
 	defer mem.Close()
 
+	// ── Session metadata store (survives restarts) ──
+	sessionStore, err := sessionsqlite.New(mem.DB())
+	if err != nil {
+		log.Fatalf("session store: %v", err)
+	}
+	defer sessionStore.Close()
+
 	// ── Sandbox + tools ──
 	workDir, _ := filepath.Abs(".")
 	sandbox, err := native.New(workDir)
@@ -91,7 +99,7 @@ func main() {
 		openagent.WithTools(sandboxTools...),
 		openagent.WithMaxTurns(10),
 	)
-	handler := rest.NewHandler(agent)
+	handler := rest.NewHandler(agent).WithSessionStore(sessionStore)
 	// Register additional models so the frontend model selector shows >1 option.
 	// These share the same API key and base URL — only the model ID differs.
 	if apiKey != "" && baseURL != "" {
@@ -138,7 +146,7 @@ func main() {
 		rest.TeamAgentTemplate{Name: "designer", Description: "Designs architecture, components, and data flow", Agent: designer},
 		rest.TeamAgentTemplate{Name: "coder", Description: "Writes clean, well-structured code with error handling", Agent: coder},
 		rest.TeamAgentTemplate{Name: "reviewer", Description: "Reviews code for correctness, style, and security", Agent: reviewer},
-	)
+	).WithSessionStore(sessionStore)
 
 	// ── Plan agents ──
 	planResearcher := openagent.NewAgent("researcher",
@@ -177,7 +185,7 @@ func main() {
 		rest.PlanAgentTemplate{Name: "coder", Description: "Writes production-quality code with error handling and comments", Runner: planCoder},
 		rest.PlanAgentTemplate{Name: "reviewer", Description: "Reviews code for correctness, style, and potential bugs — produces a list of issues and suggestions", Runner: planReviewer},
 		rest.PlanAgentTemplate{Name: "writer", Description: "Writes clear, professional documentation: README, API docs, reports. Uses markdown formatting", Runner: planWriter},
-	)
+	).WithSessionStore(sessionStore)
 
 	// ── Routes ──
 	mux := http.NewServeMux()

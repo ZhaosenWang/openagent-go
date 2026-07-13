@@ -92,7 +92,7 @@ Do NOT hand off — you are the final gate.`),
 	session := openagent.Session{
 		ID:        "team-session-1",
 		UserID:    "user-1",
-		AgentName: "team",
+
 		ModelID:   modelID,
 		CreatedAt: time.Now(),
 	}

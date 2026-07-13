@@ -30,7 +30,7 @@ import (
 type SessionInfo struct {
 	ID        string    `json:"id"`
 	Title     string    `json:"title,omitempty"`
-	AgentName string    `json:"agentName"`
+	Kind      string    `json:"kind"` // "single", "team", "plan"
 	ModelID   string    `json:"modelId,omitempty"`
 	CreatedAt time.Time `json:"createdAt"`
 	UpdatedAt time.Time `json:"updatedAt"`
@@ -46,11 +46,9 @@ type SessionDetail struct {
 // ── Request / Response types ── [satirize]
 
 // CreateSessionRequest is the optional body for POST /sessions.
-// All fields are optional — the handler defaults to the base agent's name.
 type CreateSessionRequest struct {
-	AgentName string `json:"agentName,omitempty"`
-	Title     string `json:"title,omitempty"`
-	ModelID   string `json:"modelId,omitempty"` // override model per session
+	Title   string `json:"title,omitempty"`
+	ModelID string `json:"modelId,omitempty"` // override model per session
 }
 
 // ChatRequest is the body for POST /sessions/{id}/chat.

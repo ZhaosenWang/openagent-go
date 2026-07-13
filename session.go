@@ -45,9 +45,6 @@ type Session struct {
 	ID     string `json:"id"`
 	UserID string `json:"user_id"`
 
-	// Agent selection
-	AgentName string `json:"agent_name"`
-
 	// Model selection (overrides Agent default if set)
 	ModelID         string  `json:"model_id,omitempty"`
 	Model           Model   `json:"-"`                  // per-request model override; nil = use Agent.Model

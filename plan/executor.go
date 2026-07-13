@@ -286,7 +286,7 @@ func (e *executor) executeStep(ctx context.Context, stepID string, state *PlanSt
 		// Isolated session so this step doesn't see other steps' internal history.
 		stepSession := openagent.Session{
 			ID:        e.sessionID + "/steps/" + stepID,
-			AgentName: step.Agent,
+
 			CreatedAt: time.Now(),
 		}
 

@@ -5,7 +5,7 @@
 export interface SessionInfo {
   id: string
   title?: string
-  agentName: string
+  kind: 'single' | 'team' | 'plan'
   modelId?: string
   createdAt: string
   updatedAt: string
@@ -17,7 +17,6 @@ export interface SessionDetail extends SessionInfo {
 }
 
 export interface CreateSessionRequest {
-  agentName?: string
   title?: string
   modelId?: string
 }

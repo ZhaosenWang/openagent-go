@@ -26,10 +26,9 @@ import (
 type Memory interface {
 	io.Closer
 
-	// Layer 1: Working memory — returns up to n most recent messages.
-	// Pure query, no side effects. The Runner manages compaction separately
-	// via Compact() based on token budget.
-	Recent(ctx context.Context, sessionID string, n int) ([]Message, error)
+	// Layer 1: Working memory — returns up to n most recent messages, skipping
+	// the first offset messages from the end. offset=0 returns the latest n.
+	Recent(ctx context.Context, sessionID string, n int, offset int) ([]Message, error)
 
 	// Count returns the total number of stored messages for a session.
 	Count(ctx context.Context, sessionID string) (int, error)

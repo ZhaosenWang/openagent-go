@@ -12,9 +12,9 @@ import (
 // ── streamingTestTool implements both Tool and StreamExecutor ──
 
 type streamingTestTool struct {
-	name     string
-	chunks   []string // chunks to emit
-	delay    time.Duration
+	name   string
+	chunks []string // chunks to emit
+	delay  time.Duration
 }
 
 func (t *streamingTestTool) Definition() FunctionDefinition {
@@ -143,10 +143,7 @@ func TestStreamExecutorProgressEvents(t *testing.T) {
 		WithMaxTurns(1),
 	)
 
-	ch := agent.RunStream(context.Background(),
-		Session{ID: "test-stream", AgentName: "test"},
-		UserMessage("go"),
-	)
+	ch := agent.RunStream(context.Background(), Session{ID: "test"}, UserMessage("go"))
 
 	var progressEvents []StreamEvent
 	var toolResultEvent *StreamEvent
@@ -210,10 +207,7 @@ func TestNonStreamingToolUnaffected(t *testing.T) {
 		WithMaxTurns(1),
 	)
 
-	ch := agent.RunStream(context.Background(),
-		Session{ID: "test-blocking", AgentName: "test"},
-		UserMessage("go"),
-	)
+	ch := agent.RunStream(context.Background(), Session{ID: "test"}, UserMessage("go"))
 
 	var gotProgress bool
 	var gotResult bool
@@ -275,10 +269,7 @@ func TestConcurrentStreamingToolsDisambiguated(t *testing.T) {
 		WithMaxTurns(1),
 	)
 
-	ch := agent.RunStream(context.Background(),
-		Session{ID: "test-concurrent", AgentName: "test"},
-		UserMessage("go"),
-	)
+	ch := agent.RunStream(context.Background(), Session{ID: "test"}, UserMessage("go"))
 
 	progressByID := map[string][]string{}
 	var mu sync.Mutex
@@ -336,10 +327,8 @@ func TestStreamExecutorCancellation(t *testing.T) {
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	ch := agent.RunStream(ctx,
-		Session{ID: "test-cancel", AgentName: "test"},
-		UserMessage("go"),
-	)
+	defer cancel()
+	ch := agent.RunStream(ctx, Session{ID: "test"}, UserMessage("go"))
 
 	// Read the first progress event, then cancel.
 	var gotFirst bool

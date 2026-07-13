@@ -6,7 +6,6 @@ import "context"
 // the final message list for a model call. The Runner gathers this from
 // Agent, Session, and Memory before each turn.
 type PromptInput struct {
-	AgentName        string
 	AgentDescription string
 	Instructions     string
 

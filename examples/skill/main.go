@@ -42,7 +42,7 @@ func main() {
 	session := openagent.Session{
 		ID:        "skill-demo-1",
 		UserID:    "user-1",
-		AgentName: "skill-demo",
+
 		ModelID:   modelID,
 		CreatedAt: time.Now(),
 	}

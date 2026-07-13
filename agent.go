@@ -220,7 +220,6 @@ func buildGoalInstructions(original, goal string, maxTurns int) string {
 
 // RunResult is the output of an Agent.Run call.
 type RunResult struct {
-	AgentName     string    // name of the agent that produced this result
 	Messages      []Message // all messages from this run
 	FinalOutput   string    // last assistant message content
 	TurnCount     int
@@ -327,7 +326,6 @@ func (t *agentTool) Execute(ctx context.Context, args json.RawMessage) (string, 
 	// New session — fully isolated from the coordinator.
 	session := Session{
 		ID:        fmt.Sprintf("%s-%d-%d", t.agent.Name, time.Now().UnixNano(), globalAgentSeq.Add(1)),
-		AgentName: t.agent.Name,
 		CreatedAt: time.Now(),
 	}
 

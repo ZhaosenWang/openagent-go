@@ -100,7 +100,7 @@ func main() {
 	session := openagent.Session{
 		ID:   "cli",
 		UserID: "user",
-		AgentName: "cli",
+
 		ModelID: modelID,
 		ProjectContext: fmt.Sprintf("Workspace: %s", workDir),
 	}
