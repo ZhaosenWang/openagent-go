@@ -135,8 +135,9 @@ export const useChatStore = defineStore('chat', () => {
 
   /** Activate a session — preserve current, restore target.
    *  Does NOT kill the previous session's SSE stream. */
-  function activateSession(sid: string) {
+  function activateSession(sid: string, type?: 'single' | 'team' | 'plan') {
     if (currentSessionId.value === sid) return
+    if (type) currentSessionType.value = type
     saveActive()
     currentSessionId.value = sid
     restoreActive(sid)
@@ -144,8 +145,8 @@ export const useChatStore = defineStore('chat', () => {
     const p = getPane(sid)
     if (!p._fetched) {
       p._fetched = true
-      fetchSessionDetail(sid)
-      fetchMessages(sid)
+      fetchSessionDetail(sid, type)
+      fetchMessages(sid, type)
     }
   }
 
@@ -390,9 +391,13 @@ export const useChatStore = defineStore('chat', () => {
         }
 
         case 'agent_start': {
-          // Team mode: label who acts next. Remove old thinking,
-          // push label + fresh thinking placeholder.
-          p.messages = p.messages.filter(m => m !== p.thinkingMsg)
+          // Team mode: label who acts next. Remove old thinking
+          // placeholder in-place (splice, not filter) to preserve
+          // reactive identity with messages.value.
+          if (p.thinkingMsg) {
+            const idx = p.messages.indexOf(p.thinkingMsg)
+            if (idx >= 0) p.messages.splice(idx, 1)
+          }
           p.thinkingMsg = null
           if (p.currentStreamMsg) { p.currentStreamMsg.isStreaming = false; p.currentStreamMsg = null }
           p.pendingThought = ''
@@ -407,7 +412,10 @@ export const useChatStore = defineStore('chat', () => {
         }
 
         case 'handoff': {
-          p.messages = p.messages.filter(m => m !== p.thinkingMsg)
+          if (p.thinkingMsg) {
+            const idx = p.messages.indexOf(p.thinkingMsg)
+            if (idx >= 0) p.messages.splice(idx, 1)
+          }
           p.thinkingMsg = null
           if (p.currentStreamMsg) { p.currentStreamMsg.isStreaming = false; p.currentStreamMsg = null }
           p.pendingThought = ''

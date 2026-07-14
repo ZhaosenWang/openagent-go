@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"sync"
 	"time"
@@ -24,30 +23,11 @@ type PlanAgentTemplate struct {
 // ── PlanHandler ──
 
 // PlanHandler serves a REST API for goal → DAG → execution workflows.
-//
-// Create with [NewPlanHandler], then register on an [http.ServeMux]:
-//
-//	templates := []rest.PlanAgentTemplate{
-//	    {Name: "coder", Description: "Writes code", Runner: coderAgent},
-//	    {Name: "reviewer", Description: "Reviews code", Runner: reviewerAgent},
-//	}
-//	ph := rest.NewPlanHandler(mem, model, templates...)
-//	ph.Register(mux)
 type PlanHandler struct {
 	agents []PlanAgentTemplate
 	model  openagent.Model
-	memory openagent.Memory
 
-	sessionIdleTTL time.Duration // 0 = sessions never expire
-
-	store SessionStore // nil = in-memory only
-
-	bus *eventbus.Bus[SSEEvent]
-
-	mu       sync.RWMutex
-	sessions map[string]*planSessionState
-
-	reapOnce sync.Once
+	sm *sessionManager[*planSessionState] // session CRUD, store, bus
 }
 
 // planSessionState holds per-session data for a plan workflow.
@@ -55,7 +35,6 @@ type planSessionState struct {
 	info       SessionInfo
 	plan       *plan.Plan
 	currentDef *plan.PlanDef // nil until generated
-	lastAccess time.Time
 
 	mu              sync.Mutex
 	pendingApproval *pendingApproval
@@ -67,17 +46,21 @@ type planSessionState struct {
 	retryCh   chan plan.RetryAction // closed/signaled to resume from pause
 }
 
+func (s *planSessionState) sessionInfo() *SessionInfo { return &s.info }
+
 // NewPlanHandler creates a PlanHandler.
 // model is used for both the Planner and step output summarisation.
 // At least one agent template is required.
 func NewPlanHandler(mem openagent.Memory, model openagent.Model, agents ...PlanAgentTemplate) *PlanHandler {
-	return &PlanHandler{
-		agents:   agents,
-		model:    model,
-		memory:   mem,
-		bus:      eventbus.New[SSEEvent](1000),
-		sessions: make(map[string]*planSessionState),
-	}
+	h := &PlanHandler{agents: agents, model: model}
+
+	bus := eventbus.New[SSEEvent](1000)
+	h.sm = newSessionManager[*planSessionState](nil, mem, bus, sessionHooks[*planSessionState]{
+		kind:     "plan",
+		newEntry: h.newEntry,
+	})
+
+	return h
 }
 
 // Register adds the plan handler's routes to mux using Go 1.22+ patterns.
@@ -99,242 +82,21 @@ func (h *PlanHandler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /plan/sessions/{id}/approve", h.handleApprove)
 }
 
-// WithSessionTTL sets the idle duration after which inactive sessions are
-// removed from memory. Messages are not deleted — only the in-memory plan
-// state is released. Reconnecting with the same session ID triggers a
-// transparent rebuild from persistent Memory.
-//
-// 0 (the default) disables TTL — sessions never expire.
-func (h *PlanHandler) WithSessionTTL(idle time.Duration) *PlanHandler {
-	h.sessionIdleTTL = idle
-	return h
-}
-
 // WithSessionStore attaches a persistent session metadata store.
 func (h *PlanHandler) WithSessionStore(s SessionStore) *PlanHandler {
-	h.store = s
+	h.sm.SetStore(s)
 	return h
 }
 
 // ── Session CRUD ──
 
-func (h *PlanHandler) handleCreateSession(w http.ResponseWriter, r *http.Request) {
-	var req CreateSessionRequest
-	if r.Body != nil {
-		json.NewDecoder(r.Body).Decode(&req)
-	}
+func (h *PlanHandler) handleCreateSession(w http.ResponseWriter, r *http.Request) { h.sm.create(w, r) }
+func (h *PlanHandler) handleListSessions(w http.ResponseWriter, r *http.Request)  { h.sm.list(w, r) }
+func (h *PlanHandler) handleGetSession(w http.ResponseWriter, r *http.Request)    { h.sm.get(w, r) }
+func (h *PlanHandler) handleUpdateSession(w http.ResponseWriter, r *http.Request) { h.sm.update(w, r) }
+func (h *PlanHandler) handleDeleteSession(w http.ResponseWriter, r *http.Request) { h.sm.del(w, r) }
 
-	id := generateID()
-	now := time.Now()
-
-	info := SessionInfo{
-		ID:        id,
-		Title:     req.Title,
-		Kind:      "plan",
-		CreatedAt: now,
-		UpdatedAt: now,
-	}
-
-	h.mu.Lock()
-	h.sessions[id] = h.newSession(info)
-	h.mu.Unlock()
-
-	if h.store != nil {
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			if err := h.store.Save(ctx, info); err != nil {
-				log.Printf("rest: failed to persist plan session %s: %v", id, err)
-			}
-		}()
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(info)
-}
-
-func (h *PlanHandler) handleListSessions(w http.ResponseWriter, r *http.Request) {
-	if h.store != nil {
-		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-		defer cancel()
-		list, err := h.store.List(ctx, "plan")
-		if err != nil {
-			http.Error(w, `{"error":"failed to list sessions"}`, http.StatusInternalServerError)
-			return
-		}
-		if list == nil {
-			list = []SessionInfo{}
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(list)
-		return
-	}
-
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-
-	list := make([]SessionInfo, 0, len(h.sessions))
-	for _, s := range h.sessions {
-		list = append(list, s.info)
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(list)
-}
-
-func (h *PlanHandler) handleGetSession(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-
-	h.mu.RLock()
-	s, ok := h.sessions[id]
-	h.mu.RUnlock()
-
-	if ok {
-		w.Header().Set("Content-Type", "application/json")
-		detail := SessionDetail{SessionInfo: s.info}
-		if h.memory != nil {
-			if n, err := h.memory.Count(context.Background(), s.info.ID); err == nil {
-				detail.MessageCount = n
-			}
-		}
-		json.NewEncoder(w).Encode(detail)
-		return
-	}
-
-	// Not in memory — try persistent store.
-	if h.store != nil {
-		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-		defer cancel()
-		info, err := h.store.Get(ctx, id)
-		if err != nil {
-			http.Error(w, `{"error":"failed to get session"}`, http.StatusInternalServerError)
-			return
-		}
-		if info != nil {
-			detail := SessionDetail{SessionInfo: *info}
-			if h.memory != nil {
-				if n, err := h.memory.Count(context.Background(), id); err == nil {
-					detail.MessageCount = n
-				}
-			}
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(detail)
-			return
-		}
-	}
-
-	http.Error(w, `{"error":"session not found"}`, http.StatusNotFound)
-}
-
-func (h *PlanHandler) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-
-	// Delete from store first — if it fails, don't touch the in-memory map.
-	if h.store != nil {
-		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-		defer cancel()
-		if err := h.store.Delete(ctx, id); err != nil {
-			http.Error(w, `{"error":"failed to delete session"}`, http.StatusInternalServerError)
-			return
-		}
-	}
-
-	h.mu.Lock()
-	delete(h.sessions, id)
-	h.mu.Unlock()
-
-	if h.memory != nil {
-		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-		defer cancel()
-		_ = h.memory.DeleteSession(ctx, id)
-	}
-
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func (h *PlanHandler) handleUpdateSession(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-
-	var body struct {
-		Title string `json:"title"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, `{"error":"invalid body"}`, http.StatusBadRequest)
-		return
-	}
-
-	h.mu.RLock()
-	s, ok := h.sessions[id]
-	h.mu.RUnlock()
-
-	if !ok {
-		http.Error(w, `{"error":"session not found"}`, http.StatusNotFound)
-		return
-	}
-
-	s.mu.Lock()
-	s.info.Title = body.Title
-	if body.Title != "" {
-		s.info.UpdatedAt = time.Now()
-	}
-	currentInfo := s.info
-	s.mu.Unlock()
-
-	if h.store != nil {
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			if err := h.store.Save(ctx, currentInfo); err != nil {
-				log.Printf("rest: failed to persist plan session %s: %v", id, err)
-			}
-		}()
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(currentInfo)
-}
-
-func (h *PlanHandler) handlePlanMessages(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-
-	h.mu.RLock()
-	_, ok := h.sessions[id]
-	h.mu.RUnlock()
-	if !ok {
-		http.Error(w, `{"error":"session not found"}`, http.StatusNotFound)
-		return
-	}
-	if h.memory == nil {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode([]openagent.Message{})
-		return
-	}
-
-	limit := 50
-	if l, err := parseIntParam(r, "limit", 1, 200); err == nil {
-		limit = l
-	}
-	before := 0
-	if b, err := parseIntParam(r, "before", 0, 100000); err == nil {
-		before = b
-	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-	defer cancel()
-
-	msgs, err := h.memory.Recent(ctx, id, limit, before)
-	if err != nil {
-		http.Error(w, `{"error":"failed to fetch messages"}`, http.StatusInternalServerError)
-		return
-	}
-	if msgs == nil {
-		msgs = []openagent.Message{}
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(msgs)
-}
+func (h *PlanHandler) handlePlanMessages(w http.ResponseWriter, r *http.Request) { h.sm.messages(w, r) }
 
 // ── Plan generation ──
 
@@ -349,7 +111,7 @@ func (h *PlanHandler) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s := h.getOrCreateSession(id)
+	s := h.sm.getOrCreate(id)
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -374,11 +136,17 @@ func (h *PlanHandler) handleGenerate(w http.ResponseWriter, r *http.Request) {
 
 	s.mu.Lock()
 	s.currentDef = def
-	if def.Goal != "" {
-		s.info.Title = def.Goal
-		s.info.UpdatedAt = time.Now()
-	}
 	s.mu.Unlock()
+
+	// Set the session title from the goal and persist.
+	if def.Goal != "" {
+		if inf, ok := h.sm.withMeta(id, func(inf *SessionInfo) {
+			inf.Title = def.Goal
+			inf.UpdatedAt = time.Now()
+		}); ok {
+			h.sm.syncMeta(inf)
+		}
+	}
 
 	b, _ := json.Marshal(def)
 	_ = writeSSE(w, flusher, SSEEvent{Type: "plan_generated", Text: string(b)})
@@ -389,14 +157,7 @@ func (h *PlanHandler) handleGenerate(w http.ResponseWriter, r *http.Request) {
 func (h *PlanHandler) handleGetPlan(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
-	h.mu.RLock()
-	s, ok := h.sessions[id]
-	h.mu.RUnlock()
-
-	if !ok {
-		http.Error(w, `{"error":"session not found"}`, http.StatusNotFound)
-		return
-	}
+	s := h.sm.getOrCreate(id)
 
 	s.mu.Lock()
 	def := s.currentDef
@@ -416,14 +177,7 @@ func (h *PlanHandler) handleGetPlan(w http.ResponseWriter, r *http.Request) {
 func (h *PlanHandler) handleUpdatePlan(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
-	h.mu.RLock()
-	s, ok := h.sessions[id]
-	h.mu.RUnlock()
-
-	if !ok {
-		http.Error(w, `{"error":"session not found"}`, http.StatusNotFound)
-		return
-	}
+	s := h.sm.getOrCreate(id)
 
 	var def plan.PlanDef
 	if err := json.NewDecoder(r.Body).Decode(&def); err != nil {
@@ -464,14 +218,7 @@ func (h *PlanHandler) handleUpdatePlan(w http.ResponseWriter, r *http.Request) {
 func (h *PlanHandler) handleExecute(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
-	h.mu.RLock()
-	s, ok := h.sessions[id]
-	h.mu.RUnlock()
-
-	if !ok {
-		http.Error(w, `{"error":"session not found"}`, http.StatusNotFound)
-		return
-	}
+	s := h.sm.getOrCreate(id)
 
 	s.mu.Lock()
 	if s.running {
@@ -532,7 +279,7 @@ func (h *PlanHandler) handleExecute(w http.ResponseWriter, r *http.Request) {
 				if se.Type == "" {
 					continue
 				}
-				h.bus.Publish(id, se)
+				h.sm.Bus().Publish(id, se)
 
 				if se.Type == "plan_waiting_retry" {
 					// Store state and create resume channel.
@@ -571,7 +318,7 @@ func (h *PlanHandler) handleExecute(w http.ResponseWriter, r *http.Request) {
 					state.UpdatedAt = time.Now()
 				}
 			case <-ctx.Done():
-				h.bus.Publish(id, SSEEvent{Type: "plan_cancelled"})
+				h.sm.Bus().Publish(id, SSEEvent{Type: "plan_cancelled"})
 				return
 			}
 		}
@@ -587,10 +334,7 @@ func (h *PlanHandler) handleExecute(w http.ResponseWriter, r *http.Request) {
 func (h *PlanHandler) handleEvents(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
-	h.mu.RLock()
-	_, ok := h.sessions[id]
-	h.mu.RUnlock()
-	if !ok {
+	if !h.sm.Exists(id) {
 		http.Error(w, `{"error":"session not found"}`, http.StatusNotFound)
 		return
 	}
@@ -603,8 +347,8 @@ func (h *PlanHandler) handleEvents(w http.ResponseWriter, r *http.Request) {
 	setSSEHeaders(w)
 	flusher.Flush() // flush headers immediately
 
-	sub := h.bus.SubscribeLive(id)
-	defer h.bus.Unsubscribe(id, sub)
+	sub := h.sm.Bus().SubscribeLive(id)
+	defer h.sm.Bus().Unsubscribe(id, sub)
 
 	for {
 		select {
@@ -629,14 +373,7 @@ func (h *PlanHandler) handleEvents(w http.ResponseWriter, r *http.Request) {
 func (h *PlanHandler) handleCancel(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
-	h.mu.RLock()
-	s, ok := h.sessions[id]
-	h.mu.RUnlock()
-
-	if !ok {
-		http.Error(w, `{"error":"session not found"}`, http.StatusNotFound)
-		return
-	}
+	s := h.sm.getOrCreate(id)
 
 	s.mu.Lock()
 	cancel := s.execCancel
@@ -648,7 +385,7 @@ func (h *PlanHandler) handleCancel(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cancel()
-	h.bus.Publish(id, SSEEvent{Type: "plan_cancelled"})
+	h.sm.Bus().Publish(id, SSEEvent{Type: "plan_cancelled"})
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "cancelled"})
@@ -657,19 +394,11 @@ func (h *PlanHandler) handleCancel(w http.ResponseWriter, r *http.Request) {
 // ── Manual retry / replan (when AutoReplan is false) ──
 
 // handleStepRetry resumes a paused plan by retrying a failed step.
-// The step is reset to pending and execution continues from that point.
 func (h *PlanHandler) handleStepRetry(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	stepID := r.PathValue("stepID")
 
-	h.mu.RLock()
-	s, ok := h.sessions[id]
-	h.mu.RUnlock()
-
-	if !ok {
-		http.Error(w, `{"error":"session not found"}`, http.StatusNotFound)
-		return
-	}
+	s := h.sm.getOrCreate(id)
 
 	s.mu.Lock()
 	state := s.execState
@@ -682,9 +411,7 @@ func (h *PlanHandler) handleStepRetry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify the step exists and is in a valid paused state:
-	// - Failed: can retry or replan.
-	// - Gate (done): completed successfully, awaits human approval.
+	// Verify the step exists and is in a valid paused state.
 	sr := state.Results[stepID]
 	if sr == nil {
 		http.Error(w, `{"error":"step not found"}`, http.StatusBadRequest)
@@ -692,8 +419,8 @@ func (h *PlanHandler) handleStepRetry(w http.ResponseWriter, r *http.Request) {
 	}
 	isGate := false
 	if curDef != nil {
-		for _, s := range curDef.Steps {
-			if s.ID == stepID && s.Gate {
+		for _, st := range curDef.Steps {
+			if st.ID == stepID && st.Gate {
 				isGate = true
 				break
 			}
@@ -704,16 +431,14 @@ func (h *PlanHandler) handleStepRetry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Signal the execution goroutine to continue (retry / continue past gate).
+	// Signal the execution goroutine to continue.
 	retryCh <- plan.RetryAction{Action: "retry", StepID: stepID}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "retrying"})
 }
 
-// handleReplan regenerates the affected subtree of a failed plan incorporating
-// user feedback (natural language suggestions). The new plan is sent to the
-// execution goroutine which resumes from where it left off.
+// handleReplan regenerates the affected subtree of a failed plan incorporating user feedback.
 func (h *PlanHandler) handleReplan(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
@@ -725,14 +450,7 @@ func (h *PlanHandler) handleReplan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.mu.RLock()
-	s, ok := h.sessions[id]
-	h.mu.RUnlock()
-
-	if !ok {
-		http.Error(w, `{"error":"session not found"}`, http.StatusNotFound)
-		return
-	}
+	s := h.sm.getOrCreate(id)
 
 	s.mu.Lock()
 	state := s.execState
@@ -759,17 +477,17 @@ func (h *PlanHandler) handleReplan(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Emit replanning event so the UI knows.
-	h.bus.Publish(id, SSEEvent{Type: "replanning", StepID: failedID})
+	h.sm.Bus().Publish(id, SSEEvent{Type: "replanning", StepID: failedID})
 
 	// Call planner with user feedback, streaming the LLM's thinking.
 	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
 	defer cancel()
 
 	newDef, err := s.plan.ReplanWithFeedbackStream(ctx, def, state, failedID, body.Feedback, func(chunk string) {
-		h.bus.Publish(id, SSEEvent{Type: "plan_thinking", Text: chunk})
+		h.sm.Bus().Publish(id, SSEEvent{Type: "plan_thinking", Text: chunk})
 	})
 	if err != nil {
-		h.bus.Publish(id, SSEEvent{Type: "plan_error", Error: err.Error()})
+		h.sm.Bus().Publish(id, SSEEvent{Type: "plan_error", Error: err.Error()})
 		http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusInternalServerError)
 		return
 	}
@@ -781,7 +499,7 @@ func (h *PlanHandler) handleReplan(w http.ResponseWriter, r *http.Request) {
 
 	// Emit the new plan so the UI can re-render the DAG.
 	b, _ := json.Marshal(newDef)
-	h.bus.Publish(id, SSEEvent{Type: "plan_generated", Text: string(b)})
+	h.sm.Bus().Publish(id, SSEEvent{Type: "plan_generated", Text: string(b)})
 
 	// Signal the execution goroutine to resume with the new plan.
 	retryCh <- plan.RetryAction{Action: "replan", NewDef: newDef}
@@ -801,14 +519,7 @@ func (h *PlanHandler) handleApprove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.mu.RLock()
-	s, ok := h.sessions[id]
-	h.mu.RUnlock()
-
-	if !ok {
-		http.Error(w, `{"error":"session not found"}`, http.StatusNotFound)
-		return
-	}
+	s := h.sm.getOrCreate(id)
 
 	s.mu.Lock()
 	p := s.pendingApproval
@@ -833,66 +544,9 @@ func (h *PlanHandler) handleApprove(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": reason})
 }
 
-// ── Session management ──
+// ── Factory ──
 
-func (h *PlanHandler) getOrCreateSession(id string) *planSessionState {
-	h.mu.Lock()
-	if s, ok := h.sessions[id]; ok {
-		s.lastAccess = time.Now()
-		h.mu.Unlock()
-		return s
-	}
-	h.mu.Unlock()
-
-	// Try to restore from persistent store.
-	var info SessionInfo
-	restored := false
-	if h.store != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if stored, err := h.store.Get(ctx, id); err == nil && stored != nil {
-			info = *stored
-			restored = true
-		}
-	}
-
-	if !restored {
-		info = SessionInfo{
-			ID:        id,
-			Kind:      "plan",
-			CreatedAt: time.Now(),
-			UpdatedAt: time.Now(),
-		}
-	}
-
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	// Double-check: someone else might have created it while we were querying the store.
-	if s, ok := h.sessions[id]; ok {
-		s.lastAccess = time.Now()
-		return s
-	}
-
-	s := h.newSession(info)
-	s.lastAccess = time.Now()
-	h.sessions[id] = s
-	h.maybeStartReaper()
-
-	if !restored && h.store != nil {
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			if err := h.store.Save(ctx, info); err != nil {
-				log.Printf("rest: failed to persist plan session %s: %v", id, err)
-			}
-		}()
-	}
-
-	return s
-}
-
-func (h *PlanHandler) newSession(info SessionInfo) *planSessionState {
+func (h *PlanHandler) newEntry(info SessionInfo) *planSessionState {
 	s := &planSessionState{
 		info: info,
 	}
@@ -919,6 +573,8 @@ func (h *PlanHandler) newSession(info SessionInfo) *planSessionState {
 	return s
 }
 
+// ── Approval bridge ──
+
 func (h *PlanHandler) submitApproval(s *planSessionState, call openagent.ToolCall, resp chan approveResponse) {
 	tcj := &SSEToolCall{
 		ID: call.ID,
@@ -937,11 +593,10 @@ func (h *PlanHandler) submitApproval(s *planSessionState, call openagent.ToolCal
 	s.pendingApproval = &pendingApproval{respond: resp}
 	s.mu.Unlock()
 
-	h.bus.Publish(s.info.ID, evt)
+	h.sm.Bus().Publish(s.info.ID, evt)
 }
 
-// cloneAgentForPlan clones an Agent for use in a plan session, injecting the
-// REST approver bridge so tool approvals during plan steps are surfaced to the UI.
+// cloneAgentForPlan clones an Agent for use in a plan session, injecting the REST approver bridge.
 func cloneAgentForPlan(tmpl *openagent.Agent, s *planSessionState, submitFn func(*planSessionState, openagent.ToolCall, chan approveResponse)) *openagent.Agent {
 	return openagent.NewAgent(tmpl.Name,
 		openagent.WithModel(tmpl.Model),
@@ -1020,65 +675,5 @@ func planEventToSSE(evt plan.PlanEvent) SSEEvent {
 
 	default:
 		return SSEEvent{}
-	}
-}
-
-// ── Session TTL ──
-
-// maybeStartReaper lazily starts a background goroutine that reclaims
-// idle planSessionState entries. It's a no-op when sessionIdleTTL is 0.
-func (h *PlanHandler) maybeStartReaper() {
-	if h.sessionIdleTTL <= 0 {
-		return
-	}
-	h.reapOnce.Do(func() {
-		go h.reapLoop()
-	})
-}
-
-func (h *PlanHandler) reapLoop() {
-	const interval = 1 * time.Minute
-	for {
-		time.Sleep(interval)
-		h.reap()
-	}
-}
-
-func (h *PlanHandler) reap() {
-	now := time.Now()
-
-	// Phase 1: collect expired IDs under read lock.
-	h.mu.RLock()
-	var expired []string
-	for id, s := range h.sessions {
-		if now.Sub(s.lastAccess) > h.sessionIdleTTL {
-			expired = append(expired, id)
-		}
-	}
-	h.mu.RUnlock()
-
-	if len(expired) == 0 {
-		return
-	}
-
-	// Phase 2: under write lock, re-verify lastAccess to prevent
-	// TOCTOU races with getOrCreateSession.
-	h.mu.Lock()
-	reaped := 0
-	for _, id := range expired {
-		s, ok := h.sessions[id]
-		if !ok {
-			continue
-		}
-		if now.Sub(s.lastAccess) < h.sessionIdleTTL {
-			continue // refreshed between RLock→Lock
-		}
-		delete(h.sessions, id)
-		reaped++
-	}
-	h.mu.Unlock()
-
-	if reaped > 0 {
-		log.Printf("plan: reaped %d idle sessions", reaped)
 	}
 }

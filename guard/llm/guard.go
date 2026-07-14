@@ -112,10 +112,10 @@ func (g *Guard) judge(ctx context.Context, systemPrompt, content string) openage
 		}
 		return openagent.GuardResult{Allowed: false, Reason: "guard judge returned no choices"}
 	}
-	return parseResult(resp.Choices[0].Message.Content)
+	return parseResult(resp.Choices[0].Message.Content, g.failOpen)
 }
 
-func parseResult(content string) openagent.GuardResult {
+func parseResult(content string, failOpen bool) openagent.GuardResult {
 	content = strings.TrimSpace(content)
 	content = strings.TrimPrefix(content, "```json")
 	content = strings.TrimPrefix(content, "```")
@@ -131,7 +131,12 @@ func parseResult(content string) openagent.GuardResult {
 		if strings.Contains(lower, "\"allowed\": true") || strings.Contains(lower, "\"allowed\":true") {
 			return openagent.GuardResult{Allowed: true}
 		}
-		return openagent.GuardResult{Allowed: false, Reason: "unparseable guard response: " + truncate(content, 100)}
+		// Parse failed entirely — failOpen means allow, default blocks.
+		reason := "unparseable guard response: " + truncate(content, 100)
+		if failOpen {
+			return openagent.GuardResult{Allowed: true, Reason: reason}
+		}
+		return openagent.GuardResult{Allowed: false, Reason: reason}
 	}
 	return r
 }

@@ -68,6 +68,12 @@ func (m *teamAgentMemory) Recent(ctx context.Context, sessionID string, n int, o
 	return result, nil
 }
 
+// PrivateRecent returns only the agent-private messages (tool calls, tool results).
+// Used by the message history endpoint to aggregate across all agents.
+func (m *teamAgentMemory) PrivateRecent(ctx context.Context, sessionID string, n int, offset int) ([]openagent.Message, error) {
+	return m.private.Recent(ctx, m.privateKey(sessionID), n, offset)
+}
+
 func (m *teamAgentMemory) Count(ctx context.Context, sessionID string) (int, error) {
 	sharedN, _ := m.shared.Count(ctx, sessionID)
 	privN, _ := m.private.Count(ctx, m.privateKey(sessionID))

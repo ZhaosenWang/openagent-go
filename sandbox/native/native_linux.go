@@ -3,6 +3,7 @@ package native
 import (
 	"context"
 	"fmt"
+	"log"
 	"os/exec"
 	"strings"
 
@@ -17,6 +18,7 @@ import (
 func (s *Sandbox) confineAndRun(ctx context.Context, cmd openagent.Command) (openagent.Result, error) {
 	args, ok := s.bwrapArgs(cmd)
 	if !ok {
+		log.Printf("WARNING: bwrap not found — sandbox disabled, running unconfined")
 		return s.unconfinedRun(ctx, cmd)
 	}
 

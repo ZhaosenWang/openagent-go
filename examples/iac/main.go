@@ -109,7 +109,6 @@ func main() {
 	}
 
 	ph := rest.NewPlanHandler(mem, model, planTemplates...)
-	ph.WithSessionTTL(6 * time.Hour)
 
 	// ── Routes ──
 	mux := http.NewServeMux()

@@ -368,7 +368,6 @@ type teamRunner struct {
 	totalUsage  Usage
 	forceFinal       bool   // true = next agent gets no transfer tools
 	currentName      string // currently executing agent
-	handoffHintGiven bool   // true after one "please hand off" retry per agent turn
 
 	// Per-run handoff queue — isolated from concurrent Team.Run() calls.
 	handoffMu       sync.Mutex
@@ -482,22 +481,7 @@ func (tr *teamRunner) run(ctx context.Context, session Session, input Message, c
 		tr.handoffMu.Unlock()
 
 		if len(handoffs) == 0 {
-			// Agent finished without handing off.
-			// If the agent had handoff tools but didn't use them, retry
-			// once with an explicit hint — silently, no SSE event.
-			// The frontend sees a continuous stream from the same agent.
-			if !tr.forceFinal && !tr.handoffHintGiven && len(tr.buildHandoffTools()) > 0 {
-				tr.handoffHintGiven = true
-				currentInput = Message{
-					Role: RoleUser,
-					Content: "⚠️ You must hand off. Your last response did not call transfer_to_*. " +
-						"Use the appropriate transfer_to_<name> tool now to pass control. " +
-						"If you are the final reviewer and the work is truly complete, " +
-						"produce a short summary without handing off and the team will stop.",
-				}
-				continue
-			}
-			// forceFinal, already hinted, or no handoff tools — truly done.
+			// Agent finished without handing off — its response is final.
 			if tr.team.observer != nil {
 				tr.team.observer.ObserveStage(ctx, StageEvent{
 					Name: StageTeamAgent, Phase: "leave",
@@ -601,7 +585,6 @@ func (tr *teamRunner) run(ctx context.Context, session Session, input Message, c
 		}
 
 		tr.currentName = req.target
-		tr.handoffHintGiven = false // reset for next agent
 	}
 }
 
@@ -666,37 +649,6 @@ func (tr *teamRunner) runAgentStreaming(ctx context.Context, runner AgentRunner,
 }
 
 // ── Loop detection ──
-
-// buildHandoffTools returns the handoff tools for the current agent.
-// Used to check whether the agent had any way to hand off.
-func (tr *teamRunner) buildHandoffTools() []Tool {
-	if tr.forceFinal {
-		return nil
-	}
-	myName := tr.currentName
-	tr.team.mu.Lock()
-	defer tr.team.mu.Unlock()
-	members := make([]AgentInfo, 0, len(tr.team.agents)-1)
-	for _, name := range tr.team.order {
-		if name == myName {
-			continue
-		}
-		members = append(members, AgentInfo{
-			Name:        name,
-			Description: tr.team.agents[name].description,
-			Type:        tr.team.agents[name].agentType,
-		})
-	}
-	handoffTools := make([]Tool, 0, len(members))
-	for _, m := range members {
-		handoffTools = append(handoffTools, &handoffTool{
-			record:   tr.recordHandoff,
-			target:   m.Name,
-			desc:     m.Description,
-		})
-	}
-	return handoffTools
-}
 
 func (tr *teamRunner) detectLoop() string {
 	if len(tr.chain) < 2 {
@@ -837,8 +789,10 @@ func (tr *teamRunner) buildTeamPrompt(myName string, forceFinal bool) string {
 	if forceFinal {
 		b.WriteString("\n⚠️ NO HANDOFFS: You have been instructed to produce a final answer yourself.\n")
 	} else {
-		b.WriteString("\nUse transfer_to_<name> to hand off. Include a clear message explaining what you need.\n")
-		b.WriteString("When your part is done (no handoff needed), just respond directly.\n")
+		b.WriteString("\n## Handoff Rules\n")
+		b.WriteString("- When your work should be continued by another team member, call transfer_to_<name>.\n")
+		b.WriteString("  You can explain your findings to the user first, then call the transfer tool in the same turn.\n")
+		b.WriteString("- If your task is self-contained and no teammate needs to continue, respond directly — no transfer.\n")
 	}
 
 	if len(tr.chain) > 0 {
