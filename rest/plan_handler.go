@@ -275,7 +275,9 @@ func (h *PlanHandler) handleUpdateSession(w http.ResponseWriter, r *http.Request
 
 	s.mu.Lock()
 	s.info.Title = body.Title
-	s.info.UpdatedAt = time.Now()
+	if body.Title != "" {
+		s.info.UpdatedAt = time.Now()
+	}
 	currentInfo := s.info
 	s.mu.Unlock()
 
@@ -355,6 +357,7 @@ func (h *PlanHandler) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	setSSEHeaders(w)
+	flusher.Flush() // flush headers immediately
 
 	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
 	defer cancel()
@@ -598,6 +601,7 @@ func (h *PlanHandler) handleEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	setSSEHeaders(w)
+	flusher.Flush() // flush headers immediately
 
 	sub := h.bus.SubscribeLive(id)
 	defer h.bus.Unsubscribe(id, sub)
@@ -1009,7 +1013,7 @@ func planEventToSSE(evt plan.PlanEvent) SSEEvent {
 		return SSEEvent{Type: "plan_waiting_retry", StepID: evt.StepID, Error: evt.ErrText}
 
 	case plan.PlanEventDone:
-		return SSEEvent{Type: "plan_done"}
+		return SSEEvent{Type: "plan_done", FinalOutput: evt.Text}
 
 	case plan.PlanEventError:
 		return SSEEvent{Type: "plan_error", Error: evt.ErrText}

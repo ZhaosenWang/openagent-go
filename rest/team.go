@@ -371,6 +371,7 @@ func (h *TeamHandler) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	setSSEHeaders(w)
+	flusher.Flush() // flush headers immediately
 
 	sub := h.bus.SubscribeLive(id)
 	defer h.bus.Unsubscribe(id, sub)
@@ -768,6 +769,7 @@ func teamEventToSSE(evt openagent.TeamEvent) SSEEvent {
 		se := SSEEvent{Type: "done"}
 		if evt.Result != nil {
 			se.FinalOutput = evt.Result.FinalOutput
+			se.PromptTokens = evt.Result.Usage.PromptTokens
 		}
 		return se
 
