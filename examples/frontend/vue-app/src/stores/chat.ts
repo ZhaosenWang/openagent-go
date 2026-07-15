@@ -302,6 +302,7 @@ export const useChatStore = defineStore('chat', () => {
               content: tc.function.arguments || '',
               agent: event.agent,
               toolCall: tc,
+              toolCallId: tc.id,
               timestamp: now(),
             })
             p.pendingToolCalls.set(tc.id, proxy)
@@ -490,25 +491,49 @@ export const useChatStore = defineStore('chat', () => {
       if (reqSession !== currentSessionId.value) return
       const converted: ChatMessage[] = []
       for (const m of msgs) {
+        // An assistant message with tool_calls carries both a visible
+        // response AND function invocations. Split into two entries
+        // so the content renders as an agent bubble and the tool call
+        // renders as a separate card — matching SSE stream behaviour.
+        if (m.role === 'assistant' && m.tool_calls?.length > 0) {
+          if (m.content) {
+            converted.push({
+              id: `${sessionId}-${converted.length}`,
+              role: 'agent',
+              content: m.content,
+              thoughtContent: m.reasoning_content || undefined,
+              agent: m.name || undefined,
+              timestamp: Date.now() - converted.length,
+            })
+          }
+          for (const tc of m.tool_calls) {
+            converted.push({
+              id: `${sessionId}-${converted.length}`,
+              role: 'tool_call',
+              content: tc.function.arguments,
+              toolCallId: tc.id,
+              agent: m.name || undefined,
+              toolCall: {
+                id: tc.id,
+                function: { name: tc.function.name, arguments: tc.function.arguments },
+              },
+              timestamp: Date.now() - converted.length,
+            })
+          }
+          continue
+        }
         const role = m.role === 'user' ? 'user' :
-                     m.role === 'assistant' && m.tool_calls?.length > 0 ? 'tool_call' :
                      m.role === 'assistant' ? 'agent' :
                      m.role === 'tool' ? 'tool_result' : m.role
-        const msg: ChatMessage = {
+        converted.push({
           id: `${sessionId}-${converted.length}`,
           role: role as any,
           content: m.content || '',
           thoughtContent: m.reasoning_content || undefined,
           toolCallId: m.tool_call_id || undefined,
+          agent: m.name || undefined,
           timestamp: Date.now() - converted.length,
-        }
-        if (m.tool_calls && m.tool_calls.length > 0) {
-          msg.toolCall = {
-            id: m.tool_call_id || '',
-            function: { name: m.tool_calls[0].function.name, arguments: m.tool_calls[0].function.arguments },
-          }
-        }
-        converted.push(msg)
+        })
       }
       // Don't overwrite if a live SSE stream is active for this session.
       if (!streaming.value) {

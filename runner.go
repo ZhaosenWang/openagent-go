@@ -18,10 +18,10 @@ type runner struct {
 	agent *Agent
 
 	// Cached state
-	skills       []SkillInfo         // Discover result, refreshed by reload_skills
-	loadedSkills map[string]string   // name → body, populated by use_skill
+	skills       []SkillInfo          // Discover result, refreshed by reload_skills
+	loadedSkills map[string]string    // name → body, populated by use_skill
 	builtinTools []FunctionDefinition // auto-injected tools (use_skill, reload_skills)
-	compressed   *CompressedContext  // Memory.Compressed result, set once per Run()
+	compressed   *CompressedContext   // Memory.Compressed result, set once per Run()
 
 	// Per-run state
 	runModel Model // resolved model for this run (session override > agent default)
@@ -145,7 +145,6 @@ func (r *runner) run(ctx context.Context, session Session, prefix []Message, inp
 					history = history[:len(history)-1]
 				}
 
-
 				// Fetch compressed context (Layer 2 of the memory model).
 				// Errors are collected and reported in the leave event below —
 				// compressed context is an optimization, not a requirement.
@@ -251,8 +250,8 @@ func (r *runner) run(ctx context.Context, session Session, prefix []Message, inp
 
 		mcStart := time.Now()
 		r.observe(ctx, StageModelCall, "enter", map[string]any{
-			"turn":      turn,
-			"maxTurns":  maxTurns,
+			"turn":     turn,
+			"maxTurns": maxTurns,
 		}, time.Time{}, nil)
 		resp, err := r.callModel(ctx, lastReq, ch)
 
@@ -295,7 +294,11 @@ func (r *runner) run(ctx context.Context, session Session, prefix []Message, inp
 			}
 		}
 
-		// Track response in working set and memory
+		// Track response in working set and memory.
+		// Stamp the agent name so frontend history can label who said what.
+		if choice.Message.Name == "" {
+			choice.Message.Name = r.agent.Name
+		}
 		workingMessages = append(workingMessages, choice.Message)
 		r.appendMemory(ctx, session, choice.Message)
 
@@ -492,7 +495,7 @@ func (r *runner) prepareMemory(ctx context.Context, session Session) ([]Message,
 		return msgs, ci
 	}
 	return msgs[keep:], ci
-	}
+}
 func (r *runner) buildPrompt(ctx context.Context, session Session, working []Message) []Message {
 	input := PromptInput{
 		AgentDescription: r.agent.Description,
@@ -818,6 +821,7 @@ func (r *runner) toolDef(name string) *FunctionDefinition {
 }
 
 func (r *runner) appendMemory(ctx context.Context, session Session, msg Message) {
+	if msg.Transient { return }
 	if r.agent.Memory == nil {
 		return
 	}

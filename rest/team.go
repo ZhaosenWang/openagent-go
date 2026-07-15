@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"sort"
 	"sync"
 	"time"
 
@@ -125,24 +126,23 @@ func (h *TeamHandler) handleListMessages(w http.ResponseWriter, r *http.Request)
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	// Read team-shared messages (user messages, handoffs, text output).
-	fetchN := limit + before
-	msgs, err := mem.Recent(ctx, id, fetchN, 0)
+	// Shared partition: user messages, handoffs, agent text responses.
+	msgs, err := mem.Recent(ctx, id, limit+before, 0)
 	if err != nil {
 		http.Error(w, `{"error":"failed to fetch messages"}`, http.StatusInternalServerError)
 		return
 	}
 
-	// Also read agent-private messages (tool calls, tool results) from
-	// each agent's private partition. Shared + private merged gives the
-	// full conversation history visible to external clients.
+	// Each agent's private partition: tool calls and tool results.
 	s := h.sm.getOrCreate(id)
 	for _, tam := range s.agentMems {
-		priv, _ := tam.PrivateRecent(ctx, id, fetchN, 0)
+		priv, _ := tam.PrivateRecent(ctx, id, limit+before, 0)
 		msgs = append(msgs, priv...)
 	}
 
-	// Apply offset + limit (after merging, so pagination covers all sources).
+	// Sort by global insertion index to restore chronological order
+	// across shared + private partitions.
+	sort.Slice(msgs, func(i, j int) bool { return msgs[i].Index < msgs[j].Index })
 	if before > 0 && len(msgs) > before {
 		msgs = msgs[:len(msgs)-before]
 	} else if before > 0 {

@@ -21,6 +21,8 @@ type Message struct {
 	Name             string        `json:"name,omitempty"`
 	ToolCalls        []ToolCall    `json:"tool_calls,omitempty"`
 	ToolCallID       string        `json:"tool_call_id,omitempty"`
+	Transient        bool          `json:"-"`               // internal-only routing (handoffs)
+	Index            int64         `json:"index,omitempty"` // global insertion order (0 if backend doesn't track)
 }
 
 // IsMultimodal returns true if this message carries multimodal content parts.

@@ -87,16 +87,18 @@
 
     <!-- Status bar: [pct] [bar] [tokens] · [model] · [msgs] -->
     <div class="status-bar">
-      <span class="stat-item ctx" :style="{ color: ctkColor }">{{ ctkPct }}%</span>
-      <n-progress
-        type="line"
-        :percentage="ctkPct"
-        :color="ctkColor"
-        :height="6"
-        :border-radius="3"
-        :show-indicator="false"
-        style="width:80px;flex-shrink:0"
-      />
+      <template v-if="ctkPct >= 0">
+        <span class="stat-item ctx" :style="{ color: ctkColor }">{{ ctkPct }}%</span>
+        <n-progress
+          type="line"
+          :percentage="ctkPct"
+          :color="ctkColor"
+          :height="6"
+          :border-radius="3"
+          :show-indicator="false"
+          style="width:80px;flex-shrink:0"
+        />
+      </template>
       <span class="stat-label ctx-total">{{ ctxLabel }}</span>
       <span class="stat-sep">·</span>
       <n-popselect
@@ -134,13 +136,17 @@ const props = defineProps<{
 const emits = defineEmits<{ send: [text: string] }>()
 const chatStore = useChatStore()
 const ctkPct = computed(() => {
-  if (!props.usage?.contextWindow) return 0
-  return Math.round((props.usage.promptTokens / props.usage.contextWindow) * 100)
+  const cw = props.usage?.contextWindow || chatStore.contextWindow
+  const tok = props.usage?.promptTokens || 0
+  if (!cw) return -1 // unknown
+  return Math.round((tok / cw) * 100)
 })
 const ctkColor = computed(() => ctkPct.value > 90 ? '#ef4444' : ctkPct.value > 70 ? '#f59e0b' : '#22c55e')
 const ctxLabel = computed(() => {
-  if (!props.usage?.contextWindow) return ''
-  return `${props.usage.promptTokens.toLocaleString()} / ${props.usage.contextWindow.toLocaleString()}`
+  const max = props.usage?.contextWindow || chatStore.contextWindow
+  if (!max) return 'unknown'
+  const cur = props.usage?.promptTokens || 0
+  return `${cur.toLocaleString()} / ${max.toLocaleString()}`
 })
 
 const inputText = ref('')
@@ -168,13 +174,18 @@ interface ToolBatchItem {
   name: string
   args: string
   result: string
+  callId: string
 }
 
 type DisplayItem =
   | { kind: 'msg'; msg: ChatMessage }
   | { kind: 'tool_batch'; tools: ToolBatchItem[]; id: string }
 
-// Group consecutive tool_call/tool_result messages into batches.
+// Group consecutive tool messages into batches.  A batch collects every
+// tool_call/tool_result between two non-tool messages — this matches the
+// visual grouping used during SSE streaming (one agent turn's tools =
+// one card).  tool_result entries are matched to their tool_call via
+// toolCallId so that the result text is displayed.
 const displayItems = computed<DisplayItem[]>(() => {
   const items: DisplayItem[] = []
   let batch: ToolBatchItem[] = []
@@ -187,10 +198,20 @@ const displayItems = computed<DisplayItem[]>(() => {
   }
 
   for (const m of props.messages) {
-    const isTool = m.role === 'tool_call' || m.role === 'tool_result'
-    if (!isTool) {
+    if (m.role !== 'tool_call' && m.role !== 'tool_result') {
       flush()
       items.push({ kind: 'msg', msg: m })
+      continue
+    }
+    if (m.role === 'tool_result' && m.toolCallId) {
+      // Pair to an existing tool_call in the current batch.
+      const found = batch.find(b => b.callId === m.toolCallId)
+      if (found) {
+        found.result = m.content || ''
+        continue
+      }
+      // Orphan tool_result — add as standalone entry so it isn't lost.
+      batch.push({ name: '(result)', args: '', result: m.content || '', callId: m.toolCallId })
       continue
     }
     if (m.toolCall) {
@@ -200,7 +221,8 @@ const displayItems = computed<DisplayItem[]>(() => {
           try { return JSON.stringify(JSON.parse(m.toolCall.function.arguments), null, 2) }
           catch { return m.toolCall.function.arguments }
         })(),
-        result: m.role === 'tool_result' ? m.content : '',
+        result: '',
+        callId: m.toolCall.id,
       }
       batch.push(item)
     }

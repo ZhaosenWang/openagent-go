@@ -218,6 +218,15 @@ func (sm *sessionManager[E]) update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check store if session isn't in memory (restart recovery).
+	if sm.store != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		if stored, err := sm.store.Get(ctx, id); err == nil && stored != nil {
+			sm.getOrCreate(id) // restore into memory
+		}
+	}
+
 	inf, ok := sm.withMeta(id, func(inf *SessionInfo) {
 		inf.Title = body.Title
 		if body.Title != "" {

@@ -539,6 +539,7 @@ func (tr *teamRunner) run(ctx context.Context, session Session, input Message, c
 			// Veto: inject hint, stay with current agent, force final
 			tr.forceFinal = true
 			currentInput = Message{
+				Transient: true,
 				Role:    RoleUser,
 				Content: fmt.Sprintf("⚠️ Handoff blocked: %v\n\nYour last request was: %s\nPlease handle this yourself.", vetoErr, req.message),
 			}
@@ -555,12 +556,14 @@ func (tr *teamRunner) run(ctx context.Context, session Session, input Message, c
 			}
 			tr.forceFinal = true
 			currentInput = Message{
+				Transient: true,
 				Role:    RoleUser,
 				Content: fmt.Sprintf("⚠️ %s\n\nLast handoff: %s\n\nYou must now produce a final answer yourself. Do not hand off again.", hint, req.message),
 			}
 		} else {
 			tr.forceFinal = false
 			currentInput = Message{
+				Transient: true,
 				Role:    RoleUser,
 				Content: req.message,
 			}
@@ -571,6 +574,7 @@ func (tr *teamRunner) run(ctx context.Context, session Session, input Message, c
 			// forward workflow task.
 			if tr.isReturnHandoff(tr.currentName, req.target) {
 				currentInput = Message{
+					Transient: true,
 					Role: RoleUser,
 					Content: fmt.Sprintf("⚠️ Return handoff from %s (asking a follow-up). "+
 						"Answer their question concisely, then hand off back to %s with your answer.\n\n"+
