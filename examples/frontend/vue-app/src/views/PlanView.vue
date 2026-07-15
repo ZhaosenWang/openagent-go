@@ -124,7 +124,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
+import { ref, computed, watchEffect, onBeforeUnmount } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { NScrollbar, NCard, NInput, NButton, NSpace, NText, NTag, NCollapse, NCollapseItem, NAlert } from 'naive-ui'
 import { usePlanStore } from '@/stores/plan'
@@ -149,16 +149,15 @@ const replanning = ref(false)
 
 const sessionId = computed(() => (route.params.sessionId as string) || sessions.currentSessionId || '')
 
-// Ensure plan session exists on mount
-onMounted(async () => {
-  if (!sessions.currentSessionId) {
-    try {
-      const info = await sessions.createSession('plan')
-      sessions.selectSession(info.id)
-      router.replace(`/plan/${info.id}`)
-    } catch { /* ok */ }
-  }
+// Activate session on route change — preserves plan state in per-session cache.
+watchEffect(() => {
+  const sid = sessionId.value
+  if (!sid) return
+  plan.activateSession(sid)
 })
+
+// Session creation is handled by AppSidebar on mode switch.
+// PlanView only needs to activate the already-created session.
 
 function stepState(id: string): StepState {
   return plan.steps[id] || { status: 'pending', output: '', summary: '', toolCalls: [] }
@@ -225,7 +224,6 @@ function handleApprove(allowed: boolean, feedback?: string) {
   plan.approveTool(sid, allowed, feedback)
 }
 
-watch(sessionId, () => { plan.clearPlan() })
 onBeforeUnmount(() => { plan.clearPlan() })
 </script>
 
