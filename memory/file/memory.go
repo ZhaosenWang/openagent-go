@@ -277,16 +277,19 @@ func (m *Memory) readAllLocked(ctx context.Context, sessionID string) ([]openage
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
+	var idx int64
 	for scanner.Scan() {
 		if len(msgs)%100 == 0 {
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
 		}
+		idx++
 		var msg openagent.Message
 		if err := json.Unmarshal(scanner.Bytes(), &msg); err != nil {
 			continue
 		}
+		msg.Index = idx
 		msgs = append(msgs, msg)
 	}
 	return msgs, scanner.Err()

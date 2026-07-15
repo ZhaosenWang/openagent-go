@@ -229,8 +229,6 @@ func (h *Handler) handleChat(w http.ResponseWriter, r *http.Request) {
 	model := h.lookupModel(provider, modelID)
 	if model == nil {
 		model = h.defaultModel
-		provider = ""
-		modelID = ""
 	}
 
 	// Persist the resolved model so GET /sessions reflects the actual model.

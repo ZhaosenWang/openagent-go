@@ -560,11 +560,12 @@ func (h *PlanHandler) newEntry(info SessionInfo) *planSessionState {
 	opts = append(opts, plan.WithMaxConcurrency(8))
 	opts = append(opts, plan.WithAutoReplan(false)) // pause on failure, let user retry/replan
 
+	mem := h.sm.Memory()
 	for _, t := range h.agents {
 		// Clone in-process agents so each session has isolated state.
 		runner := t.Runner
 		if ag, ok := t.Runner.(*openagent.Agent); ok {
-			runner = cloneAgentForPlan(ag, s, h.submitApproval)
+			runner = cloneAgentForPlan(ag, mem, s, h.submitApproval)
 		}
 		opts = append(opts, plan.WithAgent(t.Name, t.Description, runner))
 	}
@@ -597,10 +598,14 @@ func (h *PlanHandler) submitApproval(s *planSessionState, call openagent.ToolCal
 }
 
 // cloneAgentForPlan clones an Agent for use in a plan session, injecting the REST approver bridge.
-func cloneAgentForPlan(tmpl *openagent.Agent, s *planSessionState, submitFn func(*planSessionState, openagent.ToolCall, chan approveResponse)) *openagent.Agent {
+// If mem is non-nil, it overrides the template's memory so plan steps persist their messages.
+func cloneAgentForPlan(tmpl *openagent.Agent, mem openagent.Memory, s *planSessionState, submitFn func(*planSessionState, openagent.ToolCall, chan approveResponse)) *openagent.Agent {
+	if mem == nil {
+		mem = tmpl.Memory
+	}
 	return openagent.NewAgent(tmpl.Name,
 		openagent.WithModel(tmpl.Model),
-		openagent.WithMemory(tmpl.Memory),
+		openagent.WithMemory(mem),
 		openagent.WithTools(tmpl.Tools...),
 		openagent.WithInstructions(tmpl.Instructions),
 		openagent.WithMaxTurns(tmpl.MaxTurns),
