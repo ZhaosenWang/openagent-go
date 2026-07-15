@@ -89,6 +89,7 @@ func (r *runner) run(ctx context.Context, session Session, prefix []Message, inp
 	// Track last request/response for RunHooks.OnAgentEnd
 	var lastReq ChatCompletionRequest
 	var lastResp *ChatCompletionResponse
+	var agentHookState any
 
 	// ── RunHooks.OnAgentStart ──
 	// Build the tool list once so hooks see the full set (including built-in
@@ -98,7 +99,7 @@ func (r *runner) run(ctx context.Context, session Session, prefix []Message, inp
 		allToolDefs = append(allToolDefs, r.builtinTools...)
 	}
 	if r.agent.Hooks != nil {
-		_ = r.agent.Hooks.OnAgentStart(ctx, ChatCompletionRequest{
+		agentHookState, _ = r.agent.Hooks.OnAgentStart(ctx, ChatCompletionRequest{
 			Model:    session.ModelID,
 			Messages: []Message{input},
 			Tools:    allToolDefs,
@@ -110,7 +111,7 @@ func (r *runner) run(ctx context.Context, session Session, prefix []Message, inp
 			if resp == nil {
 				resp = &ChatCompletionResponse{}
 			}
-			r.agent.Hooks.OnAgentEnd(ctx, lastReq, resp, runErr)
+			r.agent.Hooks.OnAgentEnd(ctx, lastReq, resp, runErr, agentHookState)
 		}
 	}()
 
@@ -729,8 +730,9 @@ func (r *runner) executeOneToolInternal(ctx context.Context, session Session, ca
 
 	tool := r.findTool(call.Function.Name)
 
+	var toolHookState any
 	if r.agent.Hooks != nil {
-		_ = r.agent.Hooks.OnToolStart(ctx, *def, args)
+		toolHookState, _ = r.agent.Hooks.OnToolStart(ctx, *def, args)
 	}
 
 	teStart := time.Now()
@@ -769,7 +771,7 @@ func (r *runner) executeOneToolInternal(ctx context.Context, session Session, ca
 	r.observe(ctx, StageToolExecute, "leave", map[string]any{"tool": call.Function.Name}, teStart, execErr)
 
 	if r.agent.Hooks != nil {
-		r.agent.Hooks.OnToolEnd(ctx, *def, args, output, execErr)
+		r.agent.Hooks.OnToolEnd(ctx, *def, args, &output, &execErr, toolHookState)
 	}
 
 	content := output
@@ -784,22 +786,27 @@ func (r *runner) executeOneToolInternal(ctx context.Context, session Session, ca
 	}
 }
 
+// toolHookCtx bundles state passed from fireToolHooks to fireToolHooksEnd.
+type toolHookCtx struct {
+	start     time.Time
+	hookState any // opaque value from RunHooks.OnToolStart
+}
+
 // fireToolHooks emits observer enter + OnToolStart for built-in tools.
-// Returns the start time so fireToolHooksEnd can compute accurate duration.
-func (r *runner) fireToolHooks(ctx context.Context, def FunctionDefinition, args json.RawMessage) time.Time {
-	start := time.Now()
+func (r *runner) fireToolHooks(ctx context.Context, def FunctionDefinition, args json.RawMessage) toolHookCtx {
+	tc := toolHookCtx{start: time.Now()}
 	if r.agent.Hooks != nil {
-		_ = r.agent.Hooks.OnToolStart(ctx, def, args)
+		tc.hookState, _ = r.agent.Hooks.OnToolStart(ctx, def, args)
 	}
 	r.observe(ctx, StageToolExecute, "enter", map[string]any{"tool": def.Name}, time.Time{}, nil)
-	return start
+	return tc
 }
 
 // fireToolHooksEnd emits observer leave + OnToolEnd for built-in tools.
-func (r *runner) fireToolHooksEnd(ctx context.Context, def FunctionDefinition, args json.RawMessage, output string, start time.Time, err error) {
-	r.observe(ctx, StageToolExecute, "leave", map[string]any{"tool": def.Name}, start, err)
+func (r *runner) fireToolHooksEnd(ctx context.Context, def FunctionDefinition, args json.RawMessage, output string, tc toolHookCtx, err error) {
+	r.observe(ctx, StageToolExecute, "leave", map[string]any{"tool": def.Name}, tc.start, err)
 	if r.agent.Hooks != nil {
-		r.agent.Hooks.OnToolEnd(ctx, def, args, output, err)
+		r.agent.Hooks.OnToolEnd(ctx, def, args, &output, &err, tc.hookState)
 	}
 }
 

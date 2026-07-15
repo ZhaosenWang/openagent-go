@@ -28,26 +28,24 @@ func New(tracer trace.Tracer) *Hooks {
 	return &Hooks{tracer: tracer}
 }
 
-func (h *Hooks) OnAgentStart(ctx context.Context, req openagent.ChatCompletionRequest) error {
-	_, span := h.tracer.Start(ctx, "agent.run",
+func (h *Hooks) OnAgentStart(ctx context.Context, req openagent.ChatCompletionRequest) (any, error) {
+	ctx, span := h.tracer.Start(ctx, "agent.run",
 		trace.WithAttributes(
 			attribute.String("agent.model", req.Model),
 			attribute.Int("agent.messages", len(req.Messages)),
 			attribute.Int("agent.tools", len(req.Tools)),
 		),
 	)
-	// Span is not ended here — the caller should end it.
-	// Store nothing: OnAgentEnd creates its own span for the finish event.
-	span.End()
-	return nil
+	// Start a root span and defer End to OnAgentEnd so the duration
+	// covers the entire run loop (including all tool calls).
+	return span, nil
 }
 
-func (h *Hooks) OnAgentEnd(ctx context.Context, req openagent.ChatCompletionRequest, resp *openagent.ChatCompletionResponse, err error) {
-	_, span := h.tracer.Start(ctx, "agent.end",
-		trace.WithAttributes(
-			attribute.String("agent.model", req.Model),
-		),
-	)
+func (h *Hooks) OnAgentEnd(ctx context.Context, req openagent.ChatCompletionRequest, resp *openagent.ChatCompletionResponse, runErr error, startState any) {
+	span, _ := startState.(trace.Span)
+	if span == nil {
+		return
+	}
 	defer span.End()
 
 	if resp != nil {
@@ -57,37 +55,35 @@ func (h *Hooks) OnAgentEnd(ctx context.Context, req openagent.ChatCompletionRequ
 			attribute.Int("agent.total_tokens", resp.Usage.TotalTokens),
 		)
 	}
-	if err != nil {
-		span.SetStatus(codes.Error, err.Error())
-		span.RecordError(err)
+	if runErr != nil {
+		span.SetStatus(codes.Error, runErr.Error())
+		span.RecordError(runErr)
 	}
 }
 
-func (h *Hooks) OnToolStart(ctx context.Context, tool openagent.FunctionDefinition, args json.RawMessage) error {
-	_, span := h.tracer.Start(ctx, fmt.Sprintf("tool.%s", tool.Name),
+func (h *Hooks) OnToolStart(ctx context.Context, tool openagent.FunctionDefinition, args json.RawMessage) (any, error) {
+	ctx, span := h.tracer.Start(ctx, fmt.Sprintf("tool.%s", tool.Name),
 		trace.WithAttributes(
 			attribute.String("tool.name", tool.Name),
 			attribute.String("tool.args", string(args)),
 		),
 	)
-	// Span ended in OnToolEnd — but since we don't share state,
-	// we just end it here as a standalone event.
-	span.End()
-	return nil
+	return span, nil
 }
 
-func (h *Hooks) OnToolEnd(ctx context.Context, tool openagent.FunctionDefinition, args json.RawMessage, result string, err error) {
-	_, span := h.tracer.Start(ctx, fmt.Sprintf("tool.%s.result", tool.Name),
-		trace.WithAttributes(
-			attribute.String("tool.name", tool.Name),
-			attribute.Int("tool.result_len", len(result)),
-		),
-	)
+func (h *Hooks) OnToolEnd(ctx context.Context, tool openagent.FunctionDefinition, args json.RawMessage, result *string, err *error, startState any) {
+	span, _ := startState.(trace.Span)
+	if span == nil {
+		return
+	}
 	defer span.End()
 
-	if err != nil {
-		span.SetStatus(codes.Error, err.Error())
-		span.RecordError(err)
+	if *err != nil {
+		span.SetStatus(codes.Error, (*err).Error())
+		span.RecordError(*err)
+	}
+	if result != nil {
+		span.SetAttributes(attribute.Int("tool.result_len", len(*result)))
 	}
 }
 
