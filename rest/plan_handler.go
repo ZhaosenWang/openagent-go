@@ -49,6 +49,14 @@ type planSessionState struct {
 
 func (s *planSessionState) sessionInfo() *SessionInfo { return &s.info }
 
+// isActive reports whether the plan session has a running execution
+// or is awaiting tool approval.
+func (s *planSessionState) isActive() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.running || s.pendingApproval != nil
+}
+
 // NewPlanHandler creates a PlanHandler.
 // model is used for both the Planner and step output summarisation.
 // At least one agent template is required.
@@ -87,6 +95,11 @@ func (h *PlanHandler) Register(mux *http.ServeMux) {
 func (h *PlanHandler) WithSessionStore(s SessionStore) *PlanHandler {
 	h.sm.SetStore(s)
 	return h
+}
+
+// StartJanitor starts a background goroutine that evicts idle plan session entries.
+func (h *PlanHandler) StartJanitor(ctx context.Context, interval, maxIdle time.Duration) {
+	h.sm.StartJanitor(ctx, interval, maxIdle)
 }
 
 // ── Session CRUD ──

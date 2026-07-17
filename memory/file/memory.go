@@ -29,6 +29,7 @@ type Memory struct {
 	dir        string
 	mu         sync.RWMutex
 	summarizer openagent.Summarizer // nil = compaction is a no-op
+	nextIdx    map[string]int64     // sessionID → next message Index (0 = unseeded)
 }
 
 // New creates a Memory store at dir. Directory is created if missing.
@@ -36,7 +37,7 @@ func New(dir string) (*Memory, error) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("file memory: %w", err)
 	}
-	return &Memory{dir: dir}, nil
+	return &Memory{dir: dir, nextIdx: make(map[string]int64)}, nil
 }
 
 // WithSummarizer enables compaction. nil (default) disables it. The Runner
@@ -83,6 +84,19 @@ func (m *Memory) Append(ctx context.Context, sessionID string, msg openagent.Mes
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	// Seed the index counter on first append to this session (e.g. after
+	// restart). Subsequent appends use the in-memory counter — no per-append
+	// file scan.
+	if m.nextIdx[sessionID] == 0 {
+		n, err := m.countLinesLocked(sessionID)
+		if err != nil {
+			return fmt.Errorf("file memory append: %w", err)
+		}
+		m.nextIdx[sessionID] = n + 1
+	}
+	msg.Index = m.nextIdx[sessionID]
+	m.nextIdx[sessionID]++
 
 	f, err := os.OpenFile(m.sessionPath(sessionID), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
@@ -277,22 +291,44 @@ func (m *Memory) readAllLocked(ctx context.Context, sessionID string) ([]openage
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
-	var idx int64
+	var fallback int64
 	for scanner.Scan() {
 		if len(msgs)%100 == 0 {
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
 		}
-		idx++
+		fallback++
 		var msg openagent.Message
 		if err := json.Unmarshal(scanner.Bytes(), &msg); err != nil {
 			continue
 		}
-		msg.Index = idx
+		if msg.Index == 0 {
+			msg.Index = fallback // old files without persisted Index
+		}
 		msgs = append(msgs, msg)
 	}
 	return msgs, scanner.Err()
+}
+
+// countLinesLocked returns the number of lines in the session's JSONL file.
+// Caller must hold m.mu.
+func (m *Memory) countLinesLocked(sessionID string) (int64, error) {
+	f, err := os.Open(m.sessionPath(sessionID))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	defer f.Close()
+
+	var count int64
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		count++
+	}
+	return count, scanner.Err()
 }
 
 func (m *Memory) writeCompressed(sessionID string, cc *openagent.CompressedContext) error {

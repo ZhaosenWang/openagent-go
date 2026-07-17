@@ -36,10 +36,10 @@ type Bus[T any] struct {
 // Subscription represents a single subscriber's connection to a topic.
 // Read events from C. When C is closed the subscription has been removed.
 type Subscription[T any] struct {
-	C   <-chan T
-	ch  chan T
-	t   *topic[T]
-	cid int64 // compare-and-delete marker
+	C      <-chan T
+	ch     chan T
+	t      *topic[T]
+	closed atomic.Bool // ensure Close is called at most once
 }
 
 // New creates a Bus with per-session history capped at maxHistory events.
@@ -89,14 +89,38 @@ func (b *Bus[T]) SubscribeLive(sessionID string) *Subscription[T] {
 	return t.subscribeLive()
 }
 
+// RemoveTopic removes a session's topic entirely, closing all subscriber
+// channels. Call when a session is deleted — no further events will be sent
+// and existing SSE connections will receive channel closure (EOF).
+// Safe to call on sessions that don't exist (no-op).
+func (b *Bus[T]) RemoveTopic(sessionID string) {
+	b.mu.Lock()
+	t, ok := b.sessions[sessionID]
+	if !ok {
+		b.mu.Unlock()
+		return
+	}
+	delete(b.sessions, sessionID)
+	b.mu.Unlock()
+
+	// Close all subscriber channels. Publish will no longer find this
+	// topic, so no new sends can arrive.
+	t.mu.Lock()
+	for _, sub := range t.subs {
+		if sub.closed.CompareAndSwap(false, true) {
+			close(sub.ch)
+		}
+	}
+	t.mu.Unlock()
+}
+
 // Unsubscribe removes the subscription and closes its channel.
 // It is safe to call multiple times on the same subscription (no-op after first).
 func (b *Bus[T]) Unsubscribe(sessionID string, sub *Subscription[T]) {
 	if sub == nil {
 		return
 	}
-	// CAS: ensure Close is only called once per subscription.
-	if !atomic.CompareAndSwapInt64(&sub.cid, sub.cid, -1) {
+	if !sub.closed.CompareAndSwap(false, true) {
 		return // already unsubscribed
 	}
 
@@ -153,11 +177,10 @@ func (b *Bus[T]) Publish(sessionID string, evt T) {
 // ── topic ──
 
 type topic[T any] struct {
-	mu          sync.Mutex
-	subs        []*Subscription[T]
-	history     []T
-	maxHistory  int
-	nextID      int64
+	mu         sync.Mutex
+	subs       []*Subscription[T]
+	history    []T
+	maxHistory int
 }
 
 func (t *topic[T]) subscribeLive() *Subscription[T] {
@@ -166,10 +189,9 @@ func (t *topic[T]) subscribeLive() *Subscription[T] {
 
 	ch := make(chan T, 64)
 	sub := &Subscription[T]{
-		C:   ch,
-		ch:  ch,
-		t:   t,
-		cid: atomic.AddInt64(&t.nextID, 1),
+		C:  ch,
+		ch: ch,
+		t:  t,
 	}
 	// No history replay — subscriber only gets future events.
 	t.subs = append(t.subs, sub)
@@ -182,10 +204,9 @@ func (t *topic[T]) subscribe() *Subscription[T] {
 
 	ch := make(chan T, 64)
 	sub := &Subscription[T]{
-		C:   ch,
-		ch:  ch,
-		t:   t,
-		cid: atomic.AddInt64(&t.nextID, 1),
+		C:  ch,
+		ch: ch,
+		t:  t,
 	}
 
 	// Replay history into the new subscriber's channel.

@@ -241,9 +241,21 @@ func (e *executor) runBatch(ctx context.Context, batch []string, state *PlanStat
 		})
 	}
 
-	// Ignore the error from Wait — it only signals which step failed to
-	// cancel siblings. The actual failure info is in the StepResults.
-	_ = g.Wait()
+	// Wait reports the first error. When ctx is cancelled before any
+	// goroutine reaches executeStep (e.g. timeout), failed remains false
+	// and all step statuses stay pending. Without this check, the caller
+	// sees "all done" for steps that never ran.
+	if err := g.Wait(); err != nil {
+		// Parent context cancelled — propagate immediately. Step-level
+		// statuses may be inconsistent (some goroutines never executed)
+		// but the caller discards state on cancellation anyway.
+		if ctx.Err() != nil {
+			return usage, failed, ctx.Err()
+		}
+		// Otherwise a step failed — failed was already set by the
+		// goroutine that returned the first error; gCtx was cancelled to
+		// bail out siblings, which is expected.
+	}
 	return usage, failed, nil
 }
 

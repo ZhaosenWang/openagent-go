@@ -85,6 +85,11 @@ func (h *TeamHandler) WithSessionStore(s SessionStore) *TeamHandler {
 	return h
 }
 
+// StartJanitor starts a background goroutine that evicts idle team session entries.
+func (h *TeamHandler) StartJanitor(ctx context.Context, interval, maxIdle time.Duration) {
+	h.sm.StartJanitor(ctx, interval, maxIdle)
+}
+
 // ── teamSessionState ──
 
 type teamSessionState struct {
@@ -94,10 +99,19 @@ type teamSessionState struct {
 	agentMems  []*teamAgentMemory // per-agent memory wrappers for cleanup
 
 	mu              sync.Mutex
+	running         bool             // true while agent goroutine is active
 	pendingApproval *pendingApproval
 }
 
 func (s *teamSessionState) sessionInfo() *SessionInfo { return &s.info }
+
+// isActive reports whether the team session has an ongoing agent run
+// or is awaiting tool approval. Eviction skips active sessions.
+func (s *teamSessionState) isActive() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.running || s.pendingApproval != nil
+}
 
 type agentInfo struct {
 	Name        string `json:"name"`
@@ -182,6 +196,7 @@ func (h *TeamHandler) handleChat(w http.ResponseWriter, r *http.Request) {
 	s := h.sm.getOrCreate(id)
 
 	s.mu.Lock()
+	s.running = true
 	s.pendingApproval = nil
 	s.mu.Unlock()
 
@@ -199,6 +214,12 @@ func (h *TeamHandler) handleChat(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
+		defer func() {
+			s.mu.Lock()
+			s.running = false
+			s.pendingApproval = nil
+			s.mu.Unlock()
+		}()
 
 		oaSession := openagent.Session{
 			ID:        id,

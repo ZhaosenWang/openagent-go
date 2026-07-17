@@ -130,6 +130,12 @@ func (h *Handler) WithSessionStore(s SessionStore) *Handler {
 	return h
 }
 
+// StartJanitor starts a background goroutine that evicts idle session entries.
+// See sessionManager.StartJanitor for semantics.
+func (h *Handler) StartJanitor(ctx context.Context, interval, maxIdle time.Duration) {
+	h.sm.StartJanitor(ctx, interval, maxIdle)
+}
+
 // ── sessionState ──
 
 // sessionState holds the per-session runtime state.
@@ -140,10 +146,19 @@ type sessionState struct {
 	agent      *openagent.Agent
 
 	mu              sync.Mutex
+	running         bool             // true while agent goroutine is active
 	pendingApproval *pendingApproval
 }
 
 func (s *sessionState) sessionInfo() *SessionInfo { return &s.info }
+
+// isActive reports whether the session has an ongoing agent run
+// or is awaiting tool approval. Eviction skips active sessions.
+func (s *sessionState) isActive() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.running || s.pendingApproval != nil
+}
 
 type pendingApproval struct {
 	respond chan approveResponse
@@ -198,6 +213,7 @@ func (h *Handler) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	// Reset pending approval for the new chat message.
 	s.mu.Lock()
+	s.running = true
 	s.pendingApproval = nil
 	s.mu.Unlock()
 
@@ -244,6 +260,12 @@ func (h *Handler) handleChat(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
+		defer func() {
+			s.mu.Lock()
+			s.running = false
+			s.pendingApproval = nil
+			s.mu.Unlock()
+		}()
 
 		oaSession := openagent.Session{
 			ID:        id,

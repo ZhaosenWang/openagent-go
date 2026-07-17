@@ -17,6 +17,10 @@ import (
 // knows the concrete type.
 type sessionEntry interface {
 	sessionInfo() *SessionInfo
+	// isActive reports whether the session has an ongoing operation
+	// that must not be interrupted (e.g. waiting for tool approval,
+	// plan execution in progress). Eviction skips active sessions.
+	isActive() bool
 }
 
 // sessionHooks parameterises sessionManager by entry type E.
@@ -39,8 +43,9 @@ type sessionManager[E sessionEntry] struct {
 	bus    *eventbus.Bus[SSEEvent]
 	hooks  sessionHooks[E]
 
-	mu      sync.RWMutex
-	entries map[string]E
+	mu         sync.RWMutex
+	entries    map[string]E
+	lastAccess map[string]time.Time // touched on getOrCreate / withMeta
 }
 
 func newSessionManager[E sessionEntry](
@@ -50,11 +55,12 @@ func newSessionManager[E sessionEntry](
 	hooks sessionHooks[E],
 ) *sessionManager[E] {
 	return &sessionManager[E]{
-		store:   store,
-		memory:  memory,
-		bus:     bus,
-		hooks:   hooks,
-		entries: make(map[string]E),
+		store:      store,
+		memory:     memory,
+		bus:        bus,
+		hooks:      hooks,
+		entries:    make(map[string]E),
+		lastAccess: make(map[string]time.Time),
 	}
 }
 
@@ -83,7 +89,16 @@ func (sm *sessionManager[E]) withMeta(id string, fn func(*SessionInfo)) (*Sessio
 	fn(e.sessionInfo())
 	out := *e.sessionInfo()
 	sm.mu.RUnlock()
+	sm.touch(id)
 	return &out, true
+}
+
+// touch records a last-access timestamp for the given session.
+// Used by the idle janitor to decide which entries to evict.
+func (sm *sessionManager[E]) touch(id string) {
+	sm.mu.Lock()
+	sm.lastAccess[id] = time.Now()
+	sm.mu.Unlock()
 }
 
 // syncMeta persists a SessionInfo snapshot to the configured store.
@@ -298,7 +313,12 @@ func (sm *sessionManager[E]) del(w http.ResponseWriter, r *http.Request) {
 		sm.hooks.onDelete(e)
 	}
 	delete(sm.entries, id)
+	delete(sm.lastAccess, id)
 	sm.mu.Unlock()
+
+	// Release the bus topic — no more events, active SSE connections will
+	// see channel closure and disconnect cleanly.
+	sm.bus.RemoveTopic(id)
 
 	if sm.memory != nil {
 		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
@@ -309,12 +329,72 @@ func (sm *sessionManager[E]) del(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// ── Idle eviction ──
+
+// StartJanitor starts a background goroutine that periodically evicts idle
+// session entries. Idle sessions are those not accessed in maxIdle time and
+// not currently active (mid-chat, awaiting approval, plan executing).
+// Before eviction the entry's metadata is persisted to the configured
+// SessionStore so it can be restored on next access.
+//
+// The caller is responsible for cancelling ctx to stop the janitor.
+func (sm *sessionManager[E]) StartJanitor(ctx context.Context, interval, maxIdle time.Duration) {
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				sm.evictIdle(maxIdle)
+			}
+		}
+	}()
+}
+
+// evictIdle removes entries that haven't been accessed in maxIdle and are
+// not in an active state. Metadata is persisted first so the session can be
+// restored via getOrCreate → store.Get on next access.
+func (sm *sessionManager[E]) evictIdle(maxIdle time.Duration) {
+	now := time.Now()
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	for id, e := range sm.entries {
+		last, ok := sm.lastAccess[id]
+		if !ok || now.Sub(last) < maxIdle {
+			continue
+		}
+		if e.isActive() {
+			continue // mid-chat / awaiting approval / plan running
+		}
+
+		// Persist metadata so the session can be restored on next access.
+		if sm.store != nil {
+			info := *e.sessionInfo()
+			info.UpdatedAt = now
+			go func(inf SessionInfo) {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if err := sm.store.Save(ctx, inf); err != nil {
+					log.Printf("rest: failed to persist session %s before eviction: %v", id, err)
+				}
+			}(info)
+		}
+
+		delete(sm.entries, id)
+		delete(sm.lastAccess, id)
+	}
+}
+
 // getOrCreate returns the existing entry or creates a new one.
 // On first creation it checks the persistent store to restore
 // metadata from a previous run (e.g. after restart).
 func (sm *sessionManager[E]) getOrCreate(id string) E {
 	sm.mu.Lock()
 	if e, ok := sm.entries[id]; ok {
+		sm.lastAccess[id] = time.Now()
 		sm.mu.Unlock()
 		return e
 	}
@@ -352,6 +432,7 @@ func (sm *sessionManager[E]) getOrCreate(id string) E {
 
 	e := sm.hooks.newEntry(info)
 	sm.entries[id] = e
+	sm.lastAccess[id] = time.Now()
 
 	if !restored && sm.store != nil {
 		sm.syncMeta(&info)
