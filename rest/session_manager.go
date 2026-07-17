@@ -307,6 +307,16 @@ func (sm *sessionManager[E]) del(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Delete messages BEFORE removing from the entries map. While the
+	// entry exists, concurrent getOrCreate returns the existing entry
+	// rather than creating a new one — no new messages can be appended
+	// to a session that DeleteSession is about to wipe.
+	if sm.memory != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+		_ = sm.memory.DeleteSession(ctx, id)
+	}
+
 	sm.mu.Lock()
 	e, ok := sm.entries[id]
 	if ok && sm.hooks.onDelete != nil {
@@ -316,15 +326,8 @@ func (sm *sessionManager[E]) del(w http.ResponseWriter, r *http.Request) {
 	delete(sm.lastAccess, id)
 	sm.mu.Unlock()
 
-	// Release the bus topic — no more events, active SSE connections will
-	// see channel closure and disconnect cleanly.
+	// Release the bus topic.
 	sm.bus.RemoveTopic(id)
-
-	if sm.memory != nil {
-		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-		defer cancel()
-		_ = sm.memory.DeleteSession(ctx, id)
-	}
 
 	w.WriteHeader(http.StatusNoContent)
 }

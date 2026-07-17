@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	openagent "github.com/yusheng-g/openagent-go"
 )
@@ -49,6 +50,14 @@ func (t *Shell) Definition() openagent.FunctionDefinition {
 				"command": {
 					"type": "string",
 					"description": "The shell command to execute"
+				},
+				"description": {
+					"type": "string",
+					"description": "A short description of what this command does (for audit/logging)"
+				},
+				"timeout": {
+					"type": "integer",
+					"description": "Timeout in milliseconds (default: 180000 = 3 minutes)"
 				}
 			},
 			"required": ["command"]
@@ -58,7 +67,9 @@ func (t *Shell) Definition() openagent.FunctionDefinition {
 
 func (t *Shell) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var params struct {
-		Command string `json:"command"`
+		Command     string `json:"command"`
+		Description string `json:"description"`
+		Timeout     int    `json:"timeout"` // milliseconds, 0 = use runner default
 	}
 	if err := json.Unmarshal(args, &params); err != nil {
 		return "", fmt.Errorf("shell: %w", err)
@@ -68,6 +79,11 @@ func (t *Shell) Execute(ctx context.Context, args json.RawMessage) (string, erro
 	}
 	if t.sandbox == nil {
 		return "", fmt.Errorf("shell: no sandbox configured")
+	}
+	if params.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(params.Timeout)*time.Millisecond)
+		defer cancel()
 	}
 
 	result, err := t.sandbox.Run(ctx, openagent.Command{
@@ -83,7 +99,9 @@ func (t *Shell) Execute(ctx context.Context, args json.RawMessage) (string, erro
 
 func (t *Shell) ExecuteStream(ctx context.Context, args json.RawMessage) <-chan openagent.ToolStreamChunk {
 	var params struct {
-		Command string `json:"command"`
+		Command     string `json:"command"`
+		Description string `json:"description"`
+		Timeout     int    `json:"timeout"`
 	}
 	if err := json.Unmarshal(args, &params); err != nil || params.Command == "" || t.sandbox == nil {
 		ch := make(chan openagent.ToolStreamChunk, 1)
@@ -97,6 +115,9 @@ func (t *Shell) ExecuteStream(ctx context.Context, args json.RawMessage) <-chan 
 		close(ch)
 		return ch
 	}
+
+	// timeout is applied in Execute (sync path); streaming paths receive
+	// the caller's ctx directly — the sandbox owns its lifecycle.
 
 	type streamRunner interface {
 		RunStream(ctx context.Context, cmd openagent.Command) <-chan openagent.ToolStreamChunk
