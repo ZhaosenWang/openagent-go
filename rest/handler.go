@@ -14,6 +14,7 @@ import (
 
 	openagent "github.com/yusheng-g/openagent-go"
 	"github.com/yusheng-g/openagent-go/eventbus"
+	"github.com/yusheng-g/openagent-go/session"
 )
 
 // ── Handler ──
@@ -125,7 +126,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 
 // WithSessionStore attaches a persistent session metadata store.
 // nil (the default) preserves the current in-memory-only behavior.
-func (h *Handler) WithSessionStore(s SessionStore) *Handler {
+func (h *Handler) WithSessionStore(s session.Store) *Handler {
 	h.sm.SetStore(s)
 	return h
 }
@@ -150,7 +151,7 @@ func (h *Handler) WithCleanupDir(fn func(sessionID string)) *Handler {
 // Events are published to the Handler-level bus via sm so that multiple
 // SSE connections (e.g. browser tabs) all receive the full stream.
 type sessionState struct {
-	info       SessionInfo // ModelID is the session's model preference; empty → handler default
+	info       session.SessionInfo // ModelID is the session's model preference; empty → handler default
 	agent      *openagent.Agent
 
 	mu              sync.Mutex
@@ -158,7 +159,7 @@ type sessionState struct {
 	pendingApproval *pendingApproval
 }
 
-func (s *sessionState) sessionInfo() *SessionInfo { return &s.info }
+func (s *sessionState) sessionInfo() *session.SessionInfo { return &s.info }
 
 // isActive reports whether the session has an ongoing agent run
 // or is awaiting tool approval. Eviction skips active sessions.
@@ -244,9 +245,11 @@ func (h *Handler) handleChat(w http.ResponseWriter, r *http.Request) {
 	provider := body.Provider
 	modelID := body.ModelID
 	if provider == "" && modelID == "" {
-		h.sm.withMeta(id, func(inf *SessionInfo) {
-			provider = inf.Provider
-			modelID = inf.ModelID
+		h.sm.withMeta(id, func(inf *session.SessionInfo) {
+			p, _ := session.GetMeta[string](*inf, "provider")
+			m, _ := session.GetMeta[string](*inf, "modelId")
+			provider = p
+			modelID = m
 		})
 	}
 	// Composite key "provider:modelId" for exact match.
@@ -257,9 +260,9 @@ func (h *Handler) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Persist the resolved model so GET /sessions reflects the actual model.
-	if inf, ok := h.sm.withMeta(id, func(inf *SessionInfo) {
-		inf.ModelID = modelID
-		inf.Provider = provider
+	if inf, ok := h.sm.withMeta(id, func(inf *session.SessionInfo) {
+		inf.SetMeta("modelId", modelID)
+		inf.SetMeta("provider", provider)
 	}); ok {
 		h.sm.syncMeta(inf)
 	}
@@ -357,9 +360,9 @@ func (h *Handler) handleListModels(w http.ResponseWriter, r *http.Request) {
 
 // ── Factory ──
 
-// newEntry creates a fresh sessionState from SessionInfo.
+// newEntry creates a fresh sessionState from session.SessionInfo.
 // Used by sessionManager when creating or restoring sessions.
-func (h *Handler) newEntry(info SessionInfo) *sessionState {
+func (h *Handler) newEntry(info session.SessionInfo) *sessionState {
 	s := &sessionState{info: info}
 
 	s.agent = openagent.NewAgent(h.name,

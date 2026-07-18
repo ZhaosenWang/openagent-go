@@ -1,5 +1,4 @@
-// Package file implements rest.SessionStore with a JSON file on disk.
-// Zero external dependencies — uses only the standard library.
+// Package file implements session.Store with a JSON file on disk.
 package file
 
 import (
@@ -11,14 +10,14 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/yusheng-g/openagent-go/rest"
+	"github.com/yusheng-g/openagent-go/session"
 )
 
 // Store persists session metadata in a sessions.json file.
 type Store struct {
 	mu       sync.RWMutex
 	path     string
-	sessions map[string]rest.SessionInfo
+	sessions map[string]session.SessionInfo
 }
 
 // New creates a Store backed by dir/sessions.json.
@@ -29,7 +28,7 @@ func New(dir string) (*Store, error) {
 
 	s := &Store{
 		path:     filepath.Join(dir, "sessions.json"),
-		sessions: make(map[string]rest.SessionInfo),
+		sessions: make(map[string]session.SessionInfo),
 	}
 
 	data, err := os.ReadFile(s.path)
@@ -40,16 +39,16 @@ func New(dir string) (*Store, error) {
 	return s, nil
 }
 
-// ── rest.SessionStore ──
+// ── session.Store ──
 
-func (s *Store) Save(ctx context.Context, info rest.SessionInfo) error {
+func (s *Store) Save(ctx context.Context, info session.SessionInfo) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.sessions[info.ID] = info
 	return s.flush()
 }
 
-func (s *Store) Get(ctx context.Context, id string) (*rest.SessionInfo, error) {
+func (s *Store) Get(ctx context.Context, id string) (*session.SessionInfo, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	info, ok := s.sessions[id]
@@ -59,14 +58,12 @@ func (s *Store) Get(ctx context.Context, id string) (*rest.SessionInfo, error) {
 	return &info, nil
 }
 
-func (s *Store) List(ctx context.Context, kind string) ([]rest.SessionInfo, error) {
+func (s *Store) List(ctx context.Context) ([]session.SessionInfo, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	list := make([]rest.SessionInfo, 0)
+	list := make([]session.SessionInfo, 0, len(s.sessions))
 	for _, info := range s.sessions {
-		if info.Kind == kind {
-			list = append(list, info)
-		}
+		list = append(list, info)
 	}
 	sort.Slice(list, func(i, j int) bool {
 		return list[i].UpdatedAt.After(list[j].UpdatedAt)

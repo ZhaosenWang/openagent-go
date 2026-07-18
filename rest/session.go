@@ -10,47 +10,41 @@ import (
 
 	openagent "github.com/yusheng-g/openagent-go"
 	"github.com/yusheng-g/openagent-go/eventbus"
+	"github.com/yusheng-g/openagent-go/session"
 )
 
 // sessionEntry is implemented by every session state type.
-// sessionManager accesses shared fields through this — it never
-// knows the concrete type.
 type sessionEntry interface {
-	sessionInfo() *SessionInfo
-	// isActive reports whether the session has an ongoing operation
-	// that must not be interrupted (e.g. waiting for tool approval,
-	// plan execution in progress). Eviction skips active sessions.
+	sessionInfo() *session.SessionInfo
 	isActive() bool
 }
 
 // sessionHooks parameterises sessionManager by entry type E.
-// Each Handler supplies its own factory and callbacks.
 type sessionHooks[E sessionEntry] struct {
 	kind       string
-	newEntry   func(info SessionInfo) E
+	newEntry   func(info session.SessionInfo) E
 	fillDetail func(e E, detail *SessionDetail)
 	onDelete   func(e E)
-	cleanupDir func(sessionID string) // optional: delete temp/artifact dirs
+	cleanupDir func(sessionID string)
 }
 
 // ── sessionManager ──
 
 // sessionManager handles session CRUD, store-backed restores,
-// message listing, and bus subscriptions for a single mode
-// ("single", "team", or "plan"). All three Handlers own one.
+// message listing, and bus subscriptions for a single mode.
 type sessionManager[E sessionEntry] struct {
-	store  SessionStore
+	store  session.Store
 	memory openagent.Memory
 	bus    *eventbus.Bus[SSEEvent]
 	hooks  sessionHooks[E]
 
 	mu         sync.RWMutex
 	entries    map[string]E
-	lastAccess map[string]time.Time // touched on getOrCreate / withMeta
+	lastAccess map[string]time.Time
 }
 
 func newSessionManager[E sessionEntry](
-	store SessionStore,
+	store session.Store,
 	memory openagent.Memory,
 	bus *eventbus.Bus[SSEEvent],
 	hooks sessionHooks[E],
@@ -65,13 +59,12 @@ func newSessionManager[E sessionEntry](
 	}
 }
 
-func (sm *sessionManager[E]) SetStore(s SessionStore)       { sm.store = s }
+func (sm *sessionManager[E]) SetStore(s session.Store)      { sm.store = s }
 func (sm *sessionManager[E]) SetCleanupDir(fn func(string)) { sm.hooks.cleanupDir = fn }
-func (sm *sessionManager[E]) Bus() *eventbus.Bus[SSEEvent]  { return sm.bus }
-func (sm *sessionManager[E]) Memory() openagent.Memory      { return sm.memory }
-func (sm *sessionManager[E]) Store() SessionStore            { return sm.store }
+func (sm *sessionManager[E]) Bus() *eventbus.Bus[SSEEvent]   { return sm.bus }
+func (sm *sessionManager[E]) Memory() openagent.Memory       { return sm.memory }
+func (sm *sessionManager[E]) Store() session.Store            { return sm.store }
 
-// Exists reports whether the session is in the in-memory map.
 func (sm *sessionManager[E]) Exists(id string) bool {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
@@ -79,9 +72,7 @@ func (sm *sessionManager[E]) Exists(id string) bool {
 	return ok
 }
 
-// withMeta runs fn against the entry's SessionInfo under sm.mu.RLock.
-// Returns a snapshot so callers can persist after the lock is released.
-func (sm *sessionManager[E]) withMeta(id string, fn func(*SessionInfo)) (*SessionInfo, bool) {
+func (sm *sessionManager[E]) withMeta(id string, fn func(*session.SessionInfo)) (*session.SessionInfo, bool) {
 	sm.mu.RLock()
 	e, ok := sm.entries[id]
 	if !ok {
@@ -95,17 +86,13 @@ func (sm *sessionManager[E]) withMeta(id string, fn func(*SessionInfo)) (*Sessio
 	return &out, true
 }
 
-// touch records a last-access timestamp for the given session.
-// Used by the idle janitor to decide which entries to evict.
 func (sm *sessionManager[E]) touch(id string) {
 	sm.mu.Lock()
 	sm.lastAccess[id] = time.Now()
 	sm.mu.Unlock()
 }
 
-// syncMeta persists a SessionInfo snapshot to the configured store.
-// No-op when store is nil.
-func (sm *sessionManager[E]) syncMeta(inf *SessionInfo) {
+func (sm *sessionManager[E]) syncMeta(inf *session.SessionInfo) {
 	if sm.store == nil {
 		return
 	}
@@ -128,15 +115,15 @@ func (sm *sessionManager[E]) create(w http.ResponseWriter, r *http.Request) {
 
 	id := generateID()
 	now := time.Now()
-	info := SessionInfo{
+	info := session.SessionInfo{
 		ID:        id,
 		Title:     req.Title,
-		Kind:      sm.hooks.kind,
-		ModelID:   req.ModelID,
-		Provider:  req.Provider,
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
+	info.SetMeta("kind", sm.hooks.kind)
+	info.SetMeta("modelId", req.ModelID)
+	info.SetMeta("provider", req.Provider)
 
 	sm.mu.Lock()
 	sm.entries[id] = sm.hooks.newEntry(info)
@@ -153,23 +140,30 @@ func (sm *sessionManager[E]) list(w http.ResponseWriter, r *http.Request) {
 	if sm.store != nil {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
-		list, err := sm.store.List(ctx, sm.hooks.kind)
+		list, err := sm.store.List(ctx)
 		if err != nil {
 			http.Error(w, `{"error":"failed to list sessions"}`, http.StatusInternalServerError)
 			return
 		}
-		if list == nil {
-			list = []SessionInfo{}
+		filtered := make([]session.SessionInfo, 0, len(list))
+		for _, s := range list {
+			k, _ := session.GetMeta[string](s, "kind")
+			if k == sm.hooks.kind {
+				filtered = append(filtered, s)
+			}
+		}
+		if filtered == nil {
+			filtered = []session.SessionInfo{}
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(list)
+		json.NewEncoder(w).Encode(filtered)
 		return
 	}
 
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 
-	list := make([]SessionInfo, 0, len(sm.entries))
+	list := make([]session.SessionInfo, 0, len(sm.entries))
 	for _, e := range sm.entries {
 		list = append(list, *e.sessionInfo())
 	}
@@ -200,7 +194,6 @@ func (sm *sessionManager[E]) get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Not in memory — try persistent store (e.g. after restart).
 	if sm.store != nil {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
@@ -236,16 +229,15 @@ func (sm *sessionManager[E]) update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check store if session isn't in memory (restart recovery).
 	if sm.store != nil {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
 		if stored, err := sm.store.Get(ctx, id); err == nil && stored != nil {
-			sm.getOrCreate(id) // restore into memory
+			sm.getOrCreate(id)
 		}
 	}
 
-	inf, ok := sm.withMeta(id, func(inf *SessionInfo) {
+	inf, ok := sm.withMeta(id, func(inf *session.SessionInfo) {
 		inf.Title = body.Title
 		if body.Title != "" {
 			inf.UpdatedAt = time.Now()
@@ -298,9 +290,6 @@ func (sm *sessionManager[E]) messages(w http.ResponseWriter, r *http.Request) {
 func (sm *sessionManager[E]) del(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
-	// Delete from store first (best-effort) to prevent TOCTOU resurrection
-	// on restart. If store is temporarily unavailable, continue anyway —
-	// user intent wins over storage reliability.
 	if sm.store != nil {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
@@ -309,10 +298,6 @@ func (sm *sessionManager[E]) del(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Delete messages BEFORE removing from the entries map. While the
-	// entry exists, concurrent getOrCreate returns the existing entry
-	// rather than creating a new one — no new messages can be appended
-	// to a session that DeleteSession is about to wipe.
 	if sm.memory != nil {
 		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 		defer cancel()
@@ -328,7 +313,6 @@ func (sm *sessionManager[E]) del(w http.ResponseWriter, r *http.Request) {
 	delete(sm.lastAccess, id)
 	sm.mu.Unlock()
 
-	// Release the bus topic.
 	sm.bus.RemoveTopic(id)
 
 	if sm.hooks.cleanupDir != nil {
@@ -340,13 +324,6 @@ func (sm *sessionManager[E]) del(w http.ResponseWriter, r *http.Request) {
 
 // ── Idle eviction ──
 
-// StartJanitor starts a background goroutine that periodically evicts idle
-// session entries. Idle sessions are those not accessed in maxIdle time and
-// not currently active (mid-chat, awaiting approval, plan executing).
-// Before eviction the entry's metadata is persisted to the configured
-// SessionStore so it can be restored on next access.
-//
-// The caller is responsible for cancelling ctx to stop the janitor.
 func (sm *sessionManager[E]) StartJanitor(ctx context.Context, interval, maxIdle time.Duration) {
 	go func() {
 		ticker := time.NewTicker(interval)
@@ -362,9 +339,6 @@ func (sm *sessionManager[E]) StartJanitor(ctx context.Context, interval, maxIdle
 	}()
 }
 
-// evictIdle removes entries that haven't been accessed in maxIdle and are
-// not in an active state. Metadata is persisted first so the session can be
-// restored via getOrCreate → store.Get on next access.
 func (sm *sessionManager[E]) evictIdle(maxIdle time.Duration) {
 	now := time.Now()
 	sm.mu.Lock()
@@ -376,14 +350,13 @@ func (sm *sessionManager[E]) evictIdle(maxIdle time.Duration) {
 			continue
 		}
 		if e.isActive() {
-			continue // mid-chat / awaiting approval / plan running
+			continue
 		}
 
-		// Persist metadata so the session can be restored on next access.
 		if sm.store != nil {
 			info := *e.sessionInfo()
 			info.UpdatedAt = now
-			go func(inf SessionInfo) {
+			go func(inf session.SessionInfo) {
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
 				if err := sm.store.Save(ctx, inf); err != nil {
@@ -398,8 +371,6 @@ func (sm *sessionManager[E]) evictIdle(maxIdle time.Duration) {
 }
 
 // getOrCreate returns the existing entry or creates a new one.
-// On first creation it checks the persistent store to restore
-// metadata from a previous run (e.g. after restart).
 func (sm *sessionManager[E]) getOrCreate(id string) E {
 	sm.mu.Lock()
 	if e, ok := sm.entries[id]; ok {
@@ -409,8 +380,7 @@ func (sm *sessionManager[E]) getOrCreate(id string) E {
 	}
 	sm.mu.Unlock()
 
-	// Try to restore from persistent store.
-	var info SessionInfo
+	var info session.SessionInfo
 	restored := false
 	if sm.store != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -422,19 +392,18 @@ func (sm *sessionManager[E]) getOrCreate(id string) E {
 	}
 
 	if !restored {
-		info = SessionInfo{
+		now := time.Now()
+		info = session.SessionInfo{
 			ID:        id,
-			Kind:      sm.hooks.kind,
-			CreatedAt: time.Now(),
-			UpdatedAt: time.Now(),
+			CreatedAt: now,
+			UpdatedAt: now,
 		}
+		info.SetMeta("kind", sm.hooks.kind)
 	}
 
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
-	// Double-check: someone else might have created it while we were
-	// querying the store.
 	if e, ok := sm.entries[id]; ok {
 		return e
 	}

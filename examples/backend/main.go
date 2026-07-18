@@ -20,7 +20,7 @@ import (
 	"github.com/yusheng-g/openagent-go/memory/sqlite"
 	"github.com/yusheng-g/openagent-go/model/openai"
 	"github.com/yusheng-g/openagent-go/rest"
-	sessionsqlite "github.com/yusheng-g/openagent-go/rest/sessionstore/sqlite"
+	sessionsqlite "github.com/yusheng-g/openagent-go/session/sqlite"
 	"github.com/yusheng-g/openagent-go/sandbox/native"
 	"github.com/yusheng-g/openagent-go/tool"
 )

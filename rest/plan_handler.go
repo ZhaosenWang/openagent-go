@@ -10,6 +10,7 @@ import (
 	"time"
 
 	openagent "github.com/yusheng-g/openagent-go"
+	"github.com/yusheng-g/openagent-go/session"
 	"github.com/yusheng-g/openagent-go/eventbus"
 	"github.com/yusheng-g/openagent-go/plan"
 )
@@ -33,7 +34,7 @@ type PlanHandler struct {
 
 // planSessionState holds per-session data for a plan workflow.
 type planSessionState struct {
-	info       SessionInfo
+	info       session.SessionInfo
 	plan       *plan.Plan
 	currentDef *plan.PlanDef // nil until generated
 
@@ -47,7 +48,7 @@ type planSessionState struct {
 	retryCh   chan plan.RetryAction // closed/signaled to resume from pause
 }
 
-func (s *planSessionState) sessionInfo() *SessionInfo { return &s.info }
+func (s *planSessionState) sessionInfo() *session.SessionInfo { return &s.info }
 
 // isActive reports whether the plan session has a running execution
 // or is awaiting tool approval.
@@ -92,7 +93,7 @@ func (h *PlanHandler) Register(mux *http.ServeMux) {
 }
 
 // WithSessionStore attaches a persistent session metadata store.
-func (h *PlanHandler) WithSessionStore(s SessionStore) *PlanHandler {
+func (h *PlanHandler) WithSessionStore(s session.Store) *PlanHandler {
 	h.sm.SetStore(s)
 	return h
 }
@@ -160,7 +161,7 @@ func (h *PlanHandler) handleGenerate(w http.ResponseWriter, r *http.Request) {
 
 	// Set the session title from the goal and persist.
 	if def.Goal != "" {
-		if inf, ok := h.sm.withMeta(id, func(inf *SessionInfo) {
+		if inf, ok := h.sm.withMeta(id, func(inf *session.SessionInfo) {
 			inf.Title = def.Goal
 			inf.UpdatedAt = time.Now()
 		}); ok {
@@ -571,7 +572,7 @@ func (h *PlanHandler) handleApprove(w http.ResponseWriter, r *http.Request) {
 
 // ── Factory ──
 
-func (h *PlanHandler) newEntry(info SessionInfo) *planSessionState {
+func (h *PlanHandler) newEntry(info session.SessionInfo) *planSessionState {
 	s := &planSessionState{
 		info: info,
 	}

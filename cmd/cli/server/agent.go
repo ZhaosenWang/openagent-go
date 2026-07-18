@@ -15,7 +15,8 @@ import (
 	"github.com/yusheng-g/openagent-go/memory/sqlite"
 	"github.com/yusheng-g/openagent-go/model/openai"
 	"github.com/yusheng-g/openagent-go/rest"
-	sessionsqlite "github.com/yusheng-g/openagent-go/rest/sessionstore/sqlite"
+	"github.com/yusheng-g/openagent-go/session"
+	sessionsqlite "github.com/yusheng-g/openagent-go/session/sqlite"
 	"github.com/yusheng-g/openagent-go/sandbox/native"
 	opentool "github.com/yusheng-g/openagent-go/tool"
 
@@ -65,7 +66,7 @@ func Run(ctx context.Context, opts Options) error {
 	)
 
 	if opts.ACP {
-		return runACP(agent)
+		return runACP(ctx, agent, mem, sessionStore)
 	}
 	return runREST(ctx, opts.Config, agent, modelInfos, mem, sessionStore)
 }
@@ -96,7 +97,7 @@ func firstModel(models []openagent.Model) openagent.Model {
 	return nil
 }
 
-func buildMemory(path string) (openagent.Memory, rest.SessionStore, func(), error) {
+func buildMemory(path string) (openagent.Memory, session.Store, func(), error) {
 	_ = os.MkdirAll(filepath.Dir(path), 0755)
 	mem, err := sqlite.New(path)
 	if err != nil {
@@ -124,7 +125,7 @@ func buildTools(sandbox *native.Sandbox, workDir string, toolList []string) []op
 
 // ── REST ──
 
-func runREST(ctx context.Context, cfg *config.Config, agent *openagent.Agent, modelInfos []modelReg, mem openagent.Memory, sessionStore rest.SessionStore) error {
+func runREST(ctx context.Context, cfg *config.Config, agent *openagent.Agent, modelInfos []modelReg, mem openagent.Memory, sessionStore session.Store) error {
 	handler := rest.NewHandler(agent).
 		WithSessionStore(sessionStore).
 		WithCleanupDir(func(sessionID string) {
@@ -183,14 +184,22 @@ func recoveryMiddleware(next http.Handler) http.Handler {
 
 // ── ACP ──
 
-func runACP(agent *openagent.Agent) error {
-	srv := &acpHandler{agent: agent}
+func runACP(ctx context.Context, agent *openagent.Agent, mem openagent.Memory, sessionStore session.Store) error {
+	srv := &acpHandler{
+		agent:        agent,
+		mem:          mem,
+		sessionStore: sessionStore,
+	}
 	server := openacp.NewServer("openagent-acp", "1.0.0", srv)
 	log.Println("ACP server starting on stdio")
-	return server.Run(context.Background())
+	return server.Run(ctx)
 }
 
-type acpHandler struct{ agent *openagent.Agent }
+type acpHandler struct {
+	agent        *openagent.Agent
+	mem          openagent.Memory
+	sessionStore session.Store
+}
 
 func (h *acpHandler) OnInitialize(ctx context.Context, req openacp.InitializeRequest) (*openacp.InitializeResponse, error) {
 	return &openacp.InitializeResponse{
@@ -208,7 +217,14 @@ func (h *acpHandler) OnInitialize(ctx context.Context, req openacp.InitializeReq
 }
 
 func (h *acpHandler) OnNewSession(ctx context.Context, req openacp.NewSessionRequest) (*openacp.NewSessionResponse, error) {
-	return &openacp.NewSessionResponse{SessionID: "acp_1"}, nil
+	id := fmt.Sprintf("acp_%d", time.Now().UnixNano())
+	if h.sessionStore != nil {
+		now := time.Now()
+		info := session.SessionInfo{ID: id, CreatedAt: now, UpdatedAt: now, Cwd: req.Cwd}
+		info.SetMeta("kind", "acp")
+		_ = h.sessionStore.Save(ctx, info)
+	}
+	return &openacp.NewSessionResponse{SessionID: id}, nil
 }
 
 func (h *acpHandler) OnLoadSession(ctx context.Context, req openacp.LoadSessionRequest, sender openacp.SessionEventSender) (*openacp.LoadSessionResponse, error) {
@@ -220,14 +236,42 @@ func (h *acpHandler) OnResumeSession(ctx context.Context, req openacp.ResumeSess
 }
 
 func (h *acpHandler) OnCloseSession(ctx context.Context, req openacp.CloseSessionRequest) (*openacp.CloseSessionResponse, error) {
+	if h.sessionStore != nil {
+		_ = h.sessionStore.Delete(ctx, req.SessionID)
+	}
+	if h.mem != nil {
+		_ = h.mem.DeleteSession(ctx, req.SessionID)
+	}
 	return &openacp.CloseSessionResponse{}, nil
 }
 
 func (h *acpHandler) OnDeleteSession(ctx context.Context, req openacp.DeleteSessionRequest) (*openacp.DeleteSessionResponse, error) {
+	if h.sessionStore != nil {
+		_ = h.sessionStore.Delete(ctx, req.SessionID)
+	}
+	if h.mem != nil {
+		_ = h.mem.DeleteSession(ctx, req.SessionID)
+	}
 	return &openacp.DeleteSessionResponse{}, nil
 }
 
 func (h *acpHandler) OnListSessions(ctx context.Context, req openacp.ListSessionsRequest) (*openacp.ListSessionsResponse, error) {
+	if h.sessionStore != nil {
+		list, err := h.sessionStore.List(ctx)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]openacp.SessionInfo, 0, len(list))
+		for _, s := range list {
+			out = append(out, openacp.SessionInfo{
+				SessionID: s.ID,
+				Cwd:       "/",
+				Title:     s.Title,
+				UpdatedAt: s.UpdatedAt.Format(time.RFC3339),
+			})
+		}
+		return &openacp.ListSessionsResponse{Sessions: out}, nil
+	}
 	return &openacp.ListSessionsResponse{}, nil
 }
 
@@ -250,7 +294,12 @@ func (h *acpHandler) OnPrompt(ctx context.Context, req openacp.PromptRequest, se
 	if input == "" {
 		return nil, fmt.Errorf("no text in prompt")
 	}
-	session := openagent.Session{ID: req.SessionID}
+
+	session := openagent.Session{
+		ID:        req.SessionID,
+		CreatedAt: time.Now(),
+	}
+
 	ch := h.agent.RunStream(ctx, session, openagent.UserMessage(input))
 	for evt := range ch {
 		switch evt.Type {
@@ -281,8 +330,11 @@ func (h *acpHandler) OnPrompt(ctx context.Context, req openacp.PromptRequest, se
 	return &openacp.PromptResponse{StopReason: openacp.StopReasonEndTurn}, nil
 }
 
-func (h *acpHandler) OnCancel(ctx context.Context, sid openacp.SessionId) error { return nil }
+func (h *acpHandler) OnCancel(ctx context.Context, sid openacp.SessionId) error {
+	return nil
+}
 
 func (h *acpHandler) OnAuthenticate(ctx context.Context, req openacp.AuthenticateRequest) (*openacp.AuthenticateResponse, error) {
 	return &openacp.AuthenticateResponse{}, nil
 }
+

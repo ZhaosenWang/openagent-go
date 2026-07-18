@@ -21,25 +21,16 @@ package rest
 
 import (
 	"encoding/json"
-	"time"
+
+	"github.com/yusheng-g/openagent-go/session"
 )
 
 // ── Session ──
 
-// SessionInfo is the public representation of a conversation session.
-type SessionInfo struct {
-	ID        string    `json:"id"`
-	Title     string    `json:"title,omitempty"`
-	Kind      string    `json:"kind"` // "single", "team", "plan"
-	ModelID   string    `json:"modelId,omitempty"`
-	Provider  string    `json:"provider,omitempty"` // identifies which provider serves this model
-	CreatedAt time.Time `json:"createdAt"`
-	UpdatedAt time.Time `json:"updatedAt"`
-}
 
-// SessionDetail is a single session with runtime info.
+// SessionDetail is a single session enriched with runtime info.
 type SessionDetail struct {
-	SessionInfo
+	session.SessionInfo
 	ContextWindow int `json:"contextWindow"`
 	MessageCount  int `json:"messageCount"`
 }

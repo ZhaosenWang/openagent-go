@@ -10,6 +10,7 @@ import (
 	"time"
 
 	openagent "github.com/yusheng-g/openagent-go"
+	"github.com/yusheng-g/openagent-go/session"
 	"github.com/yusheng-g/openagent-go/eventbus"
 )
 
@@ -80,7 +81,7 @@ func (h *TeamHandler) Register(mux *http.ServeMux) {
 }
 
 // WithSessionStore attaches a persistent session metadata store.
-func (h *TeamHandler) WithSessionStore(s SessionStore) *TeamHandler {
+func (h *TeamHandler) WithSessionStore(s session.Store) *TeamHandler {
 	h.sm.SetStore(s)
 	return h
 }
@@ -99,7 +100,7 @@ func (h *TeamHandler) WithCleanupDir(fn func(sessionID string)) *TeamHandler {
 // ── teamSessionState ──
 
 type teamSessionState struct {
-	info       SessionInfo
+	info       session.SessionInfo
 	team       *openagent.Team
 	agentList  []agentInfo
 	agentMems  []*teamAgentMemory // per-agent memory wrappers for cleanup
@@ -109,7 +110,7 @@ type teamSessionState struct {
 	pendingApproval *pendingApproval
 }
 
-func (s *teamSessionState) sessionInfo() *SessionInfo { return &s.info }
+func (s *teamSessionState) sessionInfo() *session.SessionInfo { return &s.info }
 
 // isActive reports whether the team session has an ongoing agent run
 // or is awaiting tool approval. Eviction skips active sessions.
@@ -403,7 +404,7 @@ func (h *TeamHandler) handleRemoveAgent(w http.ResponseWriter, r *http.Request) 
 
 // ── Factory ──
 
-func (h *TeamHandler) newEntry(info SessionInfo) *teamSessionState {
+func (h *TeamHandler) newEntry(info session.SessionInfo) *teamSessionState {
 	s := &teamSessionState{
 		info: info,
 	}
