@@ -193,21 +193,63 @@ func runACP(agent *openagent.Agent) error {
 type acpHandler struct{ agent *openagent.Agent }
 
 func (h *acpHandler) OnInitialize(ctx context.Context, req openacp.InitializeRequest) (*openacp.InitializeResponse, error) {
-	return &openacp.InitializeResponse{ProtocolVersion: 1, AgentName: "openagent-acp", AgentVersion: "1.0.0"}, nil
+	return &openacp.InitializeResponse{
+		ProtocolVersion: 1,
+		AgentCapabilities: openacp.AgentCapabilities{
+			LoadSession: true,
+			SessionCapabilities: openacp.SessionCapabilities{
+				Close:  &openacp.SessionCloseCapabilities{},
+				Delete: &openacp.SessionDeleteCapabilities{},
+				List:   &openacp.SessionListCapabilities{},
+				Resume: &openacp.SessionResumeCapabilities{},
+			},
+		},
+	}, nil
 }
+
 func (h *acpHandler) OnNewSession(ctx context.Context, req openacp.NewSessionRequest) (*openacp.NewSessionResponse, error) {
 	return &openacp.NewSessionResponse{SessionID: "acp_1"}, nil
 }
-func (h *acpHandler) OnLoadSession(ctx context.Context, req openacp.LoadSessionRequest) (*openacp.LoadSessionResponse, error) {
+
+func (h *acpHandler) OnLoadSession(ctx context.Context, req openacp.LoadSessionRequest, sender openacp.SessionEventSender) (*openacp.LoadSessionResponse, error) {
 	return &openacp.LoadSessionResponse{}, nil
 }
+
+func (h *acpHandler) OnResumeSession(ctx context.Context, req openacp.ResumeSessionRequest) (*openacp.ResumeSessionResponse, error) {
+	return &openacp.ResumeSessionResponse{}, nil
+}
+
+func (h *acpHandler) OnCloseSession(ctx context.Context, req openacp.CloseSessionRequest) (*openacp.CloseSessionResponse, error) {
+	return &openacp.CloseSessionResponse{}, nil
+}
+
+func (h *acpHandler) OnDeleteSession(ctx context.Context, req openacp.DeleteSessionRequest) (*openacp.DeleteSessionResponse, error) {
+	return &openacp.DeleteSessionResponse{}, nil
+}
+
 func (h *acpHandler) OnListSessions(ctx context.Context, req openacp.ListSessionsRequest) (*openacp.ListSessionsResponse, error) {
 	return &openacp.ListSessionsResponse{}, nil
 }
+
+func (h *acpHandler) OnSetSessionMode(ctx context.Context, req openacp.SetSessionModeRequest) (*openacp.SetSessionModeResponse, error) {
+	return &openacp.SetSessionModeResponse{}, nil
+}
+
+func (h *acpHandler) OnSetSessionConfigOption(ctx context.Context, req openacp.SetSessionConfigOptionRequest) (*openacp.SetSessionConfigOptionResponse, error) {
+	return &openacp.SetSessionConfigOptionResponse{}, nil
+}
+
 func (h *acpHandler) OnPrompt(ctx context.Context, req openacp.PromptRequest, sender openacp.SessionEventSender) (*openacp.PromptResponse, error) {
 	var input string
-	for _, b := range req.Blocks { if b.Text != "" { input = b.Text; break } }
-	if input == "" { return nil, fmt.Errorf("no text in prompt") }
+	for _, b := range req.Prompt {
+		if b.Text != "" {
+			input = b.Text
+			break
+		}
+	}
+	if input == "" {
+		return nil, fmt.Errorf("no text in prompt")
+	}
 	session := openagent.Session{ID: req.SessionID}
 	ch := h.agent.RunStream(ctx, session, openagent.UserMessage(input))
 	for evt := range ch {
@@ -217,18 +259,30 @@ func (h *acpHandler) OnPrompt(ctx context.Context, req openacp.PromptRequest, se
 		case openagent.StreamToolCall:
 			if len(evt.Message.ToolCalls) > 0 {
 				tc := evt.Message.ToolCalls[0]
-				sender.SendToolCall(openacp.ToolCallEvent{ID: tc.ID, Title: tc.Function.Name, Status: "in_progress", RawInput: map[string]any{"args": tc.Function.Arguments}})
+				sender.SendToolCall(openacp.ToolCallUpdate{
+					ToolCallID: tc.ID,
+					Title:      tc.Function.Name,
+					Status:     "in_progress",
+					RawInput:   map[string]any{"args": tc.Function.Arguments},
+				})
 			}
 		case openagent.StreamToolResult:
-			sender.SendToolCall(openacp.ToolCallEvent{ID: evt.Message.ToolCallID, Status: "completed", RawOutput: map[string]any{"result": evt.Message.Content}})
+			sender.SendToolCall(openacp.ToolCallUpdate{
+				ToolCallID: evt.Message.ToolCallID,
+				Status:     "completed",
+				RawOutput:  map[string]any{"result": evt.Message.Content},
+			})
 		case openagent.StreamError:
 			return nil, evt.Error
 		case openagent.StreamAborted:
-			return &openacp.PromptResponse{StopReason: "cancelled"}, nil
+			return &openacp.PromptResponse{StopReason: openacp.StopReasonCancelled}, nil
 		}
 	}
-	return &openacp.PromptResponse{StopReason: "end_turn"}, nil
+	return &openacp.PromptResponse{StopReason: openacp.StopReasonEndTurn}, nil
 }
-func (h *acpHandler) OnCancel(ctx context.Context, sid string) error       { return nil }
-func (h *acpHandler) OnDeleteSession(ctx context.Context, sid string) error { return nil }
-func (h *acpHandler) OnCloseSession(ctx context.Context, sid string) error  { return nil }
+
+func (h *acpHandler) OnCancel(ctx context.Context, sid openacp.SessionId) error { return nil }
+
+func (h *acpHandler) OnAuthenticate(ctx context.Context, req openacp.AuthenticateRequest) (*openacp.AuthenticateResponse, error) {
+	return &openacp.AuthenticateResponse{}, nil
+}

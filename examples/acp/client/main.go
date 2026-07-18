@@ -1,10 +1,7 @@
-// Standalone ACP client — connects to any ACP agent via stdio and sends a prompt.
+// Standalone ACP client — connects to any ACP agent via stdio.
 //
 //	go build -o build/acp-client ./examples/acp/client/
 //	./build/acp-client -prompt "calculate 3.14 * 2"
-//
-// If -server is omitted, it defaults to ./build/acp-server relative to the
-// module root.
 package main
 
 import (
@@ -29,19 +26,19 @@ func main() {
 	}
 	defer session.Close()
 
-	// Handshake.
 	initResp, err := session.Initialize(context.Background(), openacp.InitializeRequest{
 		ProtocolVersion: 1,
-		ClientName:      "acp-client",
-		ClientVersion:   "1.0.0",
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "FATAL: initialize: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("connected to %s/%s proto=%d\n\n", initResp.AgentName, initResp.AgentVersion, initResp.ProtocolVersion)
+	agent := "unknown"
+	if initResp.AgentInfo != nil {
+		agent = initResp.AgentInfo.Name + "/" + initResp.AgentInfo.Version
+	}
+	fmt.Printf("connected to %s proto=%d\n\n", agent, initResp.ProtocolVersion)
 
-	// New session.
 	newResp, err := session.NewSession(context.Background(), openacp.NewSessionRequest{Cwd: "/tmp"})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "FATAL: new session: %v\n", err)
@@ -49,13 +46,12 @@ func main() {
 	}
 	sid := newResp.SessionID
 
-	// Register event handler and send prompt.
 	session.SetEventHandler(&eventPrinter{})
 
 	fmt.Printf("> %s\n\n", *prompt)
 	_, err = session.Prompt(context.Background(), openacp.PromptRequest{
 		SessionID: sid,
-		Blocks:    []openacp.ContentBlock{{Text: *prompt}},
+		Prompt:    []openacp.ContentBlock{{Type: "text", Text: *prompt}},
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: prompt: %v\n", err)
@@ -69,13 +65,16 @@ type eventPrinter struct{}
 
 func (p *eventPrinter) OnAgentMessage(text string)  { fmt.Print(text) }
 func (p *eventPrinter) OnAgentThought(text string)   { fmt.Printf("[thought] %s\n", text) }
-func (p *eventPrinter) OnToolCall(tc openacp.ToolCallEvent) {
+func (p *eventPrinter) OnToolCall(tc openacp.ToolCallUpdate) {
 	switch tc.Status {
-	case "in_progress":
-		fmt.Printf("[tool] %s(%v)\n", tc.Title, tc.RawInput)
-	case "completed":
-		fmt.Printf("[tool_result] %v\n", tc.RawOutput)
-	case "failed":
-		fmt.Printf("[tool_failed] %v\n", tc.RawOutput)
+	case "in_progress": fmt.Printf("[tool] %s(%v)\n", tc.Title, tc.RawInput)
+	case "completed":  fmt.Printf("[tool_result] %v\n", tc.RawOutput)
+	case "failed":     fmt.Printf("[tool_failed] %v\n", tc.RawOutput)
 	}
 }
+func (p *eventPrinter) OnPlan(plan openacp.Plan)                             {}
+func (p *eventPrinter) OnAvailableCommandsUpdate(cmds []openacp.AvailableCommand) {}
+func (p *eventPrinter) OnModeUpdate(modeID openacp.SessionModeId)             {}
+func (p *eventPrinter) OnConfigOptionUpdate(opts []openacp.SessionConfigOption)  {}
+func (p *eventPrinter) OnUsageUpdate(used, total int, cost *openacp.Cost)     {}
+func (p *eventPrinter) OnSessionInfo(title string, metadata map[string]any)   {}

@@ -117,8 +117,6 @@ func New(name, command string, args ...string) (*Runner, error) {
 
 	if _, err := sess.Initialize(initCtx, openacp.InitializeRequest{
 		ProtocolVersion: 1,
-		ClientName:      "openagent-go",
-		ClientVersion:   "0.1.0",
 	}); err != nil {
 		r.Close()
 		return nil, fmt.Errorf("acp runner %q: initialize: %w", name, err)
@@ -465,7 +463,7 @@ func (r *Runner) buildPromptRequest(prefix []openagent.Message, input openagent.
 
 	return openacp.PromptRequest{
 		SessionID: r.acpSessionID,
-		Blocks:    blocks,
+		Prompt:    blocks,
 	}
 }
 
@@ -585,21 +583,18 @@ func (h *runnerHandler) OnAgentThought(text string) {
 	})
 }
 
-func (h *runnerHandler) OnToolCall(tc openacp.ToolCallEvent) {
+func (h *runnerHandler) OnToolCall(tc openacp.ToolCallUpdate) {
 	if h.seenTools == nil {
 		h.seenTools = make(map[string]bool)
 	}
 
 	// Emit StreamToolCall only the first time we see this tool ID.
-	// ACP agents send separate notifications for in_progress and completed
-	// statuses; without dedup the assistant message (and its tool_calls)
-	// would be recorded twice in the result.
-	if !h.seenTools[tc.ID] {
-		h.seenTools[tc.ID] = true
+	if !h.seenTools[tc.ToolCallID] {
+		h.seenTools[tc.ToolCallID] = true
 		msg := openagent.Message{
 			Role: openagent.RoleAssistant,
 			ToolCalls: []openagent.ToolCall{{
-				ID:   tc.ID,
+				ID:   tc.ToolCallID,
 				Type: "function",
 				Function: openagent.ToolCallFunction{
 					Name:      tc.Title,
@@ -616,12 +611,12 @@ func (h *runnerHandler) OnToolCall(tc openacp.ToolCallEvent) {
 		})
 	}
 
-	// Emit tool result when the tool finishes (completed or failed).
+	// Emit tool result when the tool finishes.
 	if (tc.Status == "completed" || tc.Status == "failed") && tc.RawOutput != nil {
 		resultMsg := openagent.Message{
 			Role:       openagent.RoleTool,
 			Content:    fmt.Sprintf("%v", tc.RawOutput),
-			ToolCallID: tc.ID,
+			ToolCallID: tc.ToolCallID,
 		}
 		if h.collector != nil {
 			h.collector.addMessage(resultMsg)
@@ -632,6 +627,13 @@ func (h *runnerHandler) OnToolCall(tc openacp.ToolCallEvent) {
 		})
 	}
 }
+
+func (h *runnerHandler) OnPlan(plan openacp.Plan)                                 {}
+func (h *runnerHandler) OnAvailableCommandsUpdate(cmds []openacp.AvailableCommand) {}
+func (h *runnerHandler) OnModeUpdate(modeID openacp.SessionModeId)                 {}
+func (h *runnerHandler) OnConfigOptionUpdate(opts []openacp.SessionConfigOption)   {}
+func (h *runnerHandler) OnUsageUpdate(used, total int, cost *openacp.Cost)         {}
+func (h *runnerHandler) OnSessionInfo(title string, metadata map[string]any)       {}
 
 // ── resultCollector ──
 
@@ -659,7 +661,7 @@ func (c *resultCollector) result(resp *openacp.PromptResponse) *openagent.RunRes
 
 	stopReason := ""
 	if resp != nil {
-		stopReason = resp.StopReason
+		stopReason = string(resp.StopReason)
 	}
 
 	return &openagent.RunResult{

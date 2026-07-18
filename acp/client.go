@@ -1,41 +1,43 @@
-// Package acp provides an abstraction over the Agent Client Protocol (ACP).
+// ── Client ──
 //
-// It defines openagent-go's own ACP types and a Client for connecting to
-// external ACP agent processes. The default implementation uses
-// coder/acp-go-sdk internally, but the interfaces are designed so that
-// alternative implementations can be plugged in.
+// Client spawns an external ACP agent process and communicates with it over
+// stdin/stdout using JSON-RPC 2.0. Methods map 1:1 to the ACP v1 protocol:
 //
-// Import as:
+//	https://agentclientprotocol.com/protocol/v1/schema
 //
-//	openacp "github.com/yusheng-g/openagent-go/acp"
+// Usage:
+//
+//	client := acp.NewClient("my-app", "1.0.0")
+//	sess, _ := client.ConnectStdio(ctx, "my-agent", "-v")
+//	defer sess.Close()
+//
+//	sess.Initialize(ctx, acp.InitializeRequest{...})
+//	sess.NewSession(ctx, acp.NewSessionRequest{...})
+//	sess.SetEventHandler(handler)         // receive streaming notifications
+//	sess.Prompt(ctx, acp.PromptRequest{...})
+//
+// The EventHandler receives session/update notifications (agent messages,
+// tool calls, plan updates, config changes, etc.) from the agent in real
+// time as they arrive on stdout. Notifications are dispatched asynchronously
+// by a background reader goroutine started automatically by ConnectStdio.
+//
+// See [Session] for the full method set and [EventHandler] for notification
+// callbacks.
+
 package acp
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
-	"log/slog"
 	"os/exec"
 	"sync"
-
-	acpsdk "github.com/coder/acp-go-sdk"
-	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// Client connects to external ACP agent processes.
-//
-// Create with [NewClient], then call [Client.ConnectStdio] to spawn
-// an agent and communicate over stdin/stdout:
-//
-//	client := acp.NewClient("my-app", "1.0.0")
-//	session, err := client.ConnectStdio(ctx, "my-acp-agent")
-//	session.Initialize(ctx, acp.InitializeRequest{...})
-//	session.NewSession(ctx, acp.NewSessionRequest{...})
-//	session.SetEventHandler(myHandler)
-//	resp, err := session.Prompt(ctx, acp.PromptRequest{...})
-//	session.Close()
+// Client connects to external ACP agent processes over stdio.
 type Client struct {
 	name    string
 	version string
@@ -46,11 +48,14 @@ func NewClient(name, version string) *Client {
 	return &Client{name: name, version: version}
 }
 
-// ConnectStdio spawns an ACP agent as a subprocess and communicates over
-// stdin/stdout. command is the path to the executable; args are its arguments.
+// ConnectStdio spawns an ACP agent subprocess and communicates over
+// stdin/stdout with newline-delimited JSON (JSON-RPC 2.0).
 //
-// The context is used to start the process. Call [Session.Close] to terminate
-// the process and clean up.
+// command is the path to the executable; args are its CLI arguments.
+// The background reader goroutine starts automatically and dispatches
+// session/update notifications to the [EventHandler].
+//
+// Call [Session.Close] to kill the process and release resources.
 func (c *Client) ConnectStdio(ctx context.Context, command string, args ...string) (*Session, error) {
 	cmd := exec.CommandContext(ctx, command, args...)
 	stdin, err := cmd.StdinPipe()
@@ -68,261 +73,205 @@ func (c *Client) ConnectStdio(ctx context.Context, command string, args ...strin
 		return nil, fmt.Errorf("acp start %q: %w", command, err)
 	}
 
-	bridge := &sessionBridge{}
-	conn := acpsdk.NewClientSideConnection(bridge, stdin, stdout)
-	conn.SetLogger(slog.Default())
-
-	return &Session{
-		conn:      conn,
+	sess := &Session{
 		cmd:       cmd,
-		bridge:    bridge,
 		stdin:     stdin,
+		stdout:    bufio.NewScanner(stdout),
 		stderrBuf: &stderrBuf,
-	}, nil
+		writeMu:   new(sync.Mutex),
+		pending:   make(map[string]*pendingCall),
+	}
+	go sess.startReader()
+	return sess, nil
 }
 
 // ── Session ──
 
-// Session is an active connection to an external ACP agent.
+// Session is an active connection to an external ACP agent. Public methods
+// map 1:1 to ACP v1 protocol methods — each sends a JSON-RPC 2.0 request
+// and blocks until the response arrives.
 //
-// Typical lifecycle:
-//
-//	session.Initialize(ctx, req)        // handshake
-//	session.NewSession(ctx, req)        // create session (reusable)
-//	session.SetEventHandler(handler)    // register streaming handler
-//	session.Prompt(ctx, req)            // send prompt (blocks until done)
-//	session.Close()                     // kill process + cleanup
-//
-// Session is safe for sequential use. For concurrent use, external
-// synchronisation is required.
+// Streaming notifications from the agent (agent messages, tool calls, plans,
+// config changes, etc.) are delivered to the [EventHandler] set via
+// [Session.SetEventHandler]. The handler must be set before [Session.Prompt]
+// to receive streaming output.
 type Session struct {
-	conn   *acpsdk.ClientSideConnection
 	cmd    *exec.Cmd
-	bridge *sessionBridge
+	stdin  io.Writer
+	stdout *bufio.Scanner
 
-	// stdin is the write end of the process's stdin pipe. Closing it
-	// signals EOF to the process, allowing graceful shutdown before Kill.
-	stdin io.WriteCloser
-
-	// stderrBuf captures the process's stderr output for diagnostics.
 	stderrBuf *bytes.Buffer
 
-	mu        sync.Mutex
-	sessionID string
+	writeMu *sync.Mutex
+
+	mu         sync.Mutex
+	sessionID  string
+	nextID     int64
+	pending    map[string]*pendingCall
+	eh         EventHandler
+	clientReqH ClientRequestHandler
 }
 
-// Initialize performs the ACP handshake. Must be called once after connect.
-func (s *Session) Initialize(ctx context.Context, req InitializeRequest) (*InitializeResponse, error) {
-	resp, err := s.conn.Initialize(ctx, acpsdk.InitializeRequest{
-		ProtocolVersion: acpsdk.ProtocolVersion(req.ProtocolVersion),
-		ClientInfo: &acpsdk.Implementation{
-			Name: req.ClientName, Version: req.ClientVersion,
-		},
-		ClientCapabilities: acpsdk.ClientCapabilities{
-			Terminal: req.ClientCapabilities.Terminal,
-		},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("acp initialize: %w", err)
-	}
-
-	agentName := ""
-	agentVersion := ""
-	if resp.AgentInfo != nil {
-		agentName = resp.AgentInfo.Name
-		agentVersion = resp.AgentInfo.Version
-	}
-
-	return &InitializeResponse{
-		ProtocolVersion: int(resp.ProtocolVersion),
-		AgentName:       agentName,
-		AgentVersion:    agentVersion,
-		Capabilities: AgentCapabilities{
-			LoadSession: resp.AgentCapabilities.LoadSession,
-			McpCapabilities: McpCapabilities{
-				Acp:  resp.AgentCapabilities.McpCapabilities.Acp,
-				Http: resp.AgentCapabilities.McpCapabilities.Http,
-				Sse:  resp.AgentCapabilities.McpCapabilities.Sse,
-			},
-			PromptCapabilities: PromptCapabilities{
-				Image:           resp.AgentCapabilities.PromptCapabilities.Image,
-				Audio:           resp.AgentCapabilities.PromptCapabilities.Audio,
-				EmbeddedContext: resp.AgentCapabilities.PromptCapabilities.EmbeddedContext,
-			},
-			SessionCapabilities: SessionCapabilities{
-				List:   resp.AgentCapabilities.SessionCapabilities.List != nil,
-				Delete: resp.AgentCapabilities.SessionCapabilities.Delete != nil,
-				Resume: resp.AgentCapabilities.SessionCapabilities.Resume != nil,
-				Close:  resp.AgentCapabilities.SessionCapabilities.Close != nil,
-			},
-		},
-	}, nil
+type pendingCall struct {
+	resp rpcResponse
+	done chan struct{}
 }
 
-// NewSession creates a new ACP session. McpServers are passed to the agent
-// so it can connect to them for tool calls (e.g. transfer_to_* for handoff).
+// ── ACP Protocol Methods ──
 //
-// The returned session ID is stored internally and used in subsequent
-// [Session.Prompt] calls. Only one session is active at a time.
+// Each method sends the corresponding ACP v1 JSON-RPC request and blocks
+// until the agent's response arrives. Protocols docs:
+//
+//	https://agentclientprotocol.com/protocol/v1/schema
+
+// Initialize performs the ACP handshake: initialize.
+// Must be called once after ConnectStdio before any session methods.
+func (s *Session) Initialize(ctx context.Context, req InitializeRequest) (*InitializeResponse, error) {
+	var resp InitializeResponse
+	if err := s.call(ctx, "initialize", req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// NewSession creates a new session: session/new.
+// The returned session ID is stored internally and reused for subsequent
+// [Session.Prompt], [Session.LoadSession], [Session.ResumeSession], and
+// [Session.CloseSession] calls.
 func (s *Session) NewSession(ctx context.Context, req NewSessionRequest) (*NewSessionResponse, error) {
-	mcpServers := make([]acpsdk.McpServer, 0, len(req.McpServers))
-	for _, m := range req.McpServers {
-		mcpServers = append(mcpServers, toSDKMcpServer(m))
+	var resp NewSessionResponse
+	if err := s.call(ctx, "session/new", req, &resp); err != nil {
+		return nil, err
 	}
-
-	resp, err := s.conn.NewSession(ctx, acpsdk.NewSessionRequest{
-		Cwd:        req.Cwd,
-		McpServers: mcpServers,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("acp new session: %w", err)
-	}
-
 	s.mu.Lock()
-	s.sessionID = string(resp.SessionId)
+	s.sessionID = resp.SessionID
 	s.mu.Unlock()
-
-	return &NewSessionResponse{
-		SessionID:     string(resp.SessionId),
-		ConfigOptions: fromSDKConfigOptions(resp.ConfigOptions),
-		Modes:         fromSDKModeState(resp.Modes),
-	}, nil
+	return &resp, nil
 }
 
-// SetEventHandler registers the handler that receives streaming events
-// during [Session.Prompt].
+// SetEventHandler registers the callback that receives session/update
+// notifications from the agent. Must be set before [Session.Prompt] to
+// capture streaming output.
 func (s *Session) SetEventHandler(h EventHandler) {
-	s.bridge.setHandler(h)
-}
-
-// Prompt sends a user prompt to the agent and blocks until the agent
-// finishes processing. Streaming events are delivered to the registered
-// [EventHandler] concurrently.
-func (s *Session) Prompt(ctx context.Context, req PromptRequest) (*PromptResponse, error) {
-	blocks := make([]acpsdk.ContentBlock, len(req.Blocks))
-	for i, b := range req.Blocks {
-		blocks[i] = acpsdk.ContentBlock{
-			Text: &acpsdk.ContentBlockText{Text: b.Text},
-		}
-	}
-
 	s.mu.Lock()
-	sid := s.sessionID
+	s.eh = h
 	s.mu.Unlock()
-
-	resp, err := s.conn.Prompt(ctx, acpsdk.PromptRequest{
-		SessionId: acpsdk.SessionId(sid),
-		Prompt:    blocks,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("acp prompt: %w", err)
-	}
-
-	return &PromptResponse{
-		StopReason: string(resp.StopReason),
-	}, nil
 }
 
-// DeleteSession permanently removes a session and all its data from the agent.
-func (s *Session) DeleteSession(ctx context.Context, sessionID string) error {
-	_, err := s.conn.UnstableDeleteSession(ctx, acpsdk.UnstableDeleteSessionRequest{
-		SessionId: acpsdk.SessionId(sessionID),
-	})
-	if err != nil {
-		return fmt.Errorf("acp delete session: %w", err)
-	}
-	return nil
+// SetClientRequestHandler registers the handler that responds to Agent→Client
+// RPC requests (request_permission, fs/read_text_file, terminal/*, etc.).
+// If not set, unrecognised agent→client requests return MethodNotFound.
+func (s *Session) SetClientRequestHandler(h ClientRequestHandler) {
+	s.mu.Lock()
+	s.clientReqH = h
+	s.mu.Unlock()
 }
 
-// CloseSession closes the current ACP session.
+// Prompt sends a user prompt and blocks until the turn completes:
+// session/prompt.
+//
+// Streaming output (agent messages, tool calls, plan updates, etc.) is
+// delivered to the registered [EventHandler] concurrently via the
+// background reader goroutine.
+func (s *Session) Prompt(ctx context.Context, req PromptRequest) (*PromptResponse, error) {
+	s.mu.Lock()
+	req.SessionID = s.sessionID
+	s.mu.Unlock()
+	var resp PromptResponse
+	if err := s.call(ctx, "session/prompt", req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// LoadSession loads an existing session with history replay: session/load.
+// The agent replays conversation history via session/update notifications
+// before responding.
+func (s *Session) LoadSession(ctx context.Context, req LoadSessionRequest) (*LoadSessionResponse, error) {
+	var resp LoadSessionResponse
+	if err := s.call(ctx, "session/load", req, &resp); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	s.sessionID = req.SessionID
+	s.mu.Unlock()
+	return &resp, nil
+}
+
+// ResumeSession resumes an existing session without history replay:
+// session/resume.
+func (s *Session) ResumeSession(ctx context.Context, req ResumeSessionRequest) (*ResumeSessionResponse, error) {
+	var resp ResumeSessionResponse
+	if err := s.call(ctx, "session/resume", req, &resp); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	s.sessionID = req.SessionID
+	s.mu.Unlock()
+	return &resp, nil
+}
+
+// CloseSession closes the active session: session/close.
 func (s *Session) CloseSession(ctx context.Context) error {
 	s.mu.Lock()
 	sid := s.sessionID
 	s.mu.Unlock()
-
 	if sid == "" {
 		return nil
 	}
-
-	_, err := s.conn.CloseSession(ctx, acpsdk.CloseSessionRequest{
-		SessionId: acpsdk.SessionId(sid),
-	})
+	_, err := s.request(ctx, "session/close", CloseSessionRequest{SessionID: sid})
 	return err
 }
 
-// ListSessions returns the sessions available on the agent.
+// DeleteSession permanently removes a session and all its data:
+// session/delete.
+func (s *Session) DeleteSession(ctx context.Context, sessionID string) error {
+	_, err := s.request(ctx, "session/delete", DeleteSessionRequest{SessionID: sessionID})
+	return err
+}
+
+// ListSessions returns the sessions available on the agent: session/list.
 func (s *Session) ListSessions(ctx context.Context, req ListSessionsRequest) (*ListSessionsResponse, error) {
-	resp, err := s.conn.ListSessions(ctx, acpsdk.ListSessionsRequest{
-		Cursor: req.Cursor,
-		Cwd:    req.Cwd,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("acp list sessions: %w", err)
+	var resp ListSessionsResponse
+	if err := s.call(ctx, "session/list", req, &resp); err != nil {
+		return nil, err
 	}
-
-	sessions := make([]SessionInfo, len(resp.Sessions))
-	for i, info := range resp.Sessions {
-		title := ""
-		if info.Title != nil {
-			title = *info.Title
-		}
-		updatedAt := ""
-		if info.UpdatedAt != nil {
-			updatedAt = *info.UpdatedAt
-		}
-		sessions[i] = SessionInfo{
-			SessionID: string(info.SessionId),
-			Cwd:       info.Cwd,
-			Title:     title,
-			UpdatedAt: updatedAt,
-		}
-	}
-
-	return &ListSessionsResponse{
-		NextCursor: resp.NextCursor,
-		Sessions:   sessions,
-	}, nil
+	return &resp, nil
 }
 
-// LoadSession resumes an existing session on the agent.
-func (s *Session) LoadSession(ctx context.Context, req LoadSessionRequest) (*LoadSessionResponse, error) {
-	mcpServers := make([]acpsdk.McpServer, 0, len(req.McpServers))
-	for _, m := range req.McpServers {
-		mcpServers = append(mcpServers, toSDKMcpServer(m))
+// SetSessionMode changes the active session mode: session/set_mode.
+func (s *Session) SetSessionMode(ctx context.Context, req SetSessionModeRequest) (*SetSessionModeResponse, error) {
+	var resp SetSessionModeResponse
+	if err := s.call(ctx, "session/set_mode", req, &resp); err != nil {
+		return nil, err
 	}
-
-	_, err := s.conn.ResumeSession(ctx, acpsdk.ResumeSessionRequest{
-		SessionId:            acpsdk.SessionId(req.SessionID),
-		Cwd:                  req.Cwd,
-		McpServers:           mcpServers,
-		AdditionalDirectories: req.AdditionalDirectories,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("acp load session: %w", err)
-	}
-
-	s.mu.Lock()
-	s.sessionID = req.SessionID
-	s.mu.Unlock()
-
-	return &LoadSessionResponse{}, nil
+	return &resp, nil
 }
 
-// Close terminates the ACP connection and cleans up the subprocess.
-//
-// It first closes stdin to signal EOF to the process, allowing it to exit
-// gracefully. If the process doesn't exit on its own (it's not required to),
-// it is killed. Stderr output is captured and available via [Session.Stderr].
+// SetSessionConfigOption changes a config option: session/set_config_option.
+// The agent's response contains the full configOptions array (not a delta).
+func (s *Session) SetSessionConfigOption(ctx context.Context, req SetSessionConfigOptionRequest) (*SetSessionConfigOptionResponse, error) {
+	var resp SetSessionConfigOptionResponse
+	if err := s.call(ctx, "session/set_config_option", req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// Cancel sends a session/cancel notification to cancel an ongoing prompt.
+// This is a notification (no response expected).
+func (s *Session) Cancel(ctx context.Context, sessionID string) error {
+	return s.notify(ctx, "session/cancel", CancelNotification{SessionID: sessionID})
+}
+
+// Close kills the agent subprocess and releases resources. Call when the
+// client is done with the connection.
 func (s *Session) Close() error {
-	// Close stdin first — signals EOF so the process can shut down gracefully.
-	// The SDK connection reads from stdout until EOF; closing stdin triggers
-	// the process to flush and exit.
 	if s.stdin != nil {
-		_ = s.stdin.Close()
+		if wc, ok := s.stdin.(io.WriteCloser); ok {
+			_ = wc.Close()
+		}
 	}
-
-	// Force-kill the process as a safety net. If the process already exited
-	// due to stdin closing, Kill is a no-op (Process is nil after Wait).
 	if s.cmd != nil && s.cmd.Process != nil {
 		_ = s.cmd.Process.Kill()
 		_ = s.cmd.Wait()
@@ -330,9 +279,7 @@ func (s *Session) Close() error {
 	return nil
 }
 
-// Stderr returns the captured stderr output of the subprocess.
-// Empty string if nothing was written to stderr. Use this for
-// diagnostics when the process fails or behaves unexpectedly.
+// Stderr returns the captured stderr output of the agent subprocess.
 func (s *Session) Stderr() string {
 	if s.stderrBuf == nil {
 		return ""
@@ -340,173 +287,313 @@ func (s *Session) Stderr() string {
 	return s.stderrBuf.String()
 }
 
-// ── sessionBridge ──
+// ── JSON-RPC 2.0 transport ──
 
-// sessionBridge implements acpsdk.Client to receive callbacks from the SDK
-// and translate them to our EventHandler interface.
-type sessionBridge struct {
-	mu      sync.RWMutex
-	handler EventHandler
+// nextReqID returns an auto-incrementing request id.
+func (s *Session) nextReqID() string {
+	s.mu.Lock()
+	s.nextID++
+	id := s.nextID
+	s.mu.Unlock()
+	return fmt.Sprintf("%d", id)
 }
 
-func (b *sessionBridge) setHandler(h EventHandler) {
-	b.mu.Lock()
-	b.handler = h
-	b.mu.Unlock()
+// call sends a JSON-RPC 2.0 request and unmarshals the result.
+func (s *Session) call(ctx context.Context, method string, params, result any) error {
+	resp, err := s.request(ctx, method, params)
+	if err != nil {
+		return err
+	}
+	if resp.Error != nil {
+		return fmt.Errorf("acp: %s: %s", method, resp.Error.Message)
+	}
+	return json.Unmarshal(resp.Result, result)
 }
 
-func (b *sessionBridge) getHandler() EventHandler {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	return b.handler
-}
+// request sends a JSON-RPC 2.0 request and returns the full response.
+// It registers a pending call, writes the request to stdin, and blocks
+// until the reader goroutine signals completion or ctx is cancelled.
+func (s *Session) request(ctx context.Context, method string, params any) (rpcResponse, error) {
+	id := s.nextReqID()
+	req := struct {
+		JSONRPC string `json:"jsonrpc"`
+		ID      string `json:"id"`
+		Method  string `json:"method"`
+		Params  any    `json:"params,omitempty"`
+	}{JSONRPC: "2.0", ID: id, Method: method, Params: params}
 
-func (b *sessionBridge) SessionUpdate(ctx context.Context, params acpsdk.SessionNotification) error {
-	h := b.getHandler()
-	if h == nil {
-		return nil
+	reqBody, _ := json.Marshal(req)
+	call := &pendingCall{done: make(chan struct{})}
+
+	s.mu.Lock()
+	s.pending[id] = call
+	s.mu.Unlock()
+
+	defer func() {
+		s.mu.Lock()
+		delete(s.pending, id)
+		s.mu.Unlock()
+	}()
+
+	s.writeMu.Lock()
+	_, err := s.stdin.Write(append(reqBody, '\n'))
+	s.writeMu.Unlock()
+	if err != nil {
+		return rpcResponse{}, fmt.Errorf("acp write %s: %w", method, err)
 	}
 
-	update := params.Update
+	select {
+	case <-call.done:
+	case <-ctx.Done():
+		return rpcResponse{}, ctx.Err()
+	}
+	return call.resp, nil
+}
 
-	switch {
-	case update.AgentMessageChunk != nil:
-		h.OnAgentMessage(contentBlockTextSDK(update.AgentMessageChunk.Content))
+// notify sends a JSON-RPC 2.0 notification (no id field, no response).
+func (s *Session) notify(ctx context.Context, method string, params any) error {
+	notif := struct {
+		JSONRPC string `json:"jsonrpc"`
+		Method  string `json:"method"`
+		Params  any    `json:"params,omitempty"`
+	}{JSONRPC: "2.0", Method: method, Params: params}
+	body, _ := json.Marshal(notif)
+	s.writeMu.Lock()
+	_, err := s.stdin.Write(append(body, '\n'))
+	s.writeMu.Unlock()
+	return err
+}
 
-	case update.AgentThoughtChunk != nil:
-		h.OnAgentThought(contentBlockTextSDK(update.AgentThoughtChunk.Content))
+// ── EventHandler ──
 
-	case update.ToolCall != nil:
-		tc := update.ToolCall
-		status := ""
-		switch tc.Status {
-		case acpsdk.ToolCallStatusCompleted:
-			status = "completed"
-		case acpsdk.ToolCallStatusInProgress:
-			status = "in_progress"
-		case acpsdk.ToolCallStatusFailed:
-			status = "failed"
+// EventHandler receives session/update notifications from the agent.
+// Each callback maps to a sessionUpdate discriminator value:
+//
+//	https://agentclientprotocol.com/protocol/v1/schema#session%2Fupdate
+type EventHandler interface {
+	// OnAgentMessage — sessionUpdate "agent_message_chunk".
+	OnAgentMessage(text string)
+	// OnAgentThought — sessionUpdate "agent_thought_chunk".
+	OnAgentThought(text string)
+	// OnToolCall — sessionUpdate "tool_call" / "tool_call_update".
+	OnToolCall(tc ToolCallUpdate)
+	// OnPlan — sessionUpdate "plan".
+	OnPlan(plan Plan)
+	// OnAvailableCommandsUpdate — sessionUpdate "available_commands_update".
+	OnAvailableCommandsUpdate(cmds []AvailableCommand)
+	// OnModeUpdate — sessionUpdate "current_mode_update".
+	OnModeUpdate(modeID SessionModeId)
+	// OnConfigOptionUpdate — sessionUpdate "config_option_update".
+	OnConfigOptionUpdate(opts []SessionConfigOption)
+	// OnUsageUpdate — sessionUpdate "usage_update".
+	OnUsageUpdate(used, total int, cost *Cost)
+	// OnSessionInfo — sessionUpdate "session_info_update".
+	OnSessionInfo(title string, metadata map[string]any)
+}
+
+// ── Reader goroutine ──
+
+// startReader reads JSON-RPC messages from the agent's stdout. Three
+// message shapes per JSON-RPC 2.0:
+//
+//	Request:      method + id present → agent→client RPC. Handle synchronously.
+//	Notification: method present, no id → dispatch to EventHandler.
+//	Response:     no method, id present → deliver to pending call.
+func (s *Session) startReader() {
+	s.stdout.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
+	for s.stdout.Scan() {
+		line := s.stdout.Bytes()
+		if len(line) == 0 {
+			continue
 		}
-		h.OnToolCall(ToolCallEvent{
-			ID:        string(tc.ToolCallId),
-			Title:     tc.Title,
-			RawInput:  tc.RawInput,
-			Status:    status,
-			RawOutput: tc.RawOutput,
-		})
 
-	case update.ToolCallUpdate != nil:
-		tu := update.ToolCallUpdate
-		status := ""
-		if tu.Status != nil {
-			switch *tu.Status {
-			case acpsdk.ToolCallStatusCompleted:
-				status = "completed"
-			case acpsdk.ToolCallStatusInProgress:
-				status = "in_progress"
-			case acpsdk.ToolCallStatusFailed:
-				status = "failed"
+		var env struct {
+			JSONRPC string          `json:"jsonrpc"`
+			ID      json.RawMessage `json:"id,omitempty"`
+			Method  string          `json:"method,omitempty"`
+			Params  json.RawMessage `json:"params,omitempty"`
+			Result  json.RawMessage `json:"result,omitempty"`
+			Error   *Error          `json:"error,omitempty"`
+		}
+		if err := json.Unmarshal(line, &env); err != nil {
+			continue
+		}
+
+		switch {
+		case env.Method != "" && len(env.ID) > 0:
+			// Agent→Client RPC request. Handle synchronously and write
+			// the response back to the agent on stdin.
+			s.handleAgentRequest(env.Method, env.ID, env.Params)
+
+		case env.Method != "":
+			// Notification — dispatch to EventHandler.
+			s.dispatchNotif(env.Method, env.Params)
+
+		case len(env.ID) > 0:
+			// Response — deliver to pending call.
+			callKey := idString(env.ID)
+			s.mu.Lock()
+			call := s.pending[callKey]
+			s.mu.Unlock()
+			if call != nil {
+				if env.Error != nil {
+					call.resp.Error = env.Error
+				} else {
+					call.resp.Result = env.Result
+				}
+				close(call.done)
 			}
 		}
-		title := ""
-		if tu.Title != nil {
-			title = *tu.Title
+	}
+}
+
+// handleAgentRequest dispatches an incoming Agent→Client RPC request
+// and writes the JSON-RPC 2.0 response back to the agent on stdin.
+func (s *Session) handleAgentRequest(method string, id json.RawMessage, params json.RawMessage) {
+	s.mu.Lock()
+	h := s.clientReqH
+	s.mu.Unlock()
+
+	if h == nil {
+		s.writeRPCResponse(id, nil, fmt.Errorf("agent→client RPC not configured"))
+		return
+	}
+
+	var resp any
+	var err error
+
+	switch method {
+	case "session/request_permission":
+		var req RequestPermissionRequest
+		if json.Unmarshal(params, &req) == nil {
+			resp, err = h.HandleRequestPermission(context.Background(), req)
 		}
-		h.OnToolCall(ToolCallEvent{
-			ID:        string(tu.ToolCallId),
-			Title:     title,
-			RawInput:  tu.RawInput,
-			Status:    status,
-			RawOutput: tu.RawOutput,
+	case "fs/read_text_file":
+		var req ReadTextFileRequest
+		if json.Unmarshal(params, &req) == nil {
+			resp, err = h.HandleReadTextFile(context.Background(), req)
+		}
+	case "fs/write_text_file":
+		var req WriteTextFileRequest
+		if json.Unmarshal(params, &req) == nil {
+			resp, err = h.HandleWriteTextFile(context.Background(), req)
+		}
+	case "terminal/create":
+		var req CreateTerminalRequest
+		if json.Unmarshal(params, &req) == nil {
+			resp, err = h.HandleCreateTerminal(context.Background(), req)
+		}
+	case "terminal/output":
+		var req TerminalOutputRequest
+		if json.Unmarshal(params, &req) == nil {
+			resp, err = h.HandleTerminalOutput(context.Background(), req)
+		}
+	case "terminal/wait_for_exit":
+		var req WaitForTerminalExitRequest
+		if json.Unmarshal(params, &req) == nil {
+			resp, err = h.HandleWaitForTerminalExit(context.Background(), req)
+		}
+	case "terminal/kill":
+		var req KillTerminalRequest
+		if json.Unmarshal(params, &req) == nil {
+			resp, err = h.HandleKillTerminal(context.Background(), req)
+		}
+	case "terminal/release":
+		var req ReleaseTerminalRequest
+		if json.Unmarshal(params, &req) == nil {
+			resp, err = h.HandleReleaseTerminal(context.Background(), req)
+		}
+	}
+
+	if err != nil {
+		s.writeRPCResponse(id, nil, err)
+		return
+	}
+	s.writeRPCResponse(id, resp, nil)
+}
+
+// writeRPCResponse sends a JSON-RPC 2.0 response (or error) to the agent
+// via stdin.
+func (s *Session) writeRPCResponse(id json.RawMessage, result any, err error) {
+	resp := struct {
+		JSONRPC string          `json:"jsonrpc"`
+		ID      json.RawMessage `json:"id"`
+		Result  json.RawMessage `json:"result,omitempty"`
+		Error   *Error          `json:"error,omitempty"`
+	}{JSONRPC: "2.0", ID: id}
+
+	if err != nil {
+		resp.Error = &Error{Code: ErrorCodeInternal, Message: err.Error()}
+	} else {
+		resp.Result, _ = json.Marshal(result)
+	}
+
+	data, _ := json.Marshal(resp)
+	s.writeMu.Lock()
+	s.stdin.Write(append(data, '\n'))
+	s.writeMu.Unlock()
+}
+
+// dispatchNotif routes a session/update notification to the EventHandler.
+// Unrecognized notification methods are silently ignored per ACP spec.
+func (s *Session) dispatchNotif(method string, params json.RawMessage) {
+	if method != "session/update" {
+		return
+	}
+	var notif SessionNotification
+	if json.Unmarshal(params, &notif) != nil {
+		return
+	}
+	s.mu.Lock()
+	h := s.eh
+	s.mu.Unlock()
+	if h == nil {
+		return
+	}
+
+	u := notif.Update
+	switch u.SessionUpdate {
+	case "agent_message_chunk":
+		if cb := u.ContentAsBlock(); cb != nil {
+			h.OnAgentMessage(cb.Text)
+		}
+	case "agent_thought_chunk":
+		if cb := u.ContentAsBlock(); cb != nil {
+			h.OnAgentThought(cb.Text)
+		}
+	case "tool_call", "tool_call_update":
+		h.OnToolCall(ToolCallUpdate{
+			ToolCallID: u.ToolCallID, Title: u.Title,
+			Kind: u.Kind, Status: u.Status,
+			RawInput: u.RawInput, RawOutput: u.RawOutput,
+			Content: u.ContentAsToolCallContent(), Locations: u.Locations,
 		})
-	}
-
-	return nil
-}
-
-// Other Client methods — return "not supported".
-func (b *sessionBridge) RequestPermission(ctx context.Context, params acpsdk.RequestPermissionRequest) (acpsdk.RequestPermissionResponse, error) {
-	return acpsdk.RequestPermissionResponse{
-		Outcome: acpsdk.RequestPermissionOutcome{
-			Cancelled: &acpsdk.RequestPermissionOutcomeCancelled{Outcome: "cancelled"},
-		},
-	}, nil
-}
-
-func (b *sessionBridge) ReadTextFile(ctx context.Context, params acpsdk.ReadTextFileRequest) (acpsdk.ReadTextFileResponse, error) {
-	return acpsdk.ReadTextFileResponse{}, fmt.Errorf("not supported")
-}
-func (b *sessionBridge) WriteTextFile(ctx context.Context, params acpsdk.WriteTextFileRequest) (acpsdk.WriteTextFileResponse, error) {
-	return acpsdk.WriteTextFileResponse{}, fmt.Errorf("not supported")
-}
-func (b *sessionBridge) CreateTerminal(ctx context.Context, params acpsdk.CreateTerminalRequest) (acpsdk.CreateTerminalResponse, error) {
-	return acpsdk.CreateTerminalResponse{}, fmt.Errorf("not supported")
-}
-func (b *sessionBridge) KillTerminal(ctx context.Context, params acpsdk.KillTerminalRequest) (acpsdk.KillTerminalResponse, error) {
-	return acpsdk.KillTerminalResponse{}, fmt.Errorf("not supported")
-}
-func (b *sessionBridge) TerminalOutput(ctx context.Context, params acpsdk.TerminalOutputRequest) (acpsdk.TerminalOutputResponse, error) {
-	return acpsdk.TerminalOutputResponse{}, fmt.Errorf("not supported")
-}
-func (b *sessionBridge) ReleaseTerminal(ctx context.Context, params acpsdk.ReleaseTerminalRequest) (acpsdk.ReleaseTerminalResponse, error) {
-	return acpsdk.ReleaseTerminalResponse{}, fmt.Errorf("not supported")
-}
-func (b *sessionBridge) WaitForTerminalExit(ctx context.Context, params acpsdk.WaitForTerminalExitRequest) (acpsdk.WaitForTerminalExitResponse, error) {
-	return acpsdk.WaitForTerminalExitResponse{}, fmt.Errorf("not supported")
-}
-
-// ── Helpers ──
-
-// fromSDKConfigOptions converts SDK config options to our type via JSON round-trip.
-func fromSDKConfigOptions(opts []acpsdk.SessionConfigOption) []SessionConfigOption {
-	if len(opts) == 0 {
-		return nil
-	}
-	data, err := json.Marshal(opts)
-	if err != nil {
-		return nil
-	}
-	var ours []SessionConfigOption
-	json.Unmarshal(data, &ours)
-	return ours
-}
-
-// fromSDKModeState converts SDK mode state to our type via JSON round-trip.
-func fromSDKModeState(m *acpsdk.SessionModeState) *SessionModeState {
-	if m == nil {
-		return nil
-	}
-	data, err := json.Marshal(m)
-	if err != nil {
-		return nil
-	}
-	var ours SessionModeState
-	json.Unmarshal(data, &ours)
-	return &ours
-}
-
-func toSDKMcpServer(m McpServer) acpsdk.McpServer {
-	sdk := acpsdk.McpServer{}
-	if m.URL != "" {
-		sdk.Http = &acpsdk.McpServerHttpInline{Url: m.URL}
-	}
-	if m.Command != "" {
-		sdk.Stdio = &acpsdk.McpServerStdio{
-			Name:    m.Name,
-			Command: m.Command,
-			Args:    m.Args,
+	case "plan":
+		h.OnPlan(Plan{Entries: u.Entries})
+	case "available_commands_update":
+		h.OnAvailableCommandsUpdate(u.AvailableCommands)
+	case "current_mode_update":
+		h.OnModeUpdate(u.CurrentModeID)
+	case "config_option_update":
+		h.OnConfigOptionUpdate(u.ConfigOptions)
+	case "usage_update":
+		used, total := 0, 0
+		if u.Used != nil {
+			used = *u.Used
 		}
+		if u.Size != nil {
+			total = *u.Size
+		}
+		h.OnUsageUpdate(used, total, u.Cost)
+	case "session_info_update":
+		title := ""
+		md := map[string]any{}
+		if u.SessionInfoUpdate != nil {
+			if u.SessionInfoUpdate.Title != nil {
+				title = *u.SessionInfoUpdate.Title
+			}
+			md = u.SessionInfoUpdate.MetaData
+		}
+		h.OnSessionInfo(title, md)
 	}
-	return sdk
 }
-
-func contentBlockTextSDK(block acpsdk.ContentBlock) string {
-	if block.Text != nil {
-		return block.Text.Text
-	}
-	return ""
-}
-
-// Compile-time interface checks.
-var _ acpsdk.Client = (*sessionBridge)(nil)
-var _ *mcpsdk.Server = nil // ensure mcpsdk is available
