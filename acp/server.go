@@ -18,6 +18,7 @@ import (
 	"github.com/yusheng-g/openagent-go/mcp"
 	"github.com/yusheng-g/openagent-go/plan"
 	"github.com/yusheng-g/openagent-go/session"
+	opentool "github.com/yusheng-g/openagent-go/tool"
 	"github.com/yusheng-g/openagent-go/slash"
 )
 
@@ -970,6 +971,19 @@ func (s *AgentServer) agentForTurn(sid openacp.SessionId) *openagent.Agent {
 
 		// Inject MCP tools from all connected servers.
 		clone.Tools = append(clone.Tools, ss.mcpTools...)
+	}
+
+	// Inject Agent→Client RPC tools when the client supports them.
+	if s.clientRPC != nil {
+		clone.Tools = append(clone.Tools,
+			opentool.NewACPReadFile(s.clientRPC, sid),
+			opentool.NewACPWriteFile(s.clientRPC, sid),
+			opentool.NewACPTerminalCreate(s.clientRPC, sid),
+			opentool.NewACPTerminalOutput(s.clientRPC, sid),
+			opentool.NewACPTerminalWait(s.clientRPC, sid),
+			opentool.NewACPTerminalKill(s.clientRPC, sid),
+			opentool.NewACPTerminalRelease(s.clientRPC, sid),
+		)
 	}
 
 	return clone
