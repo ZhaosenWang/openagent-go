@@ -149,3 +149,4 @@ func (p *eventPrinter) OnModeUpdate(modeID openacp.SessionModeId)            {}
 func (p *eventPrinter) OnConfigOptionUpdate(opts []openacp.SessionConfigOption) {}
 func (p *eventPrinter) OnUsageUpdate(used, total int, cost *openacp.Cost)    {}
 func (p *eventPrinter) OnSessionInfo(title string, metadata map[string]any)  {}
+func (p *eventPrinter) OnUserMessage(text string)                               {}

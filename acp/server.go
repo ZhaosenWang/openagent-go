@@ -42,6 +42,7 @@ type agentSession struct {
 	cwd       string
 	createdAt time.Time
 	mode      string // "chat" or "plan"
+	config    map[openacp.SessionConfigId]any // config option values
 	cancel    context.CancelFunc
 }
 
@@ -130,7 +131,9 @@ func (s *AgentServer) OnInitialize(ctx context.Context, req openacp.InitializeRe
 			List:   &openacp.SessionListCapabilities{},
 			Resume: &openacp.SessionResumeCapabilities{},
 		},
-		Delete: map[string]bool{"supported": true},
+		Auth: openacp.AgentAuthCapabilities{
+			Logout: &openacp.LogoutCapabilities{},
+		},
 	}
 	return &openacp.InitializeResponse{
 		ProtocolVersion:   1,
@@ -151,6 +154,7 @@ func (s *AgentServer) OnNewSession(ctx context.Context, req openacp.NewSessionRe
 		cwd:       req.Cwd,
 		createdAt: time.Now(),
 		mode:      "chat",
+		config:    map[openacp.SessionConfigId]any{"thought_level": "medium"},
 	}
 	s.putSession(id, ss)
 	s.saveMeta(string(id), req.Cwd, "acp")
@@ -170,6 +174,7 @@ func (s *AgentServer) OnLoadSession(ctx context.Context, req openacp.LoadSession
 			cwd:       req.Cwd,
 			createdAt: time.Now(),
 			mode:      "chat",
+		config:    map[openacp.SessionConfigId]any{"thought_level": "medium"},
 		}
 		s.putSession(req.SessionID, ss)
 	}
@@ -204,6 +209,7 @@ func (s *AgentServer) OnResumeSession(ctx context.Context, req openacp.ResumeSes
 			cwd:       req.Cwd,
 			createdAt: time.Now(),
 			mode:      "chat",
+		config:    map[openacp.SessionConfigId]any{"thought_level": "medium"},
 		}
 		s.putSession(req.SessionID, ss)
 	}
@@ -264,8 +270,14 @@ func (s *AgentServer) OnListSessions(ctx context.Context, req openacp.ListSessio
 func (s *AgentServer) buildConfigOptions(sid openacp.SessionId) []openacp.SessionConfigOption {
 	ss := s.getSession(sid)
 	mode := "chat"
+	thoughtLevel := "medium"
 	if ss != nil {
 		mode = ss.mode
+		if v, ok := ss.config["thought_level"]; ok {
+			if s, ok := v.(string); ok {
+				thoughtLevel = s
+			}
+		}
 	}
 	return []openacp.SessionConfigOption{
 		{
@@ -286,7 +298,7 @@ func (s *AgentServer) buildConfigOptions(sid openacp.SessionId) []openacp.Sessio
 			Description:  "Controls the amount of reasoning the model produces",
 			Category:     "thought_level",
 			Type:         "select",
-			CurrentValue: "medium",
+			CurrentValue: thoughtLevel,
 			Options: []openacp.SessionConfigOptValue{
 				{Value: "low", Name: "Low"},
 				{Value: "medium", Name: "Medium"},
@@ -321,7 +333,24 @@ func (s *AgentServer) OnSetSessionMode(ctx context.Context, req openacp.SetSessi
 }
 
 func (s *AgentServer) OnSetSessionConfigOption(ctx context.Context, req openacp.SetSessionConfigOptionRequest) (*openacp.SetSessionConfigOptionResponse, error) {
-	// Config changes are ephemeral — reflect them back.
+	ss := s.getSession(req.SessionID)
+	if ss == nil {
+		return nil, fmt.Errorf("session %s not found", req.SessionID)
+	}
+
+	// Per ACP spec: Type "boolean" selects the boolean variant; absent/empty
+	// defaults to select (value_id).  Value is bool for boolean, string for select.
+	switch req.Type {
+	case "boolean":
+		if b, ok := req.Value.(bool); ok {
+			ss.config[req.ConfigID] = b
+		}
+	default:
+		if s, ok := req.Value.(string); ok {
+			ss.config[req.ConfigID] = s
+		}
+	}
+
 	return &openacp.SetSessionConfigOptionResponse{
 		ConfigOptions: s.buildConfigOptions(req.SessionID),
 	}, nil
@@ -457,6 +486,10 @@ func (s *AgentServer) OnCancel(ctx context.Context, sid openacp.SessionId) error
 func (s *AgentServer) OnAuthenticate(ctx context.Context, req openacp.AuthenticateRequest) (*openacp.AuthenticateResponse, error) {
 	// No authentication required for local agent.
 	return &openacp.AuthenticateResponse{}, nil
+}
+
+func (s *AgentServer) OnLogout(ctx context.Context, req openacp.LogoutRequest) (*openacp.LogoutResponse, error) {
+	return &openacp.LogoutResponse{}, nil
 }
 
 // ── Internal ──

@@ -207,6 +207,10 @@ func (s *calcServer) OnCancel(ctx context.Context, sid openacp.SessionId) error 
 	return nil
 }
 
+func (s *calcServer) OnLogout(ctx context.Context, req openacp.LogoutRequest) (*openacp.LogoutResponse, error) {
+	return &openacp.LogoutResponse{}, nil
+}
+
 // ── Calculator ──
 
 func extractExpression(input string) (string, bool) {

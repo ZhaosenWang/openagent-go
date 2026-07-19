@@ -49,6 +49,7 @@
 //
 //	initialize                     handshake + capability negotiation
 //	authenticate                   select auth method
+//	logout                         end authenticated state
 //	session/new                    create session
 //	session/load                   load session (history replay via sender)
 //	session/resume                 resume session (no replay)
@@ -65,6 +66,7 @@
 //
 //	agent_message_chunk            stream LLM text response
 //	agent_thought_chunk            stream LLM reasoning
+//	user_message_chunk             replay user message (session/load)
 //	tool_call                      announce tool invocation
 //	tool_call_update               tool status transition
 //	plan                           execution plan + progress

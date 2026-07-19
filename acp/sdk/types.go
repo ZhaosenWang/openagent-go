@@ -62,16 +62,16 @@ type Implementation struct {
 // ── Capabilities ──
 
 // AgentCapabilities is returned in the initialize response.
+// Per ACP v1 spec, session lifecycle capabilities (close, delete, list, resume,
+// additionalDirectories) live inside SessionCapabilities, not at the top level.
 type AgentCapabilities struct {
 	Meta map[string]any `json:"_meta,omitempty"`
 
-	LoadSession             bool                 `json:"loadSession,omitempty"`
-	AdditionalDirectories   any                  `json:"additionalDirectories,omitempty"`
-	Delete                  any                  `json:"delete,omitempty"` // null=not supported, {} = supported
-	McpCapabilities         McpCapabilities      `json:"mcpCapabilities,omitempty"`
-	PromptCapabilities      PromptCapabilities   `json:"promptCapabilities,omitempty"`
-	SessionCapabilities     SessionCapabilities  `json:"sessionCapabilities,omitempty"`
-	Auth                    AgentAuthCapabilities `json:"auth,omitempty"`
+	LoadSession         bool                `json:"loadSession,omitempty"`
+	McpCapabilities     McpCapabilities     `json:"mcpCapabilities,omitempty"`
+	PromptCapabilities  PromptCapabilities  `json:"promptCapabilities,omitempty"`
+	SessionCapabilities SessionCapabilities `json:"sessionCapabilities,omitempty"`
+	Auth                AgentAuthCapabilities `json:"auth,omitempty"`
 }
 
 // ClientCapabilities is sent by the Client during initialize.
@@ -752,16 +752,17 @@ type SessionNotification struct {
 // SessionUpdate is a discriminated union of update types.
 // The SessionUpdate field determines which payload fields are populated:
 //
-//	"agent_message_chunk"       — MessageDelta
-//	"agent_thought_chunk"       — MessageDelta
-//	"tool_call"                 — ToolCallUpdate
-//	"tool_call_update"          — ToolCallUpdate
-//	"plan"                      — Plan
-//	"available_commands_update" — AvailableCommandsUpdate
-//	"current_mode_update"       — CurrentModeUpdate
-//	"config_option_update"      — ConfigOptionUpdate
-//	"usage_update"              — Cost
-//	"session_info_update"       — SessionSessionInfoUpdate
+//	"agent_message_chunk"       — content (ContentBlock), optional messageId
+//	"agent_thought_chunk"       — content (ContentBlock), optional messageId
+//	"user_message_chunk"        — content (ContentBlock), optional messageId (session/load replay)
+//	"tool_call"                 — toolCallId🔴, title🔴, kind, status, rawInput, locations
+//	"tool_call_update"          — toolCallId🔴, status, content, rawOutput, locations (all optional except id)
+//	"plan"                      — entries🔴
+//	"available_commands_update" — availableCommands🔴
+//	"current_mode_update"       — currentModeId🔴
+//	"config_option_update"      — configOptions🔴
+//	"usage_update"              — used🔴, size🔴, cost
+//	"session_info_update"       — title, updatedAt, _meta (flat, no wrapper; per schema def)
 type SessionUpdate struct {
 	Meta map[string]any `json:"_meta,omitempty"`
 
@@ -776,8 +777,11 @@ type SessionUpdate struct {
 	MessageID *MessageId `json:"messageId,omitempty"`
 
 	// tool_call / tool_call_update
+	// Title is *string because session_info_update also uses the "title"
+	// JSON key (as a nullable string). Mutually exclusive variants share
+	// the same wire field name without conflict.
 	ToolCallID string             `json:"toolCallId,omitempty"`
-	Title      string             `json:"title,omitempty"`
+	Title      *string            `json:"title,omitempty"`
 	Kind       string             `json:"kind,omitempty"`
 	Status     string             `json:"status,omitempty"`
 	RawInput   any                `json:"rawInput,omitempty"`
@@ -803,8 +807,9 @@ type SessionUpdate struct {
 	Used *int `json:"used,omitempty"`
 	Size *int `json:"size,omitempty"`
 
-	// session_info_update
-	SessionInfoUpdate *SessionSessionInfoUpdate `json:"sessionInfoUpdate,omitempty"`
+	// session_info_update — per ACP spec the fields are flat inside the
+	// update object, not nested under a wrapper struct.
+	UpdatedAt *string `json:"updatedAt,omitempty"`
 }
 // ContentAsBlock unmarshals Content as a ContentBlock. Returns nil if
 // Content is empty or represents a different variant.
@@ -844,14 +849,6 @@ func (u *SessionUpdate) SetToolCallContent(tcc []ToolCallContent) {
 	u.Content, _ = json.Marshal(tcc)
 }
 
-
-// SessionSessionInfoUpdate updates session metadata (title, timestamps).
-type SessionSessionInfoUpdate struct {
-	Meta    map[string]any `json:"_meta,omitempty"`
-	SessionUpdate string   `json:"sessionUpdate"` // "sessionInfoUpdate"
-	Title   *string        `json:"title,omitempty"`
-	MetaData map[string]any `json:"meta,omitempty"`
-}
 
 // ── Cost / usage ──
 

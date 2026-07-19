@@ -32,6 +32,7 @@ type AgentHandler interface {
 	OnSetSessionMode(ctx context.Context, req SetSessionModeRequest) (*SetSessionModeResponse, error)
 	OnSetSessionConfigOption(ctx context.Context, req SetSessionConfigOptionRequest) (*SetSessionConfigOptionResponse, error)
 	OnPrompt(ctx context.Context, req PromptRequest, sender SessionEventSender) (*PromptResponse, error)
+	OnLogout(ctx context.Context, req LogoutRequest) (*LogoutResponse, error)
 	OnCancel(ctx context.Context, sid SessionId) error
 	OnAuthenticate(ctx context.Context, req AuthenticateRequest) (*AuthenticateResponse, error)
 }
@@ -272,6 +273,12 @@ func (m *mux) route(msg jsonrpcMessage) {
 		if isReq {
 			dispatch(m, msg, func(ctx context.Context, req SetSessionConfigOptionRequest) (*SetSessionConfigOptionResponse, error) {
 				return m.handler.OnSetSessionConfigOption(ctx, req)
+			})
+		}
+	case "logout":
+		if isReq {
+			dispatch(m, msg, func(ctx context.Context, req LogoutRequest) (*LogoutResponse, error) {
+				return m.handler.OnLogout(ctx, req)
 			})
 		}
 	case "session/cancel":
@@ -578,10 +585,14 @@ func (s *promptSender) SendToolCall(tc ToolCallUpdate) error {
 	if tc.Status != "" && tc.Status != "pending" {
 		su = "tool_call_update"
 	}
+	var t *string
+	if tc.Title != "" {
+		t = &tc.Title
+	}
 	u := SessionUpdate{
 		SessionUpdate: su,
 		ToolCallID:    tc.ToolCallID,
-		Title:         tc.Title,
+		Title:         t,
 		Kind:          tc.Kind,
 		Status:        tc.Status,
 		RawInput:      tc.RawInput,
@@ -623,14 +634,12 @@ func (s *promptSender) SendSessionInfo(title string, metadata map[string]any) er
 	if title != "" {
 		t = &title
 	}
-	s.send(SessionUpdate{
+	su := SessionUpdate{
 		SessionUpdate: "session_info_update",
-		SessionInfoUpdate: &SessionSessionInfoUpdate{
-			SessionUpdate: "sessionInfoUpdate",
-			Title:         t,
-			MetaData:      metadata,
-		},
-	})
+		Title:         t,
+		Meta:          metadata,
+	}
+	s.send(su)
 	return nil
 }
 

@@ -264,6 +264,16 @@ func (s *Session) Cancel(ctx context.Context, sessionID string) error {
 	return s.notify(ctx, "session/cancel", CancelNotification{SessionID: sessionID})
 }
 
+// Logout ends the current authenticated state. Must only be called when the
+// Agent advertised auth.logout capability.
+func (s *Session) Logout(ctx context.Context) (*LogoutResponse, error) {
+	var resp LogoutResponse
+	if err := s.call(ctx, "logout", LogoutRequest{}, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 // Close kills the agent subprocess and releases resources. Call when the
 // client is done with the connection.
 func (s *Session) Close() error {
@@ -375,6 +385,8 @@ type EventHandler interface {
 	OnAgentMessage(text string)
 	// OnAgentThought — sessionUpdate "agent_thought_chunk".
 	OnAgentThought(text string)
+	// OnUserMessage — sessionUpdate "user_message_chunk" (during session/load history replay).
+	OnUserMessage(text string)
 	// OnToolCall — sessionUpdate "tool_call" / "tool_call_update".
 	OnToolCall(tc ToolCallUpdate)
 	// OnPlan — sessionUpdate "plan".
@@ -534,12 +546,38 @@ func (s *Session) writeRPCResponse(id json.RawMessage, result any, err error) {
 	s.writeMu.Unlock()
 }
 
-// dispatchNotif routes a session/update notification to the EventHandler.
+// dispatchNotif routes a incoming notification to the EventHandler.
 // Unrecognized notification methods are silently ignored per ACP spec.
 func (s *Session) dispatchNotif(method string, params json.RawMessage) {
-	if method != "session/update" {
+	switch method {
+	case "session/update":
+		s.dispatchSessionUpdate(params)
+	case "$/cancel_request":
+		s.handleCancelRequestNotif(params)
+	}
+}
+
+// handleCancelRequestNotif handles an incoming $/cancel_request notification
+// from the agent.  The agent is asking us to cancel an in-flight client→agent
+// request.  We cancel the pending call so the blocked goroutine unblocks with
+// a context-cancelled error.
+func (s *Session) handleCancelRequestNotif(params json.RawMessage) {
+	var notif CancelRequestNotification
+	if json.Unmarshal(params, &notif) != nil {
 		return
 	}
+	s.mu.Lock()
+	call := s.pending[notif.RequestID]
+	s.mu.Unlock()
+	if call != nil {
+		// Deliver a synthetic cancellation error so the blocked caller
+		// returns promptly.
+		call.resp.Error = &Error{Code: ErrorCodeRequestCancelled, Message: "request cancelled by agent"}
+		close(call.done)
+	}
+}
+
+func (s *Session) dispatchSessionUpdate(params json.RawMessage) {
 	var notif SessionNotification
 	if json.Unmarshal(params, &notif) != nil {
 		return
@@ -561,9 +599,17 @@ func (s *Session) dispatchNotif(method string, params json.RawMessage) {
 		if cb := u.ContentAsBlock(); cb != nil {
 			h.OnAgentThought(cb.Text)
 		}
+	case "user_message_chunk":
+		if cb := u.ContentAsBlock(); cb != nil {
+			h.OnUserMessage(cb.Text)
+		}
 	case "tool_call", "tool_call_update":
+		title := ""
+		if u.Title != nil {
+			title = *u.Title
+		}
 		h.OnToolCall(ToolCallUpdate{
-			ToolCallID: u.ToolCallID, Title: u.Title,
+			ToolCallID: u.ToolCallID, Title: title,
 			Kind: u.Kind, Status: u.Status,
 			RawInput: u.RawInput, RawOutput: u.RawOutput,
 			Content: u.ContentAsToolCallContent(), Locations: u.Locations,
@@ -587,13 +633,9 @@ func (s *Session) dispatchNotif(method string, params json.RawMessage) {
 		h.OnUsageUpdate(used, total, u.Cost)
 	case "session_info_update":
 		title := ""
-		md := map[string]any{}
-		if u.SessionInfoUpdate != nil {
-			if u.SessionInfoUpdate.Title != nil {
-				title = *u.SessionInfoUpdate.Title
-			}
-			md = u.SessionInfoUpdate.MetaData
+		if u.Title != nil {
+			title = *u.Title
 		}
-		h.OnSessionInfo(title, md)
+		h.OnSessionInfo(title, u.Meta)
 	}
 }
