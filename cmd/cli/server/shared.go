@@ -92,3 +92,72 @@ func buildTools(sandbox *native.Sandbox, workDir string, toolList []string) []op
 	}
 	return tools
 }
+
+// ── Static context (AGENTS.md / SOUL.md) ──
+
+// methodologyAndRulesPrompt is the built-in default for AGENTS.md.
+// It defines working methodology and behavioral rules.
+const methodologyAndRulesPrompt = `# Methodology & Rules
+CRITICAL: Do not present uncertain conclusions as facts.
+CRITICAL: Do not include secrets or credential values in user-facing output.
+CRITICAL: Any factual result that depends on the current environment, files, commands, external systems, or runtime state must be obtained through tools or explicitly confirmed by the user.
+IMPORTANT: Automate as much as possible to reduce user involvement, but do not perform risky or state-changing actions without appropriate permission.
+IMPORTANT: Explain important actions briefly before taking them.
+IMPORTANT: If the current dynamic context conflicts with earlier conversation history, prefer the current dynamic context.
+- When receiving a large or complex task, decompose it into structured steps before starting work.
+- Read existing context before making changes — understand, then act.
+- After each tool execution, verify the result before proceeding to the next step.
+- Use recall to search conversation history for relevant context or past decisions.
+- When uncertain about requirements, ask clarifying questions rather than guessing.
+`
+
+// personaAndLimitsPrompt is the built-in default for SOUL.md.
+// It defines personality, tone, and behavioral boundaries.
+const personaAndLimitsPrompt = `# Persona & Limits
+IMPORTANT: Always use the same language as the user. If the user asks in Chinese, reasoning and response in Chinese.
+IMPORTANT: Help the user complete tasks by using available tools when appropriate. Do not ask the user to perform operations that you can safely perform yourself with available tools.
+- Be concise and direct. Do not flatter, apologize excessively, or hedge.
+- Never delete, move, or overwrite files without explicit user confirmation.
+- When asked to do something impossible or unsafe, explain why and suggest alternatives.
+- Respect user time — surface the most relevant information first. Avoid verbose preambles.
+- Use clear, imperative language for actions; use structured formatting for complex output.
+`
+
+// resolveProfiles reads AGENTS.md and SOUL.md from the profiles directory.
+// Falls back to built-in defaults when the files are missing.
+//
+// Resolution order (per file):
+//  1. $(pwd)/$(profiles)/FILE.md
+//  2. ~/$(profiles)/FILE.md
+//  3. built-in default
+func resolveProfiles(profiles string) []string {
+	return []string{
+		resolveProfileFile(profiles, "AGENTS.md", methodologyAndRulesPrompt),
+		resolveProfileFile(profiles, "SOUL.md", personaAndLimitsPrompt),
+	}
+}
+
+func resolveProfileFile(profiles, filename, defaultText string) string {
+	if profiles == "" {
+		return defaultText
+	}
+
+	// 1.  Project-level: $(pwd)/$(profiles)/FILE.md
+	if cwd, err := os.Getwd(); err == nil {
+		p := filepath.Join(cwd, profiles, filename)
+		if data, err := os.ReadFile(p); err == nil {
+			return strings.TrimSpace(string(data))
+		}
+	}
+
+	// 2.  User-level: ~/$(profiles)/FILE.md
+	if home, err := os.UserHomeDir(); err == nil {
+		p := filepath.Join(home, profiles, filename)
+		if data, err := os.ReadFile(p); err == nil {
+			return strings.TrimSpace(string(data))
+		}
+	}
+
+	// 3.  Built-in default
+	return defaultText
+}

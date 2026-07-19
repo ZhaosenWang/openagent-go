@@ -13,6 +13,7 @@ type Config struct {
 	Provider  map[string]ProviderConfig `json:"provider,omitempty"`
 	Server    ServerConfig              `json:"server,omitempty"`
 	Plugins   []string                  `json:"plugins,omitempty"`
+	Profiles  string                    `json:"profiles,omitempty"`
 	Env       map[string]string         `json:"env,omitempty"`
 }
 
@@ -66,6 +67,9 @@ func applyDefaults(cfg *Config) {
 	}
 	if len(cfg.Plugins) == 0 {
 		cfg.Plugins = []string{DefaultPluginsDir()}
+	}
+	if cfg.Profiles == "" {
+		cfg.Profiles = ".openagent/profile"
 	}
 	if cfg.Server.Port == 0 {
 		cfg.Server.Port = 8080

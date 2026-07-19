@@ -48,7 +48,7 @@ func RunREST(ctx context.Context, cfg *config.Config) error {
 	agent := openagent.NewAgent("openagent",
 		openagent.WithModel(m),
 		openagent.WithMemory(mem),
-		openagent.WithSystemPrompts("You are a helpful AI assistant."),
+		openagent.WithSystemPrompts(resolveProfiles(cfg.Profiles)...),
 		openagent.WithTools(tools...),
 		openagent.WithMaxTurns(10),
 	)

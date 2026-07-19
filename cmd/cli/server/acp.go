@@ -59,7 +59,7 @@ func RunACP(ctx context.Context, cfg *config.Config) error {
 	// different mount path than the host.
 	agent := openagent.NewAgent("openagent",
 		openagent.WithMemory(mem),
-		openagent.WithSystemPrompts("You are a helpful AI assistant. Use tools to read, write, and execute code when needed."),
+		openagent.WithSystemPrompts(resolveProfiles(cfg.Profiles)...),
 		openagent.WithMaxTurns(10),
 	)
 
