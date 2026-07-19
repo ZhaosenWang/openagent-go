@@ -81,7 +81,7 @@ func main() {
 	var sandboxTools []openagent.Tool
 	if err == nil {
 		sandboxTools = []openagent.Tool{
-			tool.NewShell(sandbox, workDir),
+			tool.NewShell(sandbox),
 			tool.NewReadFile(workDir),
 			tool.NewWriteFile(workDir),
 			tool.NewListDir(workDir),

@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"log"
-	"os"
 	"path/filepath"
 
 	"github.com/yusheng-g/openagent-go/acp"
@@ -48,28 +47,29 @@ func RunACP(ctx context.Context, cfg *config.Config) error {
 		modelMap[key] = mi.Model
 	}
 
-	workDir, _ := os.Getwd()
-	var tools []openagent.Tool
-	if sb, err := native.New(workDir); err == nil {
-		tools = buildTools(sb, workDir, []string{"shell", "read", "write", "ls", "grep"})
-	} else {
-		log.Printf("WARNING: sandbox unavailable, tools disabled: %v", err)
-	}
-
 	// Enable summarizer with the first model as summarization backend.
 	if len(modelInfos) > 0 {
 		m := modelInfos[0].Model
 		mem.WithSummarizer(summarizer.New(m))
 	}
 
+	// Tools and sandbox are created per-turn in agentForTurn so they
+	// use the session's cwd rather than the process working directory.
+	// This is essential when the agent runs in a container with a
+	// different mount path than the host.
 	agent := openagent.NewAgent("openagent",
 		openagent.WithMemory(mem),
 		openagent.WithSystemPrompts("You are a helpful AI assistant. Use tools to read, write, and execute code when needed."),
-		openagent.WithTools(tools...),
 		openagent.WithMaxTurns(10),
 	)
 
 	srv := acp.NewAgentServer(agent, mem, sessionStore, modelMap)
+	srv.ToolFactory = func(cwd string) []openagent.Tool {
+		if sb, err := native.New(cwd); err == nil {
+			return buildTools(sb, cwd, []string{"shell", "read", "write", "ls", "grep"})
+		}
+		return nil
+	}
 	server := openacpsdk.NewServer("openagent-acp", "1.0.0", srv)
 	log.Println("ACP server starting on stdio")
 	return server.Run(ctx)

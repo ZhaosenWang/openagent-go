@@ -76,7 +76,7 @@ func buildTools(sandbox *native.Sandbox, workDir string, toolList []string) []op
 	}
 	var tools []openagent.Tool
 	if enabled["shell"] {
-		tools = append(tools, opentool.NewShell(sandbox, workDir))
+		tools = append(tools, opentool.NewShell(sandbox))
 	}
 	if enabled["read"] {
 		tools = append(tools, opentool.NewReadFile(workDir))

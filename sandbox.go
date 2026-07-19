@@ -26,4 +26,9 @@ type Result struct {
 // See tool/shell.go for the canonical consumer.
 type Sandbox interface {
 	Run(ctx context.Context, cmd Command) (Result, error)
+
+	// CWD returns the working directory from the tool's perspective.
+	// This may differ from the host path when the sandbox remaps
+	// paths (e.g. bwrap maps host dir → /workspace).
+	CWD() string
 }

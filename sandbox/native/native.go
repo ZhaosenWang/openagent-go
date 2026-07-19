@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 
 	openagent "github.com/yusheng-g/openagent-go"
@@ -41,8 +42,16 @@ func New(workDir string) (*Sandbox, error) {
 	return &Sandbox{workDir: abs}, nil
 }
 
-// WorkDir returns the sandbox workspace path.
-func (s *Sandbox) WorkDir() string { return s.workDir }
+// CWD implements openagent.Sandbox. Returns the path as seen from
+// inside the sandbox, not the host path. bwrap maps s.workDir to
+// /workspace; unconfined mode preserves the original path.
+// Callers should check for bwrap the same way confineAndRun does.
+func (s *Sandbox) CWD() string {
+	if _, err := exec.LookPath("bwrap"); err == nil {
+		return "/workspace"
+	}
+	return s.workDir
+}
 
 // Run executes cmd in a sandboxed child process.
 // Calls the platform-specific confineAndRun (build-tagged per OS).

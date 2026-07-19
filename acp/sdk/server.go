@@ -278,7 +278,12 @@ func (m *mux) route(msg jsonrpcMessage) {
 		}
 	case "session/prompt":
 		if isReq {
-			m.handlePrompt(msg)
+			// Run in a goroutine so the serve loop continues
+			// reading stdin. Without this, Agent→Client RPC
+			// (permission requests, fs reads, terminal) deadlocks:
+			// the response arrives on stdin but serve() is
+			// blocked in route() waiting for OnPrompt to return.
+			go m.handlePrompt(msg)
 		}
 	case "session/set_mode":
 		if isReq {

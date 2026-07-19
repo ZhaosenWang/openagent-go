@@ -17,12 +17,11 @@ import (
 // Implements both [openagent.Tool] and [openagent.StreamExecutor].
 type Shell struct {
 	sandbox  openagent.Sandbox
-	workDir  string
 	language string
 }
 
-func NewShell(sandbox openagent.Sandbox, workDir string) *Shell {
-	return &Shell{sandbox: sandbox, workDir: workDir}
+func NewShell(sandbox openagent.Sandbox) *Shell {
+	return &Shell{sandbox: sandbox}
 }
 
 func (t *Shell) WithLanguage(lang string) *Shell {
@@ -35,11 +34,10 @@ func (t *Shell) Definition() openagent.FunctionDefinition {
 	if t.language != "" {
 		desc = fmt.Sprintf("Execute a shell command in a %s sandbox. CWD is the workspace root.", t.language)
 	}
-	if t.workDir != "" {
-		desc += fmt.Sprintf(" (CWD: %s)", t.workDir)
-	}
 	if t.sandbox == nil {
 		desc += " [UNAVAILABLE: no sandbox configured]"
+	} else if cwd := t.sandbox.CWD(); cwd != "" {
+		desc += fmt.Sprintf(" (CWD: %s)", cwd)
 	}
 	return openagent.FunctionDefinition{
 		Name:        "shell",
@@ -89,7 +87,7 @@ func (t *Shell) Execute(ctx context.Context, args json.RawMessage) (string, erro
 	result, err := t.sandbox.Run(ctx, openagent.Command{
 		Program: "/bin/bash",
 		Args:    []string{"-c", params.Command},
-		WorkDir: t.workDir,
+		WorkDir: t.sandbox.CWD(),
 	})
 	if err != nil {
 		return "", err
@@ -126,7 +124,7 @@ func (t *Shell) ExecuteStream(ctx context.Context, args json.RawMessage) <-chan 
 		return sr.RunStream(ctx, openagent.Command{
 			Program: "/bin/bash",
 			Args:    []string{"-c", params.Command},
-			WorkDir: t.workDir,
+			WorkDir: t.sandbox.CWD(),
 		})
 	}
 

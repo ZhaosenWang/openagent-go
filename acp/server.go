@@ -46,6 +46,10 @@ type AgentServer struct {
 
 	// defaultModelID is used when the session config hasn't selected one.
 	defaultModelID string
+
+	// ToolFactory is called per-turn to create tools scoped to the
+	// session cwd. If nil, only plan + MCP + client-RPC tools are used.
+	ToolFactory func(cwd string) []openagent.Tool
 }
 
 // agentSession holds per-session runtime state.
@@ -687,6 +691,21 @@ func (s *AgentServer) OnSetSessionConfigOption(ctx context.Context, req openacp.
 		}
 	}
 
+	// Sync session mode when the client sets the "mode" config option
+	// (most clients use set_config_option rather than set_mode).
+	if req.ConfigID == "mode" {
+		if v, ok := ss.config["mode"].(string); ok {
+			ss.mode = v
+			s.saveMode(ctx, string(req.SessionID), v)
+			if s.updateSender != nil {
+				s.updateSender.SendSessionUpdate(req.SessionID, openacp.SessionUpdate{
+					SessionUpdate: "current_mode_update",
+					CurrentModeID: openacp.SessionModeId(v),
+				})
+			}
+		}
+	}
+
 	// Notify clients of the config change.
 	opts := s.buildConfigOptions(req.SessionID)
 	if s.updateSender != nil {
@@ -796,9 +815,6 @@ func (s *AgentServer) OnPrompt(ctx context.Context, req openacp.PromptRequest, s
 	}
 
 	// ── Run the agent ──
-	// Single code path for all modes. Mode differences are handled
-	// upstream: system prompt (agentForTurn overlays mode-specific
-	// instructions) and config options (thought_level).
 	ch := agent.RunStream(ctx, oaSession, input)
 	var usage openagent.Usage
 	var stopReason openacp.StopReason
@@ -818,7 +834,7 @@ func (s *AgentServer) OnPrompt(ctx context.Context, req openacp.PromptRequest, s
 				for _, tc := range evt.Message.ToolCalls {
 					sender.SendToolCall(openacp.ToolCallUpdate{
 						ToolCallID: tc.ID,
-						Title:      tc.Function.Name,
+						Title:      toolTitle(tc.Function.Name, tc.Function.Arguments),
 						Kind:       "execute",
 						Status:     "pending",
 						RawInput:   json.RawMessage(tc.Function.Arguments),
@@ -1032,6 +1048,15 @@ func (s *AgentServer) agentForTurn(sid openacp.SessionId) *openagent.Agent {
 
 		// Inject MCP tools from all connected servers.
 		clone.Tools = append(clone.Tools, ss.mcpTools...)
+
+		// Create per-turn tools scoped to the session's cwd.
+	// This ensures tools see the correct working directory
+	// even when the process cwd differs (e.g. Docker mounts).
+	if s.ToolFactory != nil && ss.cwd != "" {
+		if tools := s.ToolFactory(ss.cwd); len(tools) > 0 {
+			clone.Tools = append(clone.Tools, tools...)
+		}
+	}
 	}
 
 	// Inject Agent→Client RPC tools when the client supports them.
@@ -1194,6 +1219,47 @@ func firstLine(s string, maxLen int) string {
 		return s[:maxLen] + "..."
 	}
 	return s
+}
+
+// toolTitle builds a human-readable title for an ACP tool_call update.
+// Extracts the most informative field from the tool arguments JSON.
+func toolTitle(name string, args string) string {
+	var params struct {
+		Path    string `json:"path"`
+		Command string `json:"command"`
+		Query   string `json:"query"`
+	}
+	if err := json.Unmarshal([]byte(args), &params); err != nil {
+		return name
+	}
+	switch name {
+	case "read", "write", "ls":
+		if params.Path != "" {
+			return name + " " + params.Path
+		}
+	case "shell":
+		if params.Command != "" {
+			return name + ": " + truncateToolArg(params.Command, 60)
+		}
+	case "grep":
+		if params.Query != "" {
+			return name + " " + params.Query
+		}
+	case "recall":
+		if params.Query != "" {
+			return name + " " + params.Query
+		}
+	}
+	return name
+}
+
+// truncateToolArg truncates s to n characters, adding "..." at the end.
+func truncateToolArg(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= n {
+		return s
+	}
+	return s[:n-3] + "..."
 }
 
 // finishReasonToACP maps model finish reasons to ACP stop reasons.
