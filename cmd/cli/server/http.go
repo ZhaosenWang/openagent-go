@@ -64,6 +64,11 @@ func RunREST(ctx context.Context, cfg *config.Config) error {
 		handler.RegisterModel(mi.ID, mi.Model, mi.Provider)
 	}
 
+	// Start IM channels in the background.
+	if err := RunChannels(ctx, agent, cfg.Channels); err != nil {
+		log.Printf("channel: %v", err)
+	}
+
 	mux := http.NewServeMux()
 	handler.Register(mux)
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {

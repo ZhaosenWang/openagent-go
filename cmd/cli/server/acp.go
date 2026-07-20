@@ -71,6 +71,12 @@ func RunACP(ctx context.Context, cfg *config.Config) error {
 		return nil
 	}
 	server := openacpsdk.NewServer("openagent-acp", "1.0.0", srv)
+
+	// Start IM channels in the background.
+	if err := RunChannels(ctx, agent, cfg.Channels); err != nil {
+		log.Printf("channel: %v", err)
+	}
+
 	log.Println("ACP server starting on stdio")
 	return server.Run(ctx)
 }

@@ -12,6 +12,7 @@ type Config struct {
 	FastModel string                    `json:"fast_model,omitempty"`
 	Provider  map[string]ProviderConfig `json:"provider,omitempty"`
 	Server    ServerConfig              `json:"server,omitempty"`
+	Channels  ChannelsConfig            `json:"channels,omitempty"`
 	Plugins   []string                  `json:"plugins,omitempty"`
 	Profiles  string                    `json:"profiles,omitempty"`
 	Env       map[string]string         `json:"env,omitempty"`
@@ -25,6 +26,18 @@ type ProviderConfig struct {
 
 type ServerConfig struct {
 	Port int `json:"port,omitempty"`
+}
+
+// ChannelsConfig holds per-platform IM channel configuration.
+type ChannelsConfig struct {
+	Feishu *FeishuConfig `json:"feishu,omitempty"`
+}
+
+// FeishuConfig holds credentials for a Feishu (Lark) App Bot.
+// https://open.feishu.cn/document/home/develop-a-bot-in-5-minutes
+type FeishuConfig struct {
+	AppID     string `json:"app_id"`
+	AppSecret string `json:"app_secret"`
 }
 
 // Path returns the config file path. Respects OPENAGENT_CLI_CONFIG env var.
