@@ -13,6 +13,7 @@ mod ffi {
         pub fn log_info(mp: u32, ml: u32);
         pub fn log_warn(mp: u32, ml: u32);
         pub fn log_error(mp: u32, ml: u32);
+        pub fn utc_now() -> u64;
     }
 }
 
@@ -69,6 +70,11 @@ fn find_u32(d: &[u8], k: &[u8]) -> u32 {
 pub fn log_info(msg: &str) { unsafe { ffi::log_info(msg.as_ptr() as u32, msg.len() as u32) } }
 pub fn log_warn(msg: &str) { unsafe { ffi::log_warn(msg.as_ptr() as u32, msg.len() as u32) } }
 pub fn log_error(msg: &str) { unsafe { ffi::log_error(msg.as_ptr() as u32, msg.len() as u32) } }
+
+/// Returns the current UTC time in nanoseconds since Unix epoch.
+pub fn utc_now() -> u64 {
+    unsafe { ffi::utc_now() }
+}
 
 fn find_body(d: &[u8]) -> usize {
     let pat = b"\"body\":\"";

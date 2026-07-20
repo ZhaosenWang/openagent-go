@@ -3,6 +3,7 @@ package wasmhost
 import (
 	"context"
 	"encoding/json"
+	"time"
 
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
@@ -120,6 +121,12 @@ func (h *HostAPI) RegisterHostModule(ctx context.Context, rt wazero.Runtime) err
 			h.Logger.Error(msg)
 		}).
 		Export("log_error").
+
+		NewFunctionBuilder().
+		WithFunc(func(_ context.Context, _ api.Module) uint64 {
+			return uint64(time.Now().UnixNano())
+		}).
+		Export("utc_now").
 
 		Instantiate(ctx)
 	return err
