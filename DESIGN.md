@@ -8,7 +8,7 @@ openagent-go is a **fully pluggable**, open-source AI agent framework in Go. The
 
 **Design principles:**
 
-- Follow industry standards (OpenAI API shape); no custom protocols
+- Follow industry standards (OpenAI API shape, ACP v1 protocol); no custom protocols
 - The Runner is the sole mediator — modules never call each other
 - No module configured = capability absent; nil means skip that node
 - Avoid code bloat: think first, build second, no speculative abstractions
@@ -32,12 +32,13 @@ Agent.Run(ctx, session, input)
   │
   ├─ turn 1 only:
   │   ① Memory.Compact()    ← token-based compaction (Runner-driven)
- │      Memory.Recent()    ← pure query, no side effects
+  │      Memory.Recent()    ← pure query, no side effects
   │   ③ Guard.in.Check()    ← input safety check
   │
   └─ for turn in 1..maxTurns:
       ② PromptBuilder() or defaultBuildPrompt()
-         ├─ system instructions
+         ├─ system prompts (static: SystemPrompts)
+         ├─ dynamic context (per-turn: plan entries, mode)
          ├─ compressed summary + hints (auto-injected)
          ├─ skill catalog + loaded skills
          └─ working messages
@@ -54,6 +55,15 @@ Agent.Run(ctx, session, input)
 
 Each node: `if module != nil { module.Call(...) }`.
 
+**Two-layer prompt model:**
+
+| Layer | Source | Content |
+|-------|--------|---------|
+| Static | `Agent.SystemPrompts` + `Description` | Fixed instructions, set at construction |
+| Dynamic | `Session.DynamicContext` | Plan entries, mode instructions — rebuilt each turn |
+
+The Runner passes `Session.DynamicContext` through to `PromptInput` → `defaultBuildPrompt`. The ACP layer builds it from session runtime state.
+
 ---
 
 ## Core Types
@@ -62,20 +72,22 @@ Each node: `if module != nil { module.Call(...) }`.
 
 ```go
 type Agent struct {
-    Name, Description, Instructions string
-    Model       Model
-    Tools       []Tool
-    Memory      Memory
-    Prompt      PromptBuilder    // nil = default
-    InGuard     InputGuard
-    OutGuard    OutputGuard
-    Approver    Approver
-    Hooks       RunHooks
-    Observer    RunObserver      // nil = no stage events
-    SkillLoader SkillLoader
-    MaxTurns    int             // default 20
-    MaxWorkingTokens    int    // default 0 = 70% of context window
-    MaxCompressedTokens int    // default 2048
+    Name, Description string
+    SystemPrompts   []string   // static system prompts (replaces single Instructions)
+    Model           Model
+    Tools           []Tool
+    Memory          Memory
+    Prompt          PromptBuilder    // nil = default
+    InGuard         InputGuard
+    OutGuard        OutputGuard
+    Approver        Approver
+    Hooks           RunHooks
+    Observer        RunObserver      // nil = no stage events
+    SkillLoader     SkillLoader
+    MaxTurns        int             // default 20
+    MaxWorkingTokens    int         // default 0 = 70% of context window
+    MaxCompressedTokens int         // default 2048
+    ReasoningEffort    string       // "none","minimal","low","medium","high","xhigh"
 }
 
 agent.Run(ctx, session, input) → (*RunResult, error)
@@ -85,7 +97,7 @@ agent.RunGoalStream(ctx, session, goal) → <-chan StreamEvent
 agent.Clone() → *Agent
 ```
 
-The Runner is private — `Agent.Run()` creates it internally.
+The Runner is private — `Agent.Run()` creates it internally. `Clone()` returns a shallow copy with an independent Tools backing array; used by `AgentServer.agentForTurn()` for per-session isolation.
 
 ### StreamEvent
 
@@ -107,11 +119,13 @@ const (
 
 ```go
 type Session struct {
-    ID, UserID, ModelID   string
-    Temperature, MaxTokens float64 / int
+    ID, UserID, ModelID     string
+    Temperature, MaxTokens  float64 / int
     UserProfile, ProjectContext string
-    Turn                         int
-    CreatedAt                    time.Time
+    DynamicContext              string  // per-turn plan + mode context (ACP layer builds)
+    Turn                        int
+    CreatedAt                   time.Time
+    Metadata                    map[string]any
 }
 ```
 
@@ -126,7 +140,7 @@ Pure data carrier. The application layer owns CRUD. The Runner does not create S
 ```
 Layer 1: Working    — Recent() pure query; Runner manages token budget via MaxWorkingTokens
 Layer 2: Compressed — Compressed() auto-injected; Compact() incremental/rolling via Summarizer
-Layer 3: Archive    — Search() + recall_memory tool; original messages NEVER deleted
+Layer 3: Archive    — Search() + recall tool; original messages NEVER deleted
 ```
 
 ```go
@@ -143,13 +157,14 @@ type Memory interface {
 ```
 
 The Runner drives compaction via token budget. It counts tokens backward from the
-most recent message against MaxWorkingTokens (default: 70% of model context window),
-adjusts to a safe boundary (not cutting tool_call/tool_result pairs via
-SafeCompressionBoundary), and calls Compact(). The backend compresses only newly
-overflowed messages with the previous summary for incremental/rolling compression.
-Original messages are NEVER deleted.
+most recent message against MaxWorkingTokens (default: 70% of model context window,
+minus fixed prompt overhead from `estimatePromptOverhead`), adjusts to a safe
+boundary (not cutting tool_call/tool_result pairs via SafeCompressionBoundary), and
+calls Compact(). The backend compresses only newly overflowed messages with the
+previous summary for incremental/rolling compression. Original messages are NEVER deleted.
 
-Implementations: `memory/file` (JSONL, zero-dependency), `memory/sqlite` (SQLite + FTS5, optional vector search via `WithEmbedder`).
+Implementations: `memory/file` (JSONL, zero-dependency), `memory/sqlite` (SQLite + FTS5,
+CJK tokenizer, optional vector search via `WithEmbedder`).
 
 ### Summarizer (Memory dependency)
 
@@ -159,9 +174,8 @@ type Summarizer interface {
 }
 ```
 
-nil = no compaction. Configured on Memory via `WithSummarizer()`.
-When previous is non-nil, this is incremental/rolling compression — the implementation
-should preserve existing facts and incorporate new messages.
+nil = no compaction. Configured on Memory via `WithSummarizer()`. Implementation:
+`summarizer/llm.go` — LLM-based incremental compression using the agent's Model.
 
 ### Embedder (Memory dependency)
 
@@ -187,6 +201,7 @@ type PromptInput struct {
     AvailableSkills   []SkillInfo
     LoadedSkills      map[string]string
     UserProfile, ProjectContext string
+    DynamicContext    string   // per-turn plan + mode info
 }
 ```
 
@@ -222,6 +237,8 @@ type Model interface {
 ```
 
 Implementation: `model/openai` (openai-go v3 SDK). Streaming preferred, non-streaming fallback.
+`ChatCompletionRequest` carries `ReasoningEffort` — passed through from `Agent.ReasoningEffort`
+to the model's `reasoning_effort` parameter (OpenAI o-series, Anthropic extended thinking).
 
 ### Tool
 
@@ -236,13 +253,25 @@ type StreamExecutor interface {
 }
 ```
 
-Built-in tools: `shell`, `read`, `write`, `ls`, `grep` (in `tool/` package). Auto-injected tools: `use_skill`, `reload_skills`, `recall_memory`, `subagent`. WASM tool plugins via `plugin/agent/wasm`.
+Built-in tools: `shell`, `read`, `write`, `ls`, `grep` (in `tool/` package). Auto-injected tools:
+`use_skill`, `reload_skills`, `recall`, `subagent`. ACP RPC tools: `read_client_file`,
+`write_client_file`, `terminal_create`/`output`/`wait`/`kill`/`release` (Agent→Client).
+Plan tools: `plan_create`, `plan_update` (LLM outputs structured plan entries via function-calling).
 
-**Subagent tool:** The `subagent` built-in tool lets the model dynamically spawn temporary sub-agents at runtime — `subagent(name, description, prompt, task)`. The sub-agent runs with the caller's tools (minus subagent itself), no Approver, no Memory, limited turns. Results stream back as `StreamToolProgress` events. Safe by construction: noSpawn prevents recursion.
+**Subagent tool:** The `subagent` built-in tool lets the model dynamically spawn temporary sub-agents at runtime — `subagent(name, description, prompt, task)`. The sub-agent runs with the caller's tools (minus subagent itself), no Approver, no Memory, limited turns.
 
-**AsTool():** For pre-configured agents with specific tool subsets: `coder.AsTool()` wraps the agent as a Tool. The sub-agent gets MaxTurns=3, no Approver, no Memory, noSpawn, and stripped agent-spawning tools.
+**Two-phase execution:** When an Approver is configured, tools are first approved sequentially, then approved tools execute concurrently.
 
-**Two-phase execution:** When an Approver is configured, tools are first approved sequentially (user clicks through dialogs quickly), then approved tools execute concurrently in goroutines. Before this, tool execution was serial under approval.
+### Sandbox
+
+```go
+type Sandbox interface {
+    Run(ctx context.Context, cmd Command) (Result, error)
+    CWD() string    // working dir from the tool's perspective (may differ from host path)
+}
+```
+
+`CWD()` returns the path as seen from inside the sandbox — `/workspace` under bwrap, host path otherwise. Shell tool reads its working directory from the sandbox rather than carrying its own. Implementation: `sandbox/native` (Linux bwrap, macOS Seatbelt).
 
 ### ⑥ Approver
 
@@ -252,7 +281,8 @@ type Approver interface {
 }
 ```
 
-nil = allow all. Implementations: `cmd/tui` (bubbletea v2 Y/N), `examples/backend` (SSE dialog with Allow Once / Allow Directory).
+nil = allow all. ACP mode bridges to the client via `session/request_permission` RPC.
+Implementations: `cmd/tui` (bubbletea v2 Y/N), `examples/backend` (SSE dialog).
 
 ### ⑦ RunHooks
 
@@ -265,9 +295,7 @@ type RunHooks interface {
 }
 ```
 
-Start methods return an opaque `any` value that the Runner passes to the corresponding End method. This lets implementations carry state from start to finish — OTEL creates a span in Start, defers End in the callback. slog captures `time.Now()` in Start and logs `time.Since()` in End. `result` and `err` are pointers so hooks can redact/truncate/inject metadata before memory storage.
-
-Aligned with OpenAI Agents SDK naming. Implementations: `hooks/slog`, `hooks/otel`.
+Start methods return an opaque `any` value passed to the corresponding End method. Implementations: `hooks/slog`, `hooks/otel`.
 
 ### RunObserver
 
@@ -275,17 +303,9 @@ Aligned with OpenAI Agents SDK naming. Implementations: `hooks/slog`, `hooks/ote
 type RunObserver interface {
     ObserveStage(ctx context.Context, event StageEvent)
 }
-
-type StageEvent struct {
-    Name     string         // "memory.fetch", "model.call", ...
-    Phase    string         // "enter" or "leave"
-    Detail   map[string]any // turn, tokens, tool name, ...
-    Duration time.Duration  // wall-clock on "leave"
-    Err      error
-}
 ```
 
-Per-stage enter/leave events with durations. Use for pipeline panels, tracing, monitoring. Multiple observers via `MultiObserver()`.
+Per-stage enter/leave events with durations. Multiple observers via `MultiObserver()`.
 
 ### Skill
 
@@ -296,30 +316,70 @@ type SkillLoader interface {
 }
 ```
 
-Workflow: Discover → inject catalog into prompt → model calls `use_skill(name)` → Load returns full body. `reload_skills` rescans and prunes removed skills. Implementation: `skill/fs`.
+Implementation: `skill/fs`.
 
 ---
 
-## Module Non-Interference
+## ACP v1 Protocol
 
-The Runner is the sole mediator. Modules never call each other:
+The agent speaks the Agent Client Protocol natively. An `AgentServer` wraps
+an `openagent.Agent` as an ACP-compliant handler:
 
-```
-Runner.compactIfNeeded:
-  → count tokens backward → adjust boundary → Memory.Compact()
-Runner.buildPrompt:
-  msgs = Memory.Recent()      ← pure query, no side effects
-  cc   = Memory.Compressed()
-  input = PromptInput{...}
-  result = PromptBuilder(input)
-
-Runner ferries data:
-  - Memory → PromptInput
-  - Tool.Execute result → Memory.Append
-  - Model response → Guard → Approver → Tool
+```go
+agent := openagent.NewAgent("bot", ...)
+srv := acp.NewAgentServer(agent, mem, store, models)
+server := openacpsdk.NewServer("openagent-acp", "1.0.0", srv)
+server.Run(ctx)  // blocks on stdin/stdout
 ```
 
-**Key:** `Embedder` and `Summarizer` are Memory dependencies, not Agent dependencies. They are configured on Memory at construction time.
+**Protocol layers:**
+
+| Layer | Package | Role |
+|-------|---------|------|
+| Types | `acp/sdk/` | ACP v1 schema — 958 lines, zero dependencies |
+| Transport | `acp/sdk/` | JSON-RPC 2.0 over stdio — mux, client session, Agent→Client RPC |
+| Integration | `acp/server.go` | AgentServer — session CRUD, prompt turns, plan mode, MCP, slash commands |
+
+**ACP modes:** `chat` (conversational with tools) and `plan` (structured planning via `plan_create`/`plan_update` tools). Model selection via config options — multiple models from the registry surfaced as select options.
+
+---
+
+## Plan Mode
+
+Plan mode uses `plan_create` and `plan_update` tools — the LLM outputs structured
+plan entries directly via function-calling arguments. No separate code path is needed.
+
+```
+User goal → agent.RunStream
+  → agent calls plan_create(goal, steps[{id, content, priority}])
+  → plan text enters conversation context
+  → agent calls plan_update(updates[{id, status}]) as it progresses
+  → plan entries persisted in SessionStore._meta["plan"]
+  → each turn: DynamicContext injects current plan state into system prompt
+```
+
+**Orchestrate** (`orchestrate/`) is separate — multi-agent DAG decomposition + parallel
+execution. Not ACP plan mode; used by the REST API for goal→DAG→execute pipelines.
+
+---
+
+## Slash Commands
+
+Server-side slash commands intercepted before they reach the agent:
+
+```
+/help      — list available commands
+/mode      — switch session mode (chat/plan)
+/model     — list or switch models
+/context   — show token usage
+/cwd       — show working directory
+/clear     — reset session messages
+/rename    — rename session title
+/sessions  — list all sessions
+```
+
+Commands are registered via `slash/` Registry and dispatched from `OnPrompt`. Unknown
+`/` commands fall through to the agent for natural language handling.
 
 ---
 
@@ -332,7 +392,7 @@ openagent-go/
 ├── model.go              Model, Embedder, Summarizer interfaces + request/response types
 ├── message.go            Message + ContentPart (multimodal)
 ├── tool.go               Tool interface + FunctionDefinition + StreamExecutor
-├── sandbox.go            Sandbox interface + Command/Result types
+├── sandbox.go            Sandbox interface + Command/Result types + CWD()
 ├── memory.go             Memory interface + CompressedContext
 ├── tokenizer/            Model-aware token counting (tiktoken)
 ├── prompt.go             PromptInput + PromptBuilder + RetrievalHint
@@ -344,45 +404,69 @@ openagent-go/
 ├── router.go             Router + FirstAgentRouter + LLMRouter
 ├── team.go               Team + TeamResult + HandoffEntry + handoffTool
 ├── options.go            WithXxx() AgentOption + TeamOption
-├── session.go            Session
+├── session.go            Session (+ DynamicContext)
 ├── doc.go                Package documentation
 │
 ├── tool/                 Built-in Tool implementations
-│   ├── shell.go          Shell: OS sandbox command execution with streaming
+│   ├── shell.go          Shell: OS sandbox command execution with streaming (CWD from sandbox)
 │   ├── file.go           ReadFile / WriteFile / ListDir (path traversal protection)
-│   └── grep.go           Grep: recursive file search
+│   ├── grep.go           Grep: recursive file search
+│   ├── acp_fs.go         ACPReadFile / ACPWriteFile (Agent→Client RPC)
+│   └── acp_terminal.go   ACPTerminal (create/output/wait/kill/release)
+│
+├── plan/                 Plan mode tools
+│   ├── entry.go          Entry + Priority + Status types
+│   └── tool.go           CreateTool (plan_create) + UpdateTool (plan_update)
+│
+├── slash/                Slash command registry
+│   └── slash.go          Registry, Context, Command, Handler
+│
+├── summarizer/           LLM-based compression
+│   └── llm.go            Compressor (implements Summarizer)
 │
 ├── sandbox/native/       OS-native sandbox
-│   ├── native.go         New() factory + public API
+│   ├── native.go         New() factory + CWD() + public API
 │   ├── native_darwin.go  macOS: sandbox-exec + Seatbelt profile
 │   ├── native_linux.go   Linux: bwrap namespace isolation
 │   └── native_windows.go Windows: stub
 │
+├── acp/                  ACP protocol integration
+│   ├── sdk/              ACP v1 SDK (types, JSON-RPC 2.0 mux, client)
+│   │   ├── types.go      958-line ACP v1 schema
+│   │   ├── server.go     Mux + AgentHandler interface + SessionEventSender
+│   │   ├── client.go     Client + Session + EventHandler
+│   │   └── doc.go        Package reference
+│   ├── server.go         AgentServer (Agent → ACP handler)
+│   └── commands.go       Built-in slash command registry
+│
+├── orchestrate/          Multi-agent DAG decomposition + execution
 ├── model/openai/         OpenAI model implementation
 ├── memory/file/          JSONL file memory
-├── memory/sqlite/        SQLite + FTS5 + vector search
+├── memory/sqlite/        SQLite + FTS5 + CJK tokenizer + vector search
 ├── guard/llm/            LLM-as-judge guard
 ├── hooks/slog/           slog logger hooks
 ├── hooks/otel/           OpenTelemetry tracing hooks
 ├── skill/fs/             Filesystem skill loader
-├── plugin/wasmhost/            Shared WASM host layer (ABI + host module)
-├── plugin/agent/wasm/          Agent WASM plugin runtime
-├── plugin/cli/                 CLI plugin host + WASM runtime
-├── plugin/sdk/rust/            Plugin SDK (Rust crate for plugin authors)
-├── acp/                        ACP protocol integration (Agent ↔ IDE)
-│   ├── sdk/                    ACP v1 SDK (pure stdlib, zero deps)
-│   └── server.go               AgentServer (openagent Agent → ACP AgentHandler)
-├── mcp/                        MCP protocol (tool interoperability)
-├── orchestrate/                Goal → DAG → parallel execution + replan
-├── eventbus/                   Generic pub/sub with history replay
-├── session/                    Session metadata types + persistent Store
-│   ├── sqlite/                 SQLite session store
-│   └── file/                   File-based session store
-├── rest/                       REST API (HTTP access layer)
+├── plugin/wasmhost/      Shared WASM host layer (keyring, HTTP, logging, utc_now)
+├── plugin/agent/wasm/    Agent WASM plugin runtime
+├── plugin/cli/           CLI plugin host + WASM runtime
+├── plugin/cli/wasm/      CLI WASM loader, observer hub, command runner
+├── plugin/sdk/rust/      Plugin SDK (Rust crate for plugin authors)
+├── mcp/                  Model Context Protocol client
+├── eventbus/             Generic pub/sub with history replay
+├── session/              Session metadata types + persistent Store
+│   ├── sqlite/           SQLite session store
+│   └── file/             File-based session store
+├── rest/                 REST API (HTTP access layer)
 │
 ├── cmd/
 │   ├── tui/              Terminal chat (bubbletea v2)
-│   └── cli/              Full CLI: WASM plugin runtime, cobra commands, Rust SDK
+│   └── cli/              Full CLI: cobra commands, WASM plugin runtime
+│       ├── main.go       Entry point + plugin load + command dispatch
+│       ├── config/       Settings + provider configuration
+│       ├── keyring/      System keyring integration
+│       ├── server/       Server runners (ACP, REST) + shared agent setup
+│       └── examples/plugin/  CLI plugin examples (telemetry, settings, commands)
 │
 ├── examples/
 │   ├── basic/            Non-streaming example
@@ -396,9 +480,11 @@ openagent-go/
 │   ├── delegate/         Agent-as-tool parallel delegation
 │   ├── plugin/           WASM plugin example
 │   ├── sandbox/          Sandbox demo
+│   ├── acp/              ACP protocol examples (server + client)
+│   ├── iac/              Multi-agent IaC pipeline
 │   ├── backend/          Full REST + SSE API server
 │   └── frontend/
-│       └── vue-app/   Vue 3 SPA reference UI
+│       └── vue-app/      Vue 3 SPA reference UI
 │
 ├── DESIGN.md             Architecture (English)
 ├── DESIGN.zh.md          Architecture (Chinese)
@@ -413,21 +499,23 @@ All interfaces in root package. Implementations in sub-packages. No circular dep
 
 **1. Why is Runner private?** Users call `Agent.Run()`, never construct a Runner. Runner is an internal implementation detail.
 
-**2. Why does the Runner trigger compaction?** Token budget depends on the model's context window, which only the Runner knows. The Runner counts tokens and decides when to compact; Memory just executes the compaction. Clean separation: Runner owns the decision, Memory owns the storage.
+**2. Why does the Runner trigger compaction?** Token budget depends on the model's context window, which only the Runner knows. The Runner counts tokens and decides when to compact; Memory just executes the compaction.
 
-**3. Why no auto-search (RelevantFacts)?** Archive retrieval is model-driven via the `recall_memory` tool. The model decides when and what to search. Compressed context already provides passive reminders. Dual Archive search channels (auto + tool) are redundant.
+**3. Why no auto-search?** Archive retrieval is model-driven via the `recall` tool. The model decides when and what to search.
 
-**4. Why aren't Embedder/Summarizer on Agent?** They are Memory dependencies, not Agent capabilities. Memory decides whether it needs embeddings or summaries. Preserves "modules don't call each other".
+**4. Why aren't Embedder/Summarizer on Agent?** They are Memory dependencies. Preserves "modules don't call each other".
 
-**5. Why streaming by default?** `callModelOnce` prefers `ChatCompletionStream`, falls back to non-streaming. Lowest time-to-first-token.
+**5. Why streaming by default?** `callModelOnce` prefers `ChatCompletionStream`, falls back to non-streaming.
 
-**6. Why is PromptBuilder a function type?** One method, no state. Function types are simpler.
+**6. Why a function type for PromptBuilder?** One method, no state.
 
-**7. Why is Handoff a Tool rather than Router choosing each step?** The model has full context and makes better handoff decisions than a router. Router only does two things: initial message routing and policy vetoes.
+**7. Why is Handoff a Tool?** The model has full context and makes better handoff decisions than a router.
 
-**8. Why inject hints instead of erroring on loops?** Two-layer loop detection: first give the model a hint ("you're in a loop, answer directly"), then remove transfer_to_* tools if it persists. Graceful degradation.
+**8. Why clone for agentForTurn?** `s.Agent` is shared across all sessions. Clone creates an isolated copy so per-turn overrides (Approver sessionID binding, tools, ReasoningEffort) don't race.
 
-**9. Why independent Memory per Agent instead of shared Team Memory?** Keep it simple. Agent already supports independent Memory. Add shared memory later if needed, without breaking existing interfaces.
+**9. Why ToolFactory for per-turn tool creation?** Tools need the session's cwd, which differs from the process cwd (Docker containers, bwrap). Creating them at startup would bind the wrong path.
+
+**10. Why DynamicContext on Session?** Plan entries and mode change every turn. The Runner shouldn't know about ACP or plans — Session is the neutral transport channel.
 
 ---
 
@@ -437,58 +525,41 @@ All interfaces in root package. Implementations in sub-packages. No circular dep
 
 | Node | Interface | Status | Notes |
 |------|-----------|--------|-------|
-| ①② | Memory | ✅ | file / sqlite + Compact + recall_memory |
+| ①② | Memory | ✅ | file / sqlite + Compact + recall |
 | ① | Embedder | ✅ | nil = FTS5 fallback |
-| ① | Summarizer | ✅ | nil = no compaction |
+| ① | Summarizer | ✅ | summarizer/llm.go |
 | ② | PromptBuilder | ✅ | function type, nil = default |
-| ④ | Model | ✅ | OpenAI implementation |
-| ⑥ | Tool | ✅ | compile-time + builtin + WASM |
+| ④ | Model | ✅ | OpenAI + ReasoningEffort |
+| ⑥ | Tool | ✅ | compile-time + builtin + WASM + ACP RPC |
 | — | SkillLoader | ✅ | filesystem implementation |
 | ③ | InputGuard | ✅ | guard/llm |
 | ⑤ | OutputGuard | ✅ | guard/llm |
-| ⑥ | Approver | ✅ | TUI + Frontend, human-in-the-loop |
+| ⑥ | Approver | ✅ | TUI + ACP permission bridge |
 | ⑦ | RunHooks | ✅ | slog + OpenTelemetry |
-| — | RunObserver | ✅ | per-stage enter/leave, Runner wired |
+| — | RunObserver | ✅ | per-stage enter/leave |
 | — | Router | ✅ | first-agent + LLM-based |
-| — | Team | ✅ | multi-agent with handoff + loop detection |
-| — | Orchestrate | ✅ | LLM-driven DAG → parallel execution + replan |
-| — | EventBus | ✅ | generic pub/sub, per-session topics |
+| — | Team | ✅ | multi-agent with handoff |
+| — | Orchestrate | ✅ | LLM-driven DAG + parallel + replan |
+| — | EventBus | ✅ | generic pub/sub |
+| — | Slash | ✅ | command registry + dispatch |
 
 ### Runtime Extensions (WASM Plugins)
-
-```go
-// No plugins: zero overhead
-agent := openagent.NewAgent("bot", openagent.WithModel(model))
-
-// With plugins:
-ctx, cancel := context.WithCancel(context.Background())
-defer cancel()
-
-mgr := wasm.NewManager("./plugins")
-mgr.Discover(ctx)
-mgr.OnAbort(func(reason string) { cancel() })
-
-agent := openagent.NewAgent("bot",
-    openagent.WithModel(model),
-    openagent.WithTools(mgr.Tools()...),
-    openagent.WithRunObserver(mgr.Observer()),
-)
-```
 
 **Plugin types:**
 
 | Type | Purpose | Injected as | ABI exports |
 |------|---------|------------|-------------|
-| Tool | New tools | `openagent.Tool` | `alloc`, `metadata`, `execute` |
-| Stage | Stage event observation + abort | `RunObserver` | `alloc`, `metadata`, `run` |
+| `agent:tools` | Add new tools to the agent's tool set | `openagent.Tool` | `alloc`, `metadata`, `execute` |
+| `agent:observers` | Observe pipeline stages, abort runs | `RunObserver` | `alloc`, `metadata`, `run` |
+| `cli:settings` | Inject provider credentials, modify settings JSON | `init()` transformation | `alloc`, `metadata`, `init` |
+| `cli:commands` | Add custom cobra sub-commands | `run_<name>()` handler | `alloc`, `metadata`, `commands`, `run_<name>` |
+| `cli:observers` | Lifecycle event logging | `on_startup`, `on_shutdown`, `on_command_start/end` | `alloc`, `metadata`, event handlers |
 
-WASM runtime: [wazero](https://github.com/tetratelabs/wazero) — pure Go, zero CGO. One `.wasm` file per plugin.
+WASM runtime: [wazero](https://github.com/tetratelabs/wazero) — pure Go, zero CGO.
 
 ---
 
 ## Team (Multi-Agent Orchestration)
-
-Team is an orchestration layer above the single-agent loop. Handoff = Tool with `EndTurn: true`. Each agent has independent Memory, Tools, and Guard.
 
 ```go
 team := openagent.NewTeam(
@@ -496,49 +567,12 @@ team := openagent.NewTeam(
     openagent.WithTeamAgent("calculator", "performs math", calculator),
 )
 result, _ := team.Run(ctx, session, input)
-stream := team.RunStream(ctx, session, input)
 ```
 
-**Loop detection (layered):**
+Handoff = Tool with `EndTurn: true`. Each agent has independent Memory, Tools, and Guard.
+Loop detection: ping-pong pattern detection, frequency counter, hard limit with tool removal.
 
-| Layer | Detection | Action |
-|-------|-----------|--------|
-| L1 Ping-pong | A→B→A→B pattern | Inject hint |
-| L2 Frequency | Same agent ≥3 times | Inject hint |
-| L3 Hard limit | Hint followed by another handoff | Remove transfer_to_* tools |
-
-No hard error — graceful degradation.
-
-### Router
-
-```go
-type AgentInfo struct {
-    Name        string
-    Description string
-    Type        AgentType // AgentInternal or AgentExternal
-}
-
-type Router interface {
-    Route(ctx, input, agents) (string, error)
-    CanHandoff(ctx, entry, chain, session) error
-}
-```
-
-`AgentInfo.Type` auto-populated: `WithTeamAgent` → `AgentInternal`, `AddAgent` with external runner → `AgentExternal`. Flows to Router, Team prompt, Orchestrate planner, and frontend.
-
-### Agent as Tool (Parallel Delegation)
-
-```go
-coordinator := openagent.NewAgent("coordinator",
-    openagent.WithTools(researcher.AsTool(), writer.AsTool()),
-)
-```
-
-Three-layer isolation: new session per call, no coordinator history leaked, only the task string as input.
-
----
-
-## Orchestrate (LLM-Driven DAG Execution)
+### Orchestrate (LLM-Driven DAG Execution)
 
 ```go
 p := orchestrate.NewPlan(
@@ -551,63 +585,22 @@ result, _ := p.Run(ctx, session, "Build a REST API for todos")
 
 | | Team | Orchestrate |
 |---|------|------------|
-| Decision | Runtime, agent-initiated handoff | Pre-execution, LLM generates DAG |
-| Parallelism | None (serial handoff chain) | Topological batches auto-parallel |
+| Decision | Runtime, agent-initiated | Pre-execution, LLM generates DAG |
+| Parallelism | None | Topological batches auto-parallel |
 | Failure | Agent handles itself | Subtree replan with LLM |
-| Use case | Conversational collaboration | Structured execution pipelines |
-
-`Planner` generates a DAG from the goal. `Executor` topo-sorts into batches, runs each batch with goroutines, auto-replans on failure (up to `MaxReplans` times). `AutoReplan=false` pauses on failure for manual retry/replan.
-
-**Frontend UI:** The Orchestrate page provides a full workflow — input a goal, watch the LLM stream its thinking via `plan_thinking` events, then review the rendered DAG. Pre-execution actions: `[Execute]` `[Replan]` `[Clear]`. Replan accepts natural language feedback to regenerate the DAG before execution begins. During execution, step cards update in real-time with status colors and expandable output. Failed steps offer `[Retry]` and `[Replan]` with feedback.
-
-## Goal (Autonomous Mode)
-
-```go
-agent.RunGoal(ctx, session, "Fix all failing tests")
-```
-
-Unlike `Run()` where the input is a user message that may scroll out of context, `RunGoal()` injects the goal into the system prompt — it persists across all turns. The agent iterates autonomously: plan → execute → evaluate → continue until done or impossible.
-
-| | Run | RunGoal | Orchestrate.Run |
-|---|---|---|---|
-| Goal placement | User message (scrolls out) | System prompt (persistent) | Planner-generated DAG |
-| Behavior | One-shot Q&A | Autonomous iteration | DAG parallel execution |
-| Stops when | No more tool calls | Goal achieved or impossible | All steps complete |
-
-## EventBus
-
-```go
-bus := eventbus.New[MyEvent](500) // max 500 history events per session
-sub := bus.Subscribe(sessionID)   // subscribe (auto-replays history)
-bus.Publish(sessionID, evt)       // fanout to all subscribers
-```
-
-Generic pub/sub with per-session topics and history replay. Used by the frontend for multi-tab sync, plan progress, and pipeline panel events.
-
-## Sandbox
-
-OS-native security: macOS Seatbelt (`sandbox-exec`), Linux Bubblewrap (`bwrap`), Windows stub.
-
-```go
-sb, _ := native.New("./workspace")
-// File tools: direct host I/O with path traversal protection
-// Shell tool: fork → OS sandbox → exec
-```
-
-Three-layer security: file tools validate paths → shell tool runs inside OS sandbox → workspace boundary enforced at both levels.
 
 ---
 
-## Pipeline Panel (Observability)
+## Sandbox
 
-The Runner emits `StageEvent` at each of the 8 nodes (enter/leave). A `RunObserver` implementation bridges these to the frontend, where an sidebar Monitor panel renders live:
+OS-native security: macOS Seatbelt (`sandbox-exec`), Linux Bubblewrap (`bwrap`).
 
-- 7 nodes: Fetch → Guard-In → Prompt → Model → Guard-Out → Tool → Store
-- Status: gray (pending) → blue pulse (active) → green (done + duration) → red (error)
+```go
+sb, _ := native.New("./workspace")
+cwd := sb.CWD()  // "/workspace" under bwrap, host path otherwise
+```
 
-- Info bar: round counter + token usage
-
-The observer adds `turn`/`maxTurns` and `tokens_prompt`/`tokens_completion` to `model.call` detail so the frontend shows per-round progress.
+Three-layer security: file tools validate paths → shell tool runs inside OS sandbox → workspace boundary enforced at both levels.
 
 ---
 
@@ -615,19 +608,13 @@ The observer adds `turn`/`maxTurns` and `tokens_prompt`/`tokens_completion` to `
 
 | | openai-agents | Claude Code | openagent-go |
 |---|---|---|---|
+| Protocol | — | — | ACP v1 (JSON-RPC 2.0) |
 | Sandbox | Docker SDK + macOS sandbox-exec | seccomp + namespaces | macOS Seatbelt / Linux bwrap |
-| File tools | read/write/ls/rm/mkdir | Read/Write/Glob | ReadFile/WriteFile/ListDir/Grep |
-| Streaming | PTY-based | Bash tool | Shell tool (line streaming, no PTY) |
-| Multi-agent | Handoff chain | — | Team (handoff) + Orchestrate (LLM-driven DAG) |
-| Goal mode | — | `/goal` | RunGoal + Orchestrate.Run |
-| Observability | — | — | RunObserver + SVG pipeline panel |
+| File tools | read/write/ls | Read/Write/Glob | ReadFile/WriteFile/ListDir/Grep |
+| Streaming | PTY-based | Bash tool | Shell tool (line streaming) |
+| Multi-agent | Handoff chain | — | Team + Orchestrate |
+| Plan mode | — | Tool-based | plan_create/plan_update tools |
+| Observability | — | — | RunObserver + StageEvent |
 | Plugins | — | — | WASM (wazero, zero CGO) |
-
----
-
-## UI Examples
-
-- `cmd/cli/` — CLI tool: `openagent run "msg"` and `openagent goal "task"`, streaming output
-- `cmd/tui/` — bubbletea v2 terminal chat, streaming + Y/N approval
-- `examples/backend/` — Full REST + SSE API server (single, team, plan)
-- `examples/frontend/vue-app/` — Vue 3 SPA with Chat, Team, Orchestrate modes, streaming, DAG, pipeline monitor
+| Slash commands | — | — | Registry + built-ins + extensible |
+| Memory compression | — | — | LLM incremental summarizer |

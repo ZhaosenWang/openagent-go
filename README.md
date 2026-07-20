@@ -7,49 +7,70 @@ A fully pluggable, multi-agent AI agent framework in Go.
 ## Features
 
 - **Pluggable architecture** — every component is an interface: Model, Memory, Tools, Guards, Approver, Hooks, Observer
-- **Multi-agent team** — agents hand off tasks via `transfer_to_*` with full context passing
-- **Plan mode** — LLM decomposes goals into DAGs, executes steps with streaming progress
+- **ACP v1 protocol** — full Agent Client Protocol implementation over stdio (JSON-RPC 2.0). Use any ACP-compatible client (VSCode extension, Zed, etc.)
+- **Plan mode** — `plan_create`/`plan_update` tools let the agent decompose complex tasks into structured steps with live progress tracking
+- **Multi-agent team** — agents hand off tasks via `transfer_to_*` tools; each agent has independent memory, tools, and guard
+- **Multi-agent orchestration** — LLM-driven DAG decomposition, parallel execution, and auto-replan via `orchestrate/`
 - **Streaming SSE** — real-time token-by-token output, reasoning display, tool call cards
-- **Memory system** — three-layer: Working (token-driven), Compressed (incremental summary), Archive (searchable)
-- **Sandbox** — native OS-level confinement for shell, file, and network operations
-- **WASM plugin system** — settings injection, command extension, lifecycle observers via `.wasm` modules
-- **Built-in subagent tool** — model dynamically spawns parallel sub-agents at runtime
-- **Full CLI** — `openagent-cli` with config-driven models, keyring secrets, cobra commands
+- **Three-layer memory** — Working (token-driven), Compressed (LLM incremental summary via `summarizer/`), Archive (FTS5/vector searchable, never deleted)
+- **Sandbox** — native OS-level confinement (Linux bwrap, macOS Seatbelt) for shell, file, and network operations
+- **WASM plugins** — agent-level: `agent:tools` and `agent:observers` plug into the tool/observer pipeline. CLI-level: `cli:settings`, `cli:commands`, `cli:observers` for settings injection, command extension, and lifecycle monitoring
+- **Static context profiles** — `AGENTS.md` (working rules) and `SOUL.md` (persona & limits) with user-level and project-level resolution
+- **Slash commands** — built-in `/help`, `/mode`, `/model`, `/context`, `/cwd`, `/clear`, `/rename`, `/sessions`, extensible via `slash/` registry
+- **Full CLI** — `openagent-cli` with cobra commands, config-driven models, keyring secrets, WASM plugin runtime
 - **RunHooks with state** — start/end callbacks share opaque state; OTEL spans nest, slog logs duration
+- **Dynamic context** — session-level plan status and mode injected into every prompt turn
 
 ## Quick Start
 
 ```bash
-# CLI
+# Build CLI
 go build -o openagent-cli ./cmd/cli/
-./openagent-cli serve --port 8080
 
-# Backend (programmatic)
-OPENAGENT_API_KEY=sk-... OPENAGENT_MODEL=gpt-4o go run ./examples/backend/
+# ACP mode (stdio — for VSCode/Zed ACP plugins)
+./openagent-cli serve --acp
+
+# REST mode (HTTP + SSE)
+./openagent-cli serve --port 8080
 
 # Frontend
 cd examples/frontend/vue-app && npm install && npm run dev
 ```
 
-Open `http://localhost:5173` — three modes available:
-- **Chat** — single-agent conversation
-- **Team** — multi-agent pipeline with handoff
-- **Plan** — goal → DAG → streaming execution
+### Configuration
+
+Create `~/.openagent/settings.json`:
+
+```json
+{
+  "provider": {
+    "openai": {
+      "api_key": "sk-...",
+      "models": ["gpt-4o"]
+    }
+  },
+  "profiles": ".openagent/profile"
+}
+```
+
+Put `AGENTS.md` and `SOUL.md` in `~/.openagent/profile/` or `$(pwd)/.openagent/profile/` to customise the agent's behaviour.
+
+Open `http://localhost:5173` or connect an ACP client — the server supports both protocols.
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────┐
-│  Agent                                   │
-│  ├── Model      (LLM provider)           │
-│  ├── Memory     (conversation storage)   │
-│  ├── Tools      (shell, file, grep, ...) │
-│  ├── InGuard    (input validation)       │
-│  ├── OutGuard   (output validation)      │
-│  ├── Approver   (tool call confirmation) │
-│  ├── Hooks      (lifecycle callbacks)    │
-│  └── Observer   (pipeline monitoring)    │
-└──────────────────────────────────────────┘
+┌──────────────────────────────────────────────┐
+│  Agent                                       │
+│  ├── Model        (LLM provider)             │
+│  ├── Memory       (conversation storage)     │
+│  ├── Tools        (shell, file, grep, ...)   │
+│  ├── InGuard      (input validation)         │
+│  ├── OutGuard     (output validation)        │
+│  ├── Approver     (tool call confirmation)   │
+│  ├── Hooks        (lifecycle callbacks)      │
+│  └── Observer     (pipeline monitoring)      │
+└──────────────────────────────────────────────┘
 ```
 
 ## Examples
@@ -65,9 +86,10 @@ Open `http://localhost:5173` — three modes available:
 | `examples/observer/` | Pipeline observer |
 | `examples/delegate/` | Agent as tool delegation |
 | `examples/sandbox/` | Native sandbox tools |
-| `examples/plugin/` | WASM tool + stage plugins |
+| `examples/plugin/` | WASM tool + observer plugins |
 | `examples/skill/` | On-demand skill loading |
-| `examples/acp/` | ACP agent protocol |
+| `examples/acp/` | ACP agent protocol (server + client) |
+| `examples/iac/` | Multi-agent IaC pipeline |
 | `examples/backend/` | Full REST + SSE API server |
 | `examples/frontend/vue-app/` | Vue 3 SPA reference UI |
 | `cmd/cli/` | Full-featured CLI with WASM plugin runtime |
@@ -76,21 +98,33 @@ Open `http://localhost:5173` — three modes available:
 
 | Package | Purpose |
 |---------|---------|
-| `openagent` | Core types, Agent, Team, Runner, Memory |
-| `rest/` | REST + SSE handlers for single/team/plan |
-| `plan/` | Goal decomposition, DAG execution |
+| `openagent` | Core types, Agent, Team, Runner, Memory, Sandbox |
+| `acp/sdk/` | ACP v1 protocol SDK — types, JSON-RPC 2.0 mux, client |
+| `acp/` | AgentServer — wraps an Agent as an ACP handler |
+| `rest/` | REST + SSE handlers (single, team, orchestrate) |
+| `orchestrate/` | Multi-agent DAG decomposition + streaming execution |
+| `plan/` | `plan_create`/`plan_update` tools (ACP plan mode) |
+| `slash/` | Slash command registry and dispatch |
+| `summarizer/` | LLM-based incremental conversation compression |
 | `memory/sqlite/` | SQLite + FTS5 + vector memory backend |
 | `memory/file/` | JSONL file memory backend |
-| `model/openai/` | OpenAI ChatCompletion + Summarizer |
+| `model/openai/` | OpenAI ChatCompletion + streaming |
 | `tokenizer/` | tiktoken model-aware token counting |
-| `sandbox/native/` | OS-level process confinement |
+| `sandbox/native/` | OS-level process confinement (bwrap/Seatbelt) |
+| `session/` | Session metadata types and store interface |
+| `session/sqlite/` | SQLite session store |
+| `session/file/` | File-backed session store |
 | `eventbus/` | Session-scoped pub/sub for SSE |
-| `plugin/agent/wasm/` | WASM plugin host |
+| `plugin/wasmhost/` | Shared WASM host module (keyring, HTTP, logging, utc_now) |
+| `plugin/agent/wasm/` | Agent-scoped WASM plugin host |
+| `plugin/cli/` | CLI plugin manager and types |
+| `plugin/cli/wasm/` | CLI-scoped WASM runtime, loader, observer hub |
+| `plugin/sdk/rust/` | Rust SDK crate for building WASM plugins |
 | `skill/fs/` | Filesystem skill loader |
-| `mcp/` | Model Context Protocol |
-| `acp/` | Agent Communication Protocol |
+| `mcp/` | Model Context Protocol client |
+| `acp/` | ACP server — Agent→Client RPC tools |
 | `guard/llm/` | LLM-based input/output guard |
 | `hooks/otel/` | OpenTelemetry hooks |
 | `hooks/slog/` | Structured logging hooks |
-| `tool/` | Built-in tools (shell, read, write, ls, grep) |
-| `cmd/cli/` | CLI runtime, WASM host, Rust SDK |
+| `tool/` | Built-in tools (shell, read, write, ls, grep, ACP fs, ACP terminal) |
+| `cmd/cli/` | CLI runtime, WASM host, Rust SDK examples |
