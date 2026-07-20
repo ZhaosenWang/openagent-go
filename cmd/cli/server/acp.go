@@ -3,6 +3,8 @@ package server
 import (
 	"context"
 	"log"
+	"log/slog"
+	"os"
 	"path/filepath"
 
 	openagent "github.com/yusheng-g/openagent-go"
@@ -72,12 +74,28 @@ func RunACP(ctx context.Context, cfg *config.Config) error {
 		return nil
 	}
 	server := openacpsdk.NewServer("openagent-acp", "1.0.0", srv)
+	server.SetLogger(slog.Default())
 
-	// Start IM channels in the background.
-	if err := RunChannels(ctx, agent, cfg.Channels); err != nil {
+	// Channel agent: clone the template and inject a default Model + Tools
+	// so the IM bot can run standalone (ACP path injects Model per-turn in
+	// agentForTurn, but channels call agent.RunStream() directly).
+	channelAgent := agent.Clone()
+	for _, mi := range modelInfos {
+		if mi.Model != nil {
+			channelAgent.Model = mi.Model
+			break
+		}
+	}
+	cwd, _ := os.Getwd()
+	if sb, err := native.New(cwd); err == nil {
+		channelAgent.Tools = buildTools(sb, cwd, []string{"shell", "read", "write", "ls", "grep"})
+	}
+
+	if err := RunChannels(ctx, channelAgent, cfg.Channels); err != nil {
 		log.Printf("channel: %v", err)
 	}
 
 	log.Println("ACP server starting on stdio")
 	return server.Run(ctx)
 }
+

@@ -34,6 +34,11 @@ func RunREST(ctx context.Context, cfg *config.Config) error {
 		log.Printf("WARNING: sandbox unavailable, tools disabled: %v", err)
 	}
 
+	// MCP tools from config.
+	mcpTools, mcpCleanup := connectMcpFromConfig(ctx, cfg.McpServers)
+	tools = append(tools, mcpTools...)
+	defer mcpCleanup()
+
 	cfgPath, _ := config.Path()
 	dataDir := filepath.Join(filepath.Dir(cfgPath), "data")
 	mem, store, cleanup, err := buildMemory(filepath.Join(dataDir, "memory.db"))

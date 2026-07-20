@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"os/exec"
 
 	openagent "github.com/yusheng-g/openagent-go"
@@ -26,11 +27,12 @@ type Client struct {
 }
 
 // NewClient creates an MCP [Client] with the given implementation identity.
+// MCP protocol logging is written to slog.Default().
 func NewClient(name, version string) *Client {
 	return &Client{
 		inner: mcpsdk.NewClient(&mcpsdk.Implementation{
 			Name: name, Version: version,
-		}, nil),
+		}, &mcpsdk.ClientOptions{Logger: slog.Default()}),
 	}
 }
 

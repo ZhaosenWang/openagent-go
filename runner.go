@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -273,6 +274,18 @@ func (r *runner) run(ctx context.Context, session Session, prefix []Message, inp
 		// ── ④ Model: call LLM ──
 		lastReq = r.buildModelRequest(session, messages)
 
+		reqBody, _ := json.Marshal(lastReq)
+		slog.Debug("model request",
+			"session", session.ID, "user", session.UserID,
+			"model", lastReq.Model, "turn", turn, "maxTurns", maxTurns,
+			"messages", len(messages), "tools", len(lastReq.Tools),
+			"maxTokens", lastReq.MaxTokens, "bodyKB", len(reqBody)/1024,
+			"metadata", session.Metadata)
+		for i, m := range messages {
+			slog.Debug("  msg", "i", i, "role", m.Role,
+				"content", m.Content, "tool_calls", len(m.ToolCalls), "name", m.Name)
+		}
+
 		// Last-resort truncation: if the full message set exceeds the model's
 		// context window, drop oldest non-system messages to fit. The compaction
 		// pipeline normally keeps the working set within budget; this triggers
@@ -284,13 +297,6 @@ func (r *runner) run(ctx context.Context, session Session, prefix []Message, inp
 				before := len(messages)
 				messages = trimToContextWindow(tokenizerModelID(r.runModel), messages, cw)
 				trimmed := before - len(messages)
-				// When using the default prompt builder, every non-system
-				// message in the model input originates from workingMessages,
-				// so trimToContextWindow drops exactly workingMessages[:trimmed].
-				// With a custom PromptBuilder this mapping doesn't hold (the
-				// builder can insert non-system messages anywhere), so we skip
-				// the sync — it's just an optimization, and the compaction
-				// pipeline normally prevents this path anyway.
 				if r.agent.Prompt == nil && trimmed > 0 && trimmed <= len(workingMessages) {
 					workingMessages = workingMessages[trimmed:]
 				}

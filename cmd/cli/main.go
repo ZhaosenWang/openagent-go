@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"github.com/spf13/cobra"
@@ -128,6 +129,30 @@ func main() {
 	for k, v := range cfg.Env {
 		os.Setenv(k, v)
 	}
+	// Apply log defaults — main.go uses json.Unmarshal directly
+	// so defaults from config.Load() are never run. Fill in
+	// missing values before SetupLog.
+	if cfg.Log.File == "" {
+		cfg.Log.File = filepath.Join(filepath.Dir(cfgPath), "data", "openagent.log")
+	}
+	if cfg.Log.MaxSize == 0 {
+		cfg.Log.MaxSize = 10
+	}
+	if cfg.Log.MaxBackups == 0 {
+		cfg.Log.MaxBackups = 5
+	}
+	if cfg.Log.Level == "" {
+		cfg.Log.Level = "info"
+	}
+
+	logCleanup, err := server.SetupLog(cfg.Log)
+	if err != nil {
+		log.Printf("WARNING: log setup failed, using defaults: %v", err)
+	}
+	if logCleanup != nil {
+		defer logCleanup()
+	}
+
 	pretty, _ := json.MarshalIndent(&cfg, "", "  ")
 	log.Printf("Merged settings:\n%s", string(pretty))
 

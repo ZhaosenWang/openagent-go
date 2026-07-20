@@ -14,6 +14,8 @@ type Config struct {
 	Server    ServerConfig              `json:"server,omitempty"`
 	Channels  ChannelsConfig            `json:"channels,omitempty"`
 	Sandbox   SandboxConfig             `json:"sandbox,omitempty"`
+	Log       LogConfig                 `json:"log,omitempty"`
+	McpServers map[string]McpServerConfig `json:"mcp_servers,omitempty"`
 	Plugins   []string                  `json:"plugins,omitempty"`
 	Profiles  string                    `json:"profiles,omitempty"`
 	Env       map[string]string         `json:"env,omitempty"`
@@ -27,6 +29,17 @@ type ProviderConfig struct {
 
 type ServerConfig struct {
 	Port int `json:"port,omitempty"`
+}
+
+// McpServerConfig describes an MCP server using the standard MCP config format
+// (same as Claude Code / Claude Desktop / Cursor).
+// The map key is the server name.
+type McpServerConfig struct {
+	Command string            `json:"command,omitempty"`
+	Args    []string          `json:"args,omitempty"`
+	Env     map[string]string `json:"env,omitempty"`
+	URL     string            `json:"url,omitempty"`  // HTTP/SSE endpoint
+	Type    string            `json:"type,omitempty"` // "stdio" (default), "http", "sse"
 }
 
 // ChannelsConfig holds per-platform IM channel configuration.
@@ -56,6 +69,21 @@ type SandboxConfig struct {
 	ReadablePaths []string `json:"readable_paths,omitempty"`
 }
 
+// LogConfig controls logging output.
+type LogConfig struct {
+	// File is the log file path. Logs are written to stderr when empty.
+	File string `json:"file,omitempty"`
+	// MaxSize is the maximum size in megabytes before rotation. Default: 10.
+	MaxSize int `json:"max_size,omitempty"`
+	// MaxBackups is the number of rotated files to keep. Default: 5.
+	MaxBackups int `json:"max_backups,omitempty"`
+	// MaxAge is the maximum age in days to keep rotated files. Default: 30.
+	MaxAge int `json:"max_age,omitempty"`
+	// Level filters log messages below this threshold. Default: "info".
+	// Valid: "debug", "info", "warn", "error".
+	Level string `json:"level,omitempty"`
+}
+
 // Path returns the config file path. Respects OPENAGENT_CLI_CONFIG env var.
 func Path() (string, error) {
 	if p := os.Getenv("OPENAGENT_CLI_CONFIG"); p != "" {
@@ -75,7 +103,25 @@ func DefaultPluginsDir() string {
 }
 
 func Load(path string) (*Config, error) {
-	cfg := &Config{}
+	p, _ := Path()
+	if p == "" {
+		home, _ := os.UserHomeDir()
+		p = filepath.Join(home, ".openagent", "settings.json")
+	}
+	cfg := &Config{
+		Provider: make(map[string]ProviderConfig),
+		Plugins:  []string{DefaultPluginsDir()},
+		Profiles: ".openagent/profile",
+		Server:   ServerConfig{Port: 8080},
+		Log: LogConfig{
+			File:       filepath.Join(filepath.Dir(p), "data", "openagent.log"),
+			MaxSize:    10,
+			MaxBackups: 5,
+			MaxAge:     30,
+			Level:      "info",
+		},
+	}
+
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -86,21 +132,5 @@ func Load(path string) (*Config, error) {
 	if err := json.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("parse settings: %w", err)
 	}
-	applyDefaults(cfg)
 	return cfg, nil
-}
-
-func applyDefaults(cfg *Config) {
-	if cfg.Provider == nil {
-		cfg.Provider = make(map[string]ProviderConfig)
-	}
-	if len(cfg.Plugins) == 0 {
-		cfg.Plugins = []string{DefaultPluginsDir()}
-	}
-	if cfg.Profiles == "" {
-		cfg.Profiles = ".openagent/profile"
-	}
-	if cfg.Server.Port == 0 {
-		cfg.Server.Port = 8080
-	}
 }
