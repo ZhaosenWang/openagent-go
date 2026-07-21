@@ -142,13 +142,32 @@ func toSDKMessage(m openagent.Message) openaisdk.ChatCompletionMessageParamUnion
 
 	case openagent.RoleAssistant:
 		if len(m.ToolCalls) > 0 {
-			return openaisdk.ChatCompletionMessageParamUnion{
-				OfAssistant: &openaisdk.ChatCompletionAssistantMessageParam{
-					ToolCalls: toSDKToolCallParams(m.ToolCalls),
-				},
+			assistant := &openaisdk.ChatCompletionAssistantMessageParam{
+				ToolCalls: toSDKToolCallParams(m.ToolCalls),
 			}
+			if m.Content != "" {
+				assistant.Content = openaisdk.ChatCompletionAssistantMessageParamContentUnion{
+					OfString: openaisdk.String(m.Content),
+				}
+			}
+			if m.ReasoningContent != "" {
+				assistant.SetExtraFields(map[string]any{
+					"reasoning_content": m.ReasoningContent,
+				})
+			}
+			return openaisdk.ChatCompletionMessageParamUnion{OfAssistant: assistant}
 		}
-		return openaisdk.AssistantMessage(m.Content)
+		assistant := &openaisdk.ChatCompletionAssistantMessageParam{
+			Content: openaisdk.ChatCompletionAssistantMessageParamContentUnion{
+				OfString: openaisdk.String(m.Content),
+			},
+		}
+		if m.ReasoningContent != "" {
+			assistant.SetExtraFields(map[string]any{
+				"reasoning_content": m.ReasoningContent,
+			})
+		}
+		return openaisdk.ChatCompletionMessageParamUnion{OfAssistant: assistant}
 
 	case openagent.RoleTool:
 		return openaisdk.ToolMessage(m.Content, m.ToolCallID)
