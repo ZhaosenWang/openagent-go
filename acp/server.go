@@ -444,6 +444,14 @@ func (s *AgentServer) OnLoadSession(ctx context.Context, req openacp.LoadSession
 		s.replayPlan(sender, entries)
 	}
 
+	// Send available commands (same as session/new).
+	if s.updateSender != nil {
+		s.updateSender.SendSessionUpdate(req.SessionID, openacp.SessionUpdate{
+			SessionUpdate: "available_commands_update",
+			AvailableCommands: s.availableCommands(),
+		})
+	}
+
 	return &openacp.LoadSessionResponse{
 		ConfigOptions: s.buildConfigOptions(req.SessionID),
 		Modes:         s.buildModeState(req.SessionID),
