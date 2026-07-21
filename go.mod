@@ -9,7 +9,7 @@ require (
 	github.com/godbus/dbus/v5 v5.2.2
 	github.com/hashicorp/terraform-exec v0.25.2
 	github.com/hashicorp/terraform-json v0.27.2
-	github.com/larksuite/oapi-sdk-go/v3 v3.4.9
+	github.com/larksuite/oapi-sdk-go/v3 v3.9.9
 	github.com/modelcontextprotocol/go-sdk v1.6.1
 	github.com/openai/openai-go/v3 v3.41.0
 	github.com/pkoukk/tiktoken-go v0.1.8
@@ -48,6 +48,7 @@ require (
 	github.com/lucasb-eyer/go-colorful v1.4.0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/mattn/go-runewidth v0.0.24 // indirect
+	github.com/mdp/qrterminal/v3 v3.2.1 // indirect
 	github.com/muesli/cancelreader v0.2.2 // indirect
 	github.com/ncruces/go-strftime v0.1.9 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
@@ -64,8 +65,10 @@ require (
 	github.com/zclconf/go-cty v1.18.1 // indirect
 	golang.org/x/exp v0.0.0-20250620022241-b7579e27df2b // indirect
 	golang.org/x/oauth2 v0.35.0 // indirect
+	golang.org/x/term v0.13.0 // indirect
 	golang.org/x/text v0.31.0 // indirect
 	modernc.org/libc v1.66.3 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
+	rsc.io/qr v0.2.0 // indirect
 )

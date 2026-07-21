@@ -216,11 +216,31 @@ func buildServeCmd(cfg config.Config) *cobra.Command {
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			isACP, _ := cmd.Flags().GetBool("acp")
+			channelFlag, _ := cmd.Flags().GetString("channel")
 			p, _ := cmd.Flags().GetInt("port")
 			if p > 0 {
 				cfg.Server.Port = p
 			}
+
 			ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+
+		// Resolve Feishu credentials when --channel feishu is set.
+		if channelFlag == "feishu" {
+			creds, err := server.ResolveFeishuCredentials(ctx)
+			if err != nil {
+				cancel()
+				return fmt.Errorf("feishu: %w", err)
+			}
+			if cfg.Channels.Feishu == nil {
+				cfg.Channels.Feishu = &config.FeishuConfig{}
+			}
+			if cfg.Channels.Feishu.AppID == "" {
+				cfg.Channels.Feishu.AppID = creds.AppID
+			}
+			if cfg.Channels.Feishu.AppSecret == "" {
+				cfg.Channels.Feishu.AppSecret = creds.AppSecret
+			}
+		}
 			defer cancel()
 			if isACP {
 				return server.RunACP(ctx, &cfg)
@@ -229,6 +249,7 @@ func buildServeCmd(cfg config.Config) *cobra.Command {
 		},
 	}
 	cmd.Flags().Bool("acp", false, "ACP mode over stdio")
+	cmd.Flags().String("channel", "", "Enable IM channel (e.g. \"feishu\")")
 	cmd.Flags().Int("port", 0, "REST port (overrides settings)")
 	return cmd
 }
