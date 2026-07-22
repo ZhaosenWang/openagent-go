@@ -96,6 +96,14 @@ type agentSession struct {
 
 	// Cached plan entries (mirrors SessionStore._meta["plan"]).
 	planEntries []plan.Entry
+
+	// planMu guards plan notification sends so that exit_plan_mode's
+	// mode change + empty-plan notification is atomic with respect to
+	// plan_create / plan_update notification sends. Without this, when
+	// tools execute concurrently (runner.go executeTools goroutines),
+	// plan entries can arrive at the client after the mode change,
+	// causing the VS Code plugin to keep showing plan mode.
+	planMu sync.Mutex
 }
 
 // NewAgentServer creates an AgentServer wrapping the given agent.
@@ -892,7 +900,13 @@ func (s *AgentServer) OnPrompt(ctx context.Context, req openacp.PromptRequest, s
 		pt := plan.NewCreateTool(func(entries []plan.Entry) {
 			ss.planEntries = entries
 			s.savePlan(ctx, string(req.SessionID), entries)
-			sender.SendPlanUpdate(s.entriesToACP(entries))
+			// planMu + mode check prevents a race with concurrent
+			// exit_plan_mode (runner.go executes tools in goroutines).
+			ss.planMu.Lock()
+			if ss.mode == "plan" {
+				sender.SendPlanUpdate(s.entriesToACP(entries))
+			}
+			ss.planMu.Unlock()
 		})
 		agent.Tools = append(agent.Tools, pt)
 
@@ -912,6 +926,16 @@ func (s *AgentServer) OnPrompt(ctx context.Context, req openacp.PromptRequest, s
 			if err := s.setSessionMode(ctx, req.SessionID, target); err != nil {
 				return err
 			}
+
+			// Clear the client's plan panel. planMu ensures
+			// atomicity with concurrent plan_create / plan_update
+			// goroutines: either this empty-plan notification
+			// arrives after the entries (correct order), or the
+			// mode check in those callbacks skips the entries
+			// (client never sees stale plan data after exit).
+			ss.planMu.Lock()
+			sender.SendPlanUpdate(nil)
+			ss.planMu.Unlock()
 
 			// Inject execution tools into the running agent clone
 			// for subsequent model calls this turn.
@@ -956,7 +980,11 @@ func (s *AgentServer) OnPrompt(ctx context.Context, req openacp.PromptRequest, s
 			ss.planEntries[idx].Status = plan.Status(u.Status)
 		}
 		s.savePlan(ctx, string(req.SessionID), ss.planEntries)
-		sender.SendPlanUpdate(s.entriesToACP(ss.planEntries))
+		ss.planMu.Lock()
+		if ss.mode == "plan" {
+			sender.SendPlanUpdate(s.entriesToACP(ss.planEntries))
+		}
+		ss.planMu.Unlock()
 		return copyPlanEntries(ss.planEntries), nil
 	})
 	agent.Tools = append(agent.Tools, pu)
