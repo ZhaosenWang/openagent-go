@@ -1269,7 +1269,7 @@ func (s *AgentServer) injectExecutionTools(clone *openagent.Agent, sid openacp.S
 // buildDynamicContext assembles per-turn dynamic context from session
 // runtime state — plan entries with status, mode instruction, etc.
 // Called every turn in OnPrompt; injected into the system prompt via
-// Session.DynamicContext → PromptInput → defaultBuildPrompt.
+// Session.DynamicContext → PromptInput → BuildPrompt.
 func (s *AgentServer) buildDynamicContext(ss *agentSession) string {
 	var b strings.Builder
 

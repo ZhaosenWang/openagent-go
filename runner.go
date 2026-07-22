@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -297,7 +299,7 @@ func (r *runner) run(ctx context.Context, session Session, prefix []Message, inp
 				before := len(messages)
 				messages = trimToContextWindow(tokenizerModelID(r.runModel), messages, cw)
 				trimmed := before - len(messages)
-				if r.agent.Prompt == nil && trimmed > 0 && trimmed <= len(workingMessages) {
+				if trimmed > 0 && trimmed <= len(workingMessages) {
 					workingMessages = workingMessages[trimmed:]
 				}
 				lastReq = r.buildModelRequest(session, messages)
@@ -578,154 +580,170 @@ func (r *runner) prepareMemory(ctx context.Context, session Session) ([]Message,
 }
 
 // estimatePromptOverhead returns the estimated token count of everything
-// defaultBuildPrompt adds BEFORE the working messages: system instructions,
-// compressed summary, skills catalog, etc.  This is subtracted from the
+// BuildPrompt adds BEFORE the working messages. This is subtracted from the
 // working token budget so that the total prompt (overhead + working) fits
 // within the model's context window.
-//
-// When a custom PromptBuilder is configured we cannot predict what it will
-// produce, so we return 0 — the caller's budget becomes best-effort.
 func (r *runner) estimatePromptOverhead(ctx context.Context, session Session, modelID string) int {
-	if r.agent.Prompt != nil {
-		return 0 // custom PromptBuilder — can't know
-	}
-
 	var n int
 
-	// System prompts (Agent.SystemPrompts).
-	sys := strings.Join(r.agent.SystemPrompts, "\n\n")
-	if r.agent.Description != "" {
-		sys = r.agent.Description + "\n\n" + sys
-	}
-	if sys != "" {
-		n += tokenizer.Count(modelID, sys) + 4
-	}
-
-	// Project context.
+	// Static context.
+	static := strings.Join(r.agent.SystemPrompts, "\n\n")
 	if session.ProjectContext != "" {
-		n += tokenizer.Count(modelID, session.ProjectContext) + 4
+		static += "\n\n## Project Context\n\n" + session.ProjectContext
+	}
+	if static != "" {
+		n += tokenizer.Count(modelID, static) + 4
 	}
 
-	// Dynamic context (plan, mode, etc.) — injected by ACP layer.
+	// Dynamic context — same assembly order as buildPrompt.
+	if len(r.skills) > 0 {
+		n += tokenizer.Count(modelID, buildSkillsSection(r.skills)) + 4
+	}
+	for name, body := range r.loadedSkills {
+		n += tokenizer.Count(modelID, "## Loaded Skill: "+name+"\n\n"+body) + 4
+	}
 	if session.DynamicContext != "" {
 		n += tokenizer.Count(modelID, session.DynamicContext) + 4
 	}
 
+	// Semantic memory.
+	if path := r.semanticMDPath(); path != "" {
+		if data, err := os.ReadFile(path); err == nil {
+			if content := strings.TrimSpace(string(data)); content != "" {
+				n += tokenizer.Count(modelID, "## Semantic Memory\n\n"+content) + 4
+			}
+		}
+	}
+
 	// Compressed summary + hints.
 	if cc, err := r.agent.Memory.Compressed(ctx, session.ID); err == nil && cc != nil && cc.Summary != "" {
-		content := "## Conversation Summary\n" + cc.Summary
-		if len(cc.Hints) > 0 {
-			content += "\n\n### Retrieval Hints\n"
-			for i, h := range cc.Hints {
-				content += fmt.Sprintf("%d. %s (query: %s)\n", i+1, h.Description, h.Query)
-			}
-		}
-		n += tokenizer.Count(modelID, content) + 4
-	}
-
-	// Skills catalog.
-	if len(r.skills) > 0 {
-		var catalog string
-		for _, s := range r.skills {
-			catalog += "\n### " + s.Name + "\n"
-			for k, v := range s.Frontmatter {
-				catalog += fmt.Sprintf("%s: %v\n", k, v)
-			}
-		}
-		n += tokenizer.Count(modelID, "## Available Skills\n"+catalog) + 4
-	}
-
-	// Loaded skill bodies.
-	for name, body := range r.loadedSkills {
-		n += tokenizer.Count(modelID, "## Loaded Skill: "+name+"\n\n"+body) + 4
+		n += tokenizer.Count(modelID, buildCompressedSection(cc)) + 4
 	}
 
 	return n
 }
 
 func (r *runner) buildPrompt(ctx context.Context, session Session, working []Message) []Message {
-	input := PromptInput{
-		AgentDescription: r.agent.Description,
-		Instructions:     strings.Join(r.agent.SystemPrompts, "\n\n"),
-		WorkingMessages:  working,
-		Tools:            toolDefinitions(r.agent.Tools),
-		UserProfile:      session.UserProfile,
-		ProjectContext:   session.ProjectContext,
-		DynamicContext:   session.DynamicContext,
+	// ── Static context (assembled once per run, never changes) ──
+	static := strings.Join(r.agent.SystemPrompts, "\n\n")
+	if session.ProjectContext != "" {
+		static += "\n\n## Project Context\n\n" + session.ProjectContext
 	}
 
-	if r.compressed != nil {
-		input.Compressed = r.compressed
-	}
+	// ── Dynamic context (re-assembled every turn) ──
+	var dynamicParts []string
+	dynamicParts = append(dynamicParts,
+		"\nIMPORTANT: The context below is generated fresh for this turn. "+
+			"If it conflicts with static instructions or earlier conversation, the latest context here is authoritative. "+
+			"Earlier summaries, skill lists, semantic memory, or plan state may be outdated.\n",
+	)
 
+	// Skills catalog + loaded skill bodies.
 	if len(r.skills) > 0 {
-		input.AvailableSkills = r.skills
-	}
-	if len(r.loadedSkills) > 0 {
-		input.LoadedSkills = r.loadedSkills
+		dynamicParts = append(dynamicParts, buildSkillsSection(r.skills))
+	} else {
+		dynamicParts = append(dynamicParts,
+			"\nIMPORTANT: No available skills."+
+				"",
+		)
 	}
 
-	if r.agent.Prompt != nil {
-		if msgs, err := r.agent.Prompt(ctx, input); err == nil {
-			return msgs
-		}
+	for name, body := range r.loadedSkills {
+		dynamicParts = append(dynamicParts, "## Loaded Skill: "+name+"\n\n"+body)
 	}
-	return defaultBuildPrompt(input)
+
+	// ACP / plan-mode context (injected by Session.DynamicContext).
+	if session.DynamicContext != "" {
+		dynamicParts = append(dynamicParts, session.DynamicContext)
+	}
+
+	// Semantic memory — persistent facts/preferences/rules, re-read every turn.
+	if semanticPath := r.semanticMDPath(); semanticPath != "" {
+		dynamicParts = append(dynamicParts, buildSemanticSection(semanticPath))
+	}
+
+	// Compressed conversation summary — Layer 2 of the memory model.
+	if r.compressed != nil && r.compressed.Summary != "" {
+		dynamicParts = append(dynamicParts, buildCompressedSection(r.compressed))
+	}
+
+	input := PromptInput{
+		StaticContext:   static,
+		DynamicContext:  strings.Join(dynamicParts, "\n\n"),
+		WorkingMessages: working,
+	}
+
+	msgs, _ := r.agent.Prompt(ctx, input)
+	return msgs
 }
 
-// defaultBuildPrompt assembles system instructions + skill catalog +
-// loaded skill bodies + working messages.
-func defaultBuildPrompt(input PromptInput) []Message {
-	var msgs []Message
+// ── Section builders ──
 
-	system := input.Instructions
-	if input.AgentDescription != "" {
-		system = input.AgentDescription + "\n\n" + system
+func (r *runner) semanticMDPath() string {
+	if r.agent.Memory == nil {
+		return ""
 	}
-	msgs = append(msgs, Message{Role: RoleSystem, Content: system})
-
-	if input.ProjectContext != "" {
-		msgs = append(msgs, Message{Role: RoleSystem, Content: input.ProjectContext})
+	s, ok := r.agent.Memory.(interface{ SemanticMDPath() string })
+	if !ok {
+		return ""
 	}
+	return s.SemanticMDPath()
+}
 
-	if input.Compressed != nil && input.Compressed.Summary != "" {
-		content := "## Conversation Summary\n" + input.Compressed.Summary
-		if len(input.Compressed.Hints) > 0 {
-			content += "\n\n### Retrieval Hints\n"
-			for i, h := range input.Compressed.Hints {
-				content += fmt.Sprintf("%d. %s (query: %s)\n", i+1, h.Description, h.Query)
-			}
+func buildSemanticSection(path string) string {
+	var b strings.Builder
+	b.WriteString("## Semantic Memory\n\n")
+	b.WriteString(fmt.Sprintf("File: %s\n", path))
+
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		if dir := filepath.Dir(path); dir != "" {
+			err = os.MkdirAll(dir, 0755)
 		}
-		msgs = append(msgs, Message{Role: RoleSystem, Content: content})
-	}
-
-	if input.DynamicContext != "" {
-		msgs = append(msgs, Message{Role: RoleSystem, Content: input.DynamicContext})
-	}
-
-	if len(input.AvailableSkills) > 0 {
-		var catalog string
-		for _, s := range input.AvailableSkills {
-			catalog += "\n### " + s.Name + "\n"
-			for k, v := range s.Frontmatter {
-				catalog += fmt.Sprintf("%s: %v\n", k, v)
-			}
+		if err == nil {
+			err = os.WriteFile(path, nil, 0644)
 		}
-		msgs = append(msgs, Message{
-			Role:    RoleSystem,
-			Content: "## Available Skills\n" + catalog,
-		})
+	}
+	if err != nil {
+		// Read, create, or write failed — surface it so the section
+		// isn't silently empty and the agent can react.
+		b.WriteString(fmt.Sprintf("\n(error accessing %s: %v)\n", path, err))
 	}
 
-	for name, body := range input.LoadedSkills {
-		msgs = append(msgs, Message{
-			Role:    RoleSystem,
-			Content: "## Loaded Skill: " + name + "\n\n" + body,
-		})
-	}
+	b.WriteString("Persistent facts, preferences, and rules. One list item per line.\n")
+	b.WriteString("To remember: append a line. To forget: delete the line.\n")
 
-	msgs = append(msgs, input.WorkingMessages...)
-	return msgs
+	if len(data) == 0 {
+		b.WriteString("(empty)\n")
+	} else {
+		b.WriteString(strings.TrimSpace(string(data)))
+	}
+	return b.String()
+}
+
+func buildSkillsSection(skills []SkillInfo) string {
+	var b strings.Builder
+	b.WriteString("## Available Skills\n")
+	for _, s := range skills {
+		b.WriteString("\n### " + s.Name + "\n")
+		for k, v := range s.Frontmatter {
+			fmt.Fprintf(&b, "%s: %v\n", k, v)
+		}
+	}
+	return b.String()
+}
+
+func buildCompressedSection(cc *CompressedContext) string {
+	var b strings.Builder
+	b.WriteString("## Conversation Summary\n")
+	b.WriteString(cc.Summary)
+	if len(cc.Hints) > 0 {
+		b.WriteString("\n\n### Retrieval Hints\n")
+		for i, h := range cc.Hints {
+			fmt.Fprintf(&b, "%d. %s (query: %s)\n", i+1, h.Description, h.Query)
+		}
+	}
+	return b.String()
 }
 
 func (r *runner) buildModelRequest(session Session, messages []Message) ChatCompletionRequest {
@@ -976,8 +994,8 @@ var (
 	}
 	builtinRecallDef = FunctionDefinition{
 		Name:        "recall",
-		Description: "Search past conversation history for relevant information. Use this when you need to remember previously discussed facts, user preferences, decisions, or context that may not be in the current conversation window. Returns ranked results with relevance scores.",
-		Parameters:  json.RawMessage(`{"type":"object","properties":{"query":{"type":"string","description":"Search query to find relevant memories (e.g. 'user favourite colour', 'database version', 'project deadline')"}},"required":["query"]}`),
+		Description: "Search the full message archive for exact details — commands, file names, dates, numbers, or verbatim text — that the conversation summary may have omitted. Do NOT use for general context or preferences; the conversation summary and semantic memory already cover those. Returns ranked results with relevance scores.",
+		Parameters:  json.RawMessage(`{"type":"object","properties":{"query":{"type":"string","description":"Specific keywords to find (e.g. 'kubectl rollout restart', 'benchmark_2024.csv', 'port 5432')"}},"required":["query"]}`),
 	}
 )
 
@@ -1450,13 +1468,13 @@ func (r *runner) executeSubAgent(ctx context.Context, session Session, call Tool
 
 	// Build a sub-agent from the caller's capabilities.
 	sub := Agent{
-		Name:         args.Name,
-		Description:  args.Description,
+		Name:          args.Name,
+		Description:   args.Description,
 		SystemPrompts: []string{args.Prompt},
-		Model:        r.runModel,
-		Tools:        stripAgentTools(r.agent.Tools),
-		MaxTurns:     3,
-		NoSpawn:      true,
+		Model:         r.runModel,
+		Tools:         stripAgentTools(r.agent.Tools),
+		MaxTurns:      3,
+		NoSpawn:       true,
 		// no Approver, no Memory — safe sub-agent
 	}
 

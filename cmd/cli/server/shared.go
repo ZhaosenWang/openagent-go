@@ -24,13 +24,15 @@ import (
 
 // ── Shared agent setup ──
 
-// buildMemory opens the SQLite memory and session store at path.
-func buildMemory(path string) (*sqlite.Memory, session.Store, func(), error) {
-	_ = os.MkdirAll(filepath.Dir(path), 0755)
-	mem, err := sqlite.New(path)
+// buildMemory opens the SQLite memory and session store under profilesDir/memory/.
+func buildMemory(profilesDir string) (*sqlite.Memory, session.Store, func(), error) {
+	memDir := filepath.Join(profilesDir, "memory")
+	_ = os.MkdirAll(memDir, 0755)
+	mem, err := sqlite.New(filepath.Join(memDir, "memory.db"))
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("memory: %w", err)
 	}
+	mem.WithSemanticMD(filepath.Join(memDir, "semantic.md"))
 	store, err := sessionsqlite.New(mem.DB())
 	if err != nil {
 		mem.Close()
@@ -126,7 +128,7 @@ IMPORTANT: If the current dynamic context conflicts with earlier conversation hi
 - When receiving a large or complex task, decompose it into structured steps before starting work.
 - Read existing context before making changes — understand, then act.
 - After each tool execution, verify the result before proceeding to the next step.
-- Use recall to search conversation history for relevant context or past decisions.
+- Use recall to search conversation history for exact details — commands, file names, dates — not covered by the summary.
 - When uncertain about requirements, ask clarifying questions rather than guessing.
 `
 
@@ -142,6 +144,24 @@ IMPORTANT: Help the user complete tasks by using available tools when appropriat
 - Respect user time — surface the most relevant information first. Avoid verbose preambles.
 - Use clear, imperative language for actions; use structured formatting for complex output.
 `
+
+// resolveProfilesDir resolves the profiles directory to an absolute path.
+// $(pwd)/$(profiles) takes priority, ~/$(profiles) is fallback.
+func resolveProfilesDir(profiles string) string {
+	if profiles == "" {
+		profiles = ".openagent"
+	}
+	if cwd, err := os.Getwd(); err == nil {
+		p := filepath.Join(cwd, profiles)
+		if info, err := os.Stat(p); err == nil && info.IsDir() {
+			return p
+		}
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		return filepath.Join(home, profiles)
+	}
+	return filepath.Join(os.TempDir(), profiles)
+}
 
 // resolveProfiles reads AGENTS.md and SOUL.md from the profiles directory.
 // Falls back to built-in defaults when the files are missing.

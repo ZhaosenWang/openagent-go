@@ -85,7 +85,7 @@ func WithMaxWorkingTokens(n int) AgentOption {
 
 // WithMaxCompressedTokens sets the maximum token budget for the compressed
 // summary. The summarizer will merge and de-duplicate facts when the budget
-// is exceeded. 0 means no explicit limit (default 2048).
+// is exceeded. 0 means no explicit limit (default 8192).
 func WithMaxCompressedTokens(n int) AgentOption {
 	return func(a *Agent) { a.MaxCompressedTokens = n }
 }

@@ -41,16 +41,12 @@ func RunREST(ctx context.Context, cfg *config.Config, caps Capabilities) error {
 		defer mcpCleanup()
 	}
 
-	cfgPath, _ := config.Path()
-	dataDir := filepath.Join(filepath.Dir(cfgPath), "data")
-	mem, store, cleanup, err := buildMemory(filepath.Join(dataDir, "memory.db"))
+	profilesDir := resolveProfilesDir(cfg.Profiles)
+	mem, store, cleanup, err := buildMemory(profilesDir)
 	if err != nil {
 		return err
 	}
 	defer cleanup()
-	if caps.OnSummarizer() && m != nil {
-		mem.WithSummarizer(summarizer.New(m))
-	}
 
 	opts := []openagent.AgentOption{
 		openagent.WithModel(m),
@@ -65,6 +61,10 @@ func RunREST(ctx context.Context, cfg *config.Config, caps Capabilities) error {
 	}
 	opts = buildOpts(opts, caps, m)
 	agent := openagent.NewAgent("openagent", opts...)
+
+	if caps.OnSummarizer() && m != nil && caps.OnMemory() {
+		mem.WithSummarizer(summarizer.New(m).WithMaxTokens(agent.MaxCompressedTokens))
+	}
 
 	handler := rest.NewHandler(agent).
 		WithSessionStore(store).

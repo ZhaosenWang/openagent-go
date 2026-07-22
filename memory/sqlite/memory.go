@@ -30,10 +30,11 @@ import (
 
 // Memory implements openagent.Memory backed by SQLite.
 type Memory struct {
-	db            *sql.DB
-	embedder      openagent.Embedder
-	summarizer    openagent.Summarizer
-	maxVectorScan int // max rows to scan for vector similarity, default 2000
+	db             *sql.DB
+	embedder       openagent.Embedder
+	summarizer     openagent.Summarizer
+	maxVectorScan  int    // max rows to scan for vector similarity, default 2000
+	semanticMDPath string // path to semantic.md, re-read each turn; "" = disabled
 }
 
 // New opens a SQLite database at path and runs migrations.
@@ -76,6 +77,18 @@ func (m *Memory) WithMaxVectorScan(n int) *Memory {
 	m.maxVectorScan = n
 	return m
 }
+
+// WithSemanticMD sets the path to the semantic memory file (semantic.md).
+// When set, the runner re-reads it every turn and injects its content into
+// ## Semantic Memory section of the dynamic context. Agent can edit it
+// directly with standard file tools (write_file, read_file).
+func (m *Memory) WithSemanticMD(path string) *Memory {
+	m.semanticMDPath = path
+	return m
+}
+
+// SemanticMDPath returns the path to semantic.md, or "" if not configured.
+func (m *Memory) SemanticMDPath() string { return m.semanticMDPath }
 
 // Close releases the database connection.
 func (m *Memory) Close() error { return m.db.Close() }
@@ -441,21 +454,21 @@ func (m *Memory) ftsSearch(ctx context.Context, sessionID, query string, limit i
 		return nil, nil
 	}
 
-	// Build a keyword query: each whitespace-separated token has
-	// leading/trailing punctuation trimmed (so "colour?" matches "colour"),
-	// is quoted as an FTS5 phrase, and is OR-joined. Results are ranked by
-	// BM25 (ORDER BY rank), so messages sharing more — and rarer — tokens
-	// surface first. OR (not implicit AND) is used because the query is
-	// often natural language (the recall_memory tool passes the model's
-	// query); AND would require every token present and return nothing when
-	// the query has words not in any stored message.
+	// Build a keyword query for the trigram tokenizer.
+	// Unlike the default unicode61 tokenizer (which treats CJK runs as a single
+	// token), the trigram tokenizer breaks everything into 3-character n-grams.
+	// Quoting tokens as FTS5 phrases ("...") is counterproductive with trigram —
+	// it demands consecutive tri-gram sequence alignment, which is too strict for
+	// natural-language queries. Instead we pass bare tokens and let the trigram
+	// tokenizer tokenize the query identically to how content was indexed.
+	// BM25 ranking naturally boosts messages that share more (and rarer) trigrams.
 	//
-	// The trigram tokenizer (see migrate) only matches tokens of ≥3
-	// characters, so shorter tokens are dropped. When no usable token
-	// remains, fall back to a LIKE substring scan.
+	// Tokens shorter than 3 characters are dropped (trigram can't match them).
+	// When no usable token remains, fall back to a LIKE substring scan.
 	if q := buildFTSQuery(query); q != "" {
 		rows, err := m.db.QueryContext(ctx,
-			`SELECT m.id, m.role, m.name, m.content, m.content_parts, m.tool_calls, m.tool_call_id, reasoning_content
+			`SELECT m.id, m.role, m.name, m.content, m.content_parts, m.tool_calls, m.tool_call_id, reasoning_content,
+			        bm25(messages_fts) AS bm25_score
 			 FROM messages_fts f
 			 JOIN messages m ON f.rowid = m.id
 			 WHERE m.session_id = ? AND messages_fts MATCH ?
@@ -464,23 +477,37 @@ func (m *Memory) ftsSearch(ctx context.Context, sessionID, query string, limit i
 			sessionID, q, limit,
 		)
 		if err == nil {
-			msgs, scanErr := scanMessages(rows)
+			results := scanSearchResults(rows, true)
 			rows.Close()
-			if scanErr != nil {
-				return nil, scanErr
-			}
-			return toSearchResults(msgs), nil
+			return results, nil
 		}
 		// FTS5 errored (unexpected query shape) — fall back to LIKE.
 	}
 	return m.likeSearch(ctx, sessionID, query, limit)
 }
 
-// buildFTSQuery turns a free-text query into a safe FTS5 expression. Each
-// whitespace-separated token has leading/trailing punctuation trimmed, is
-// quoted as a phrase, and is OR-joined. Tokens shorter than 3 characters are
-// dropped (the trigram tokenizer cannot match them). Returns "" when no usable
-// token remains.
+// FTS5 special characters that must be escaped in bare-token queries.
+// These are the FTS5 expression syntax characters (AND, OR, NOT, NEAR are case-
+// sensitive keywords and only special when standalone, which our tokenisation
+// naturally avoids — so we only need to strip the single-char operators).
+var fts5Special = strings.NewReplacer(
+	`"`, `""`,
+	`(`, ``,
+	`)`, ``,
+	`*`, ``,
+	`+`, ``,
+	`-`, ``,
+	`~`, ``,
+	`^`, ``,
+)
+
+// buildFTSQuery turns a free-text query into a safe FTS5 expression for the
+// trigram tokenizer. Each whitespace-separated token has leading/trailing
+// punctuation trimmed and FTS5 special characters stripped. Tokens shorter than
+// 3 characters are dropped (the trigram tokenizer cannot match them). Remaining
+// tokens are bare (no phrase quoting) and OR-joined — BM25 ranking will favour
+// messages that share more trigrams.
+// Returns "" when no usable token remains.
 func buildFTSQuery(query string) string {
 	var parts []string
 	for _, tok := range strings.Fields(query) {
@@ -490,14 +517,19 @@ func buildFTSQuery(query string) string {
 		if len([]rune(tok)) < 3 {
 			continue
 		}
-		// Escape embedded double-quotes per FTS5 phrase rules.
-		parts = append(parts, `"`+strings.ReplaceAll(tok, `"`, `""`)+`"`)
+		tok = fts5Special.Replace(tok)
+		tok = strings.TrimSpace(tok)
+		if tok == "" || len([]rune(tok)) < 3 {
+			continue
+		}
+		parts = append(parts, tok)
 	}
 	return strings.Join(parts, " OR ")
 }
 
 // likeSearch is the substring fallback used when the FTS query is empty (all
-// tokens too short) or errors out. It does a case-insensitive LIKE scan.
+// tokens too short) or errors out. Scores by match position — earlier match
+// within the content ranks higher — and drops results below threshold.
 func (m *Memory) likeSearch(ctx context.Context, sessionID, query string, limit int) ([]openagent.SearchResult, error) {
 	rows, err := m.db.QueryContext(ctx,
 		`SELECT id, role, name, content, content_parts, tool_calls, tool_call_id, reasoning_content
@@ -511,21 +543,108 @@ func (m *Memory) likeSearch(ctx context.Context, sessionID, query string, limit 
 		return nil, fmt.Errorf("sqlite fts: %w", err)
 	}
 	defer rows.Close()
-	msgs, err := scanMessages(rows)
-	if err != nil {
+
+	lowerQ := strings.ToLower(query)
+	var candidates []scoredMsg
+	for rows.Next() {
+		var id int64
+		var role, name, content, contentParts, toolCalls, toolCallID, reasoningContent string
+		if err := rows.Scan(&id, &role, &name, &content, &contentParts, &toolCalls, &toolCallID, &reasoningContent); err != nil {
+			continue
+		}
+		pos := strings.Index(strings.ToLower(content), lowerQ)
+		if pos < 0 {
+			continue
+		}
+		// Position-based score: earlier match → higher score.
+		// pos=0 → 1.00, pos=50 → 0.67, pos=200 → 0.33, pos=1000 → 0.09.
+		score := 1.0 / (1.0 + float64(pos)/100.0)
+		msg := rowToMessage(role, name, content, contentParts, toolCalls, toolCallID, reasoningContent)
+		msg.Index = id
+		candidates = append(candidates, scoredMsg{msg: msg, score: score})
+	}
+	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	return toSearchResults(msgs), nil
+	return topScored(candidates, limit), nil
 }
 
 func likeEscape(s string) string {
 	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(s)
 }
 
-func toSearchResults(msgs []openagent.Message) []openagent.SearchResult {
-	results := make([]openagent.SearchResult, len(msgs))
-	for i, msg := range msgs {
-		results[i] = openagent.SearchResult{Message: msg, Score: 1.0}
+// ── Search result helpers ──
+
+type scoredMsg struct {
+	msg   openagent.Message
+	score float64
+}
+
+// scanSearchResults reads rows from an FTS5 query that selected bm25_score.
+// When hasBM25 is true, the first column is the raw (negative) BM25 value;
+// otherwise it's a plain message scan (used by vectorSearch via the existing
+// path which already handles its own scoring).
+func scanSearchResults(rows *sql.Rows, hasBM25 bool) []openagent.SearchResult {
+	var candidates []scoredMsg
+	for rows.Next() {
+		var id int64
+		var role, name, content, contentParts, toolCalls, toolCallID, reasoningContent string
+		var rawBM25 float64
+		scanArgs := []any{&id, &role, &name, &content, &contentParts, &toolCalls, &toolCallID, &reasoningContent}
+		if hasBM25 {
+			scanArgs = append(scanArgs, &rawBM25)
+		}
+		if err := rows.Scan(scanArgs...); err != nil {
+			continue
+		}
+		msg := rowToMessage(role, name, content, contentParts, toolCalls, toolCallID, reasoningContent)
+		msg.Index = id
+
+		score := 1.0
+		if hasBM25 {
+			score = normalizeBM25(rawBM25)
+			if score < 0.1 {
+				continue // noise floor — drop irrelevant matches
+			}
+		}
+		candidates = append(candidates, scoredMsg{msg: msg, score: score})
+	}
+	return topScored(candidates, -1) // limit applied later by caller
+}
+
+// normalizeBM25 converts a raw FTS5 bm25() value to [0, 1].
+// SQLite FTS5 bm25() returns a negative value where:
+//
+//	  -5  = excellent match (many rare trigrams in common)
+//	 -10  = good match
+//	 -20  = moderate match
+//	 -40+ = weak / noisy match
+//
+// We use a sigmoid-like normalisation so top matches cluster near 1.0.
+func normalizeBM25(raw float64) float64 {
+	if raw >= 0 {
+		return 1.0 // should never happen, but guard
+	}
+	abs := -raw
+	return 1.0 / (1.0 + abs/8.0)
+}
+
+// topScored sorts candidates by score descending and returns up to limit results.
+// limit <= 0 means return all.
+func topScored(candidates []scoredMsg, limit int) []openagent.SearchResult {
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].score > candidates[j].score
+	})
+	n := len(candidates)
+	if limit > 0 && limit < n {
+		n = limit
+	}
+	results := make([]openagent.SearchResult, n)
+	for i := 0; i < n; i++ {
+		results[i] = openagent.SearchResult{
+			Message: candidates[i].msg,
+			Score:   candidates[i].score,
+		}
 	}
 	return results
 }

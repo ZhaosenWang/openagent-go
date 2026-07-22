@@ -41,7 +41,7 @@ type Agent struct {
 	// Configuration
 	MaxTurns            int // max loop iterations, 0 = default (20)
 	MaxWorkingTokens    int // max tokens for working set before compaction; 0 = 70% of model context window
-	MaxCompressedTokens int // max tokens for compressed summary, 0 = no limit (default 2048)
+	MaxCompressedTokens int // max tokens for compressed summary, 0 = no limit (default 8192)
 
 	// ReasoningEffort is passed through to the Model's ChatCompletionRequest
 	// for providers that support it (OpenAI o-series, Anthropic extended thinking).
@@ -76,7 +76,8 @@ func NewAgent(name string, opts ...AgentOption) *Agent {
 		Name:                name,
 		MaxTurns:            20,
 		MaxWorkingTokens:    0, // 0 = auto: 70% of model context window
-		MaxCompressedTokens: 2048,
+		MaxCompressedTokens: 8192,
+		Prompt:              BuildPrompt,
 	}
 	for _, o := range opts {
 		o(a)

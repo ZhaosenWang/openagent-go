@@ -19,12 +19,20 @@ import (
 // Compressor implements openagent.Summarizer by calling the configured
 // Model to produce incremental summaries.
 type Compressor struct {
-	model openagent.Model
+	model     openagent.Model
+	maxTokens int // 0 = no limit; non-zero = instruct LLM to keep summary under this
 }
 
 // New creates a Compressor backed by m.
 func New(m openagent.Model) *Compressor {
 	return &Compressor{model: m}
+}
+
+// WithMaxTokens sets a hard cap on the summarizer's LLM output via
+// ChatCompletionRequest.MaxTokens. Default is 0 (no cap).
+func (c *Compressor) WithMaxTokens(n int) *Compressor {
+	c.maxTokens = n
+	return c
 }
 
 // Summarize implements openagent.Summarizer.
@@ -41,8 +49,9 @@ func (c *Compressor) Summarize(ctx context.Context, messages []openagent.Message
 		return nil, fmt.Errorf("summarizer: no messages to summarize")
 	}
 
-	prompt := buildSummarizePrompt(messages, previous)
+	prompt := c.buildSummarizePrompt(messages, previous)
 	resp, err := c.model.ChatCompletion(ctx, openagent.ChatCompletionRequest{
+		MaxTokens: c.maxTokens,
 		Messages: []openagent.Message{
 			{Role: openagent.RoleSystem, Content: summarizeSystemPrompt},
 			{Role: openagent.RoleUser, Content: prompt},
@@ -75,7 +84,7 @@ Rules:
 Format:
 {"summary": "<text>", "hints": [{"description": "<what to find>", "query": "<search keywords>"}]}`
 
-func buildSummarizePrompt(messages []openagent.Message, prev *openagent.CompressedContext) string {
+func (c *Compressor) buildSummarizePrompt(messages []openagent.Message, prev *openagent.CompressedContext) string {
 	var b strings.Builder
 	if prev != nil && prev.Summary != "" {
 		b.WriteString("## Existing Summary\n")

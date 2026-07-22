@@ -5,7 +5,6 @@ import (
 	"log"
 	"log/slog"
 	"os"
-	"path/filepath"
 
 	openagent "github.com/yusheng-g/openagent-go"
 	"github.com/yusheng-g/openagent-go/acp"
@@ -26,10 +25,8 @@ import (
 //  5. Construct the agent.
 //  6. Wrap in AgentServer, launch ACP protocol mux on stdin/stdout.
 func RunACP(ctx context.Context, cfg *config.Config, caps Capabilities) error {
-	cfgPath, _ := config.Path()
-	dataDir := filepath.Join(filepath.Dir(cfgPath), "data")
-
-	mem, sessionStore, cleanup, err := buildMemory(filepath.Join(dataDir, "memory.db"))
+	profilesDir := resolveProfilesDir(cfg.Profiles)
+	mem, sessionStore, cleanup, err := buildMemory(profilesDir)
 	if err != nil {
 		return err
 	}
@@ -54,9 +51,6 @@ func RunACP(ctx context.Context, cfg *config.Config, caps Capabilities) error {
 	var firstM openagent.Model
 	if len(modelInfos) > 0 {
 		firstM = modelInfos[0].Model
-		if caps.OnSummarizer() {
-			mem.WithSummarizer(summarizer.New(firstM))
-		}
 	}
 
 	// Tools and sandbox are created per-turn in agentForTurn so they
@@ -70,6 +64,10 @@ func RunACP(ctx context.Context, cfg *config.Config, caps Capabilities) error {
 	}
 	opts = buildOpts(opts, caps, firstM)
 	agent := openagent.NewAgent("openagent", opts...)
+
+	if caps.OnMemory() && caps.OnSummarizer() && firstM != nil {
+		mem.WithSummarizer(summarizer.New(firstM).WithMaxTokens(agent.MaxCompressedTokens))
+	}
 
 	// Pass nil Mem when --memory=off so the AgentServer skips history
 	// replay and memory cleanup (all s.Mem uses are nil-guarded). The
