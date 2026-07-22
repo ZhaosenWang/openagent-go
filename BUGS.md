@@ -1,6 +1,6 @@
 # BUGS.md — Known Issues & Technical Debt
 
-> Last updated 2026-07-21 (rev 8).
+> Last updated 2026-07-22 (rev 9).
 > Format: `[P0]` = critical, `[P1]` = high, `[P2]` = medium, `[P3]` = low.
 > `[DEBT]` = technical debt (no immediate breakage, will compound).
 
@@ -476,6 +476,34 @@ Final tool availability:
 | `plan_create` | ✗ | ✗ | ✓ |
 | `plan_update` | ✓ | ✓ | ✓ |
 | `exit_plan_mode` | ✗ | ✗ | ✓ |
+
+---
+
+### [P2] `memory/file` `countLinesLocked` hits `bufio.Scanner` default 64KB cap — long messages cause session amnesia / append deadlock
+
+[memory/file/memory.go:316-332](memory/file/memory.go#L316),
+[memory/file/memory.go:91-97](memory/file/memory.go#L91),
+[runner.go:521-529](runner.go#L521),
+[acp/server.go:464-473](acp/server.go#L464),
+[rest/session.go:188,208](rest/session.go#L188),
+[rest/team_memory.go:77-80](rest/team_memory.go#L77):
+
+`countLinesLocked` uses `bufio.NewScanner(f)` without `scanner.Buffer(...)`, so it inherits the stdlib default `bufio.MaxScanTokenSize = 64*1024` (64KB). The sibling write path (`Append`, no limit) and read path `readAllLocked` (explicit 1MB cap) are unaffected — a single JSON message > 64KB can be written and read back, **only "count lines" returns `bufio.ErrTooLong`**. Trigger threshold is low: one assistant message embedding a large artifact (a `read` of a big single-line file, a `grep` full-repo hit, a base64 screenshot, an SQL dump) suffices. `Compact` never deletes original messages, so the oversized line **persists permanently** — one trigger becomes a chronic condition.
+
+Note: `cli serve` (REST + ACP) uses `memory/sqlite`; `file` memory is only reached via `examples/iac`, `examples/memory`, and downstream embedded users, so the main product surface is unaffected.
+
+Impact:
+
+1. **Silent amnesia mid-run** — `prepareMemory` (`runner.go:521`) gets `ErrTooLong` from `Count`, returns `nil, ci` without fataling; the main loop continues with **zero history** for the turn. No error surfaces to the user. Compaction/summarizer also stop firing.
+2. **Restart append deadlock** — `Append` (`memory.go:91-97`) seeds `nextIdx` via `countLinesLocked` on first use. Once the file holds a >64KB line, the first `Append` after restart errors, leaving `nextIdx` at 0; **every subsequent `Append` re-enters the `==0` branch and fails again**. `appendMemory` (`runner.go:1013-1024`) is void and only observes, so the in-memory conversation keeps running while all new messages are silently dropped.
+3. **Count/Recent split-brain** — for 64KB < line ≤ 1MB, `readAllLocked` succeeds but `Count` errors. `globalOffset := totalCount - len(msgs)` (`runner.go:538`) goes negative, skewing compaction and indexing.
+4. **Error-swallowing callers make sessions "vanish"** — `acp/server.go:467`, `rest/session.go:188/208`, and `rest/team_memory.go:77-80` discard `Count` errors, treating them as `n=0`. A session with messages is judged empty and disappears from REST lists / ACP replay (file still present, `Recent` still readable).
+
+Repro:
+1. Start an agent with file memory (`examples/iac` or an embedded path).
+2. Have the agent `read`/`grep` a single-line file > 64KB.
+3. Next turn: agent forgets the conversation (empty history).
+4. Restart: new inputs to that session fail to persist (`file memory append: bufio.Scanner: token too long`) until the oversized line is manually split.
 
 ---
 
