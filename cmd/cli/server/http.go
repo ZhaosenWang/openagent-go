@@ -29,7 +29,7 @@ func RunREST(ctx context.Context, cfg *config.Config, caps Capabilities) error {
 	sb, err := native.NewWithPolicy(workDir, sandboxPolicy(cfg.Sandbox))
 	var tools []openagent.Tool
 	if err == nil {
-		tools = buildTools(sb, workDir, []string{"shell", "read", "write", "ls", "grep"})
+		tools = buildTools(sb, workDir, []string{"shell", "read", "write", "edit", "ls", "grep"})
 	} else {
 		log.Printf("WARNING: sandbox unavailable, tools disabled: %v", err)
 	}

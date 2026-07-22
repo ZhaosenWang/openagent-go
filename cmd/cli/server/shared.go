@@ -111,6 +111,9 @@ func buildTools(sandbox *native.Sandbox, workDir string, toolList []string) []op
 	if enabled["grep"] {
 		tools = append(tools, opentool.NewGrep(workDir))
 	}
+	if enabled["edit"] {
+		tools = append(tools, opentool.NewEditFile(workDir))
+	}
 	return tools
 }
 

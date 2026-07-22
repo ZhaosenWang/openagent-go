@@ -382,3 +382,101 @@ func (t *ListDir) Execute(ctx context.Context, args json.RawMessage) (string, er
 	}
 	return b.String(), nil
 }
+
+// ── EditFile ──
+
+// EditFile performs exact string replacement in a file.
+type EditFile struct {
+	workDir string
+}
+
+func NewEditFile(workDir string) *EditFile {
+	abs, _ := filepath.Abs(workDir)
+	return &EditFile{workDir: abs}
+}
+
+func (t *EditFile) Definition() openagent.FunctionDefinition {
+	return openagent.FunctionDefinition{
+		Name:        "edit",
+		Description: "Replace a string in a file. Finds old_text and replaces it with new_text. When replace_all is false (default), only the first match is replaced. Returns an error when old_text is not unique — use replace_all or make old_text more specific.",
+		Parameters: json.RawMessage(`{
+			"type": "object",
+			"properties": {
+				"path":        {"type": "string", "description": "File path"},
+				"old_text":    {"type": "string", "description": "Text to find and replace"},
+				"new_text":    {"type": "string", "description": "Replacement text"},
+				"replace_all": {"type": "boolean", "description": "Replace all occurrences (default: false)"}
+			},
+			"required": ["path", "old_text", "new_text"]
+		}`),
+	}
+}
+
+func (t *EditFile) CanSelfApprove(args json.RawMessage) bool {
+	var params struct {
+		Path string `json:"path"`
+	}
+	json.Unmarshal(args, &params)
+	if params.Path == "" {
+		return false
+	}
+	abs, err := validatePath(t.workDir, params.Path)
+	if err != nil {
+		return false
+	}
+	return isWithinWorkspace(t.workDir, abs) || isWithinArtifactDir(abs)
+}
+
+func (t *EditFile) Execute(ctx context.Context, args json.RawMessage) (string, error) {
+	var params struct {
+		Path       string `json:"path"`
+		OldText    string `json:"old_text"`
+		NewText    string `json:"new_text"`
+		ReplaceAll bool   `json:"replace_all"`
+	}
+	if err := json.Unmarshal(args, &params); err != nil {
+		return "", fmt.Errorf("edit: %w", err)
+	}
+	if params.Path == "" {
+		return "", fmt.Errorf("edit: path is required")
+	}
+	if params.OldText == "" {
+		return "", fmt.Errorf("edit: old_text is required")
+	}
+
+	abs, err := validatePath(t.workDir, params.Path)
+	if err != nil {
+		return "", err
+	}
+
+	data, err := os.ReadFile(abs)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("edit: file not found: %s", params.Path)
+		}
+		return "", fmt.Errorf("edit: %w", err)
+	}
+
+	content := string(data)
+	count := strings.Count(content, params.OldText)
+	if count == 0 {
+		return "", fmt.Errorf("edit: old_text not found in %s", params.Path)
+	}
+	if !params.ReplaceAll && count > 1 {
+		return "", fmt.Errorf("edit: old_text found %d times in %s — set replace_all to true or make old_text more specific", count, params.Path)
+	}
+
+	n := 1
+	if params.ReplaceAll {
+		n = count
+	}
+	newContent := strings.Replace(content, params.OldText, params.NewText, n)
+	if err := os.WriteFile(abs, []byte(newContent), 0644); err != nil {
+		return "", fmt.Errorf("edit: %w", err)
+	}
+
+	if params.ReplaceAll {
+		return fmt.Sprintf("Replaced %d occurrences in %s", count, params.Path), nil
+	}
+	return fmt.Sprintf("Replaced in %s", params.Path), nil
+}
