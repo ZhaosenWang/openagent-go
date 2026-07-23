@@ -1473,6 +1473,7 @@ func (r *runner) executeSubAgent(ctx context.Context, session Session, call Tool
 		Name:          args.Name,
 		Description:   args.Description,
 		SystemPrompts: []string{args.Prompt},
+		Prompt:        BuildPrompt,
 		Model:         r.runModel,
 		Tools:         stripAgentTools(r.agent.Tools),
 		MaxTurns:      3,
