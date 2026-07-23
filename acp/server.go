@@ -184,7 +184,7 @@ func (s *AgentServer) newSessionID() openacp.SessionId {
 	return openacp.SessionId(fmt.Sprintf("acp_%d_%d", time.Now().UnixNano(), id))
 }
 
-func (s *AgentServer) saveMeta(id string, cwd string, kind string) {
+func (s *AgentServer) saveMeta(id string, cwd string, kind string, meta map[string]any) {
 	if s.SessionStore == nil {
 		return
 	}
@@ -194,6 +194,7 @@ func (s *AgentServer) saveMeta(id string, cwd string, kind string) {
 		Cwd:       cwd,
 		CreatedAt: now,
 		UpdatedAt: now,
+		Meta:      meta,
 	}
 	info.SetMeta("kind", kind)
 	_ = s.SessionStore.Save(context.Background(), info)
@@ -408,7 +409,7 @@ func (s *AgentServer) OnNewSession(ctx context.Context, req openacp.NewSessionRe
 		mcpTools:              mcpTools,
 	}
 	s.putSession(id, ss)
-	s.saveMeta(string(id), req.Cwd, "acp")
+	s.saveMeta(string(id), req.Cwd, "acp", req.Meta)
 
 	// Send available commands so the client can show them immediately.
 	if s.updateSender != nil {
@@ -635,6 +636,7 @@ func (s *AgentServer) OnListSessions(ctx context.Context, req openacp.ListSessio
 			Cwd:       cwd,
 			Title:     si.Title,
 			UpdatedAt: si.UpdatedAt.Format(time.RFC3339),
+			Meta:      si.Meta,
 		})
 	}
 	return &openacp.ListSessionsResponse{Sessions: out}, nil
