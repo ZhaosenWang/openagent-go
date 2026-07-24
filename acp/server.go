@@ -1158,7 +1158,6 @@ func (s *AgentServer) OnPrompt(ctx context.Context, req openacp.PromptRequest, s
 		return copyPlanEntries(ss.planEntries), nil
 	})
 	agent.Tools = append(agent.Tools, pu)
-
 	// ── Run the agent ──
 	ch := agent.RunStream(ctx, oaSession, input)
 	var usage openagent.Usage

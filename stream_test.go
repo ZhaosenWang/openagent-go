@@ -169,17 +169,25 @@ func TestStreamExecutorProgressEvents(t *testing.T) {
 		t.Fatal("missing StreamDone")
 	}
 
-	// Verify progress events.
-	if len(progressEvents) != 3 {
-		t.Fatalf("expected 3 progress events, got %d", len(progressEvents))
+	// Verify progress events. With 0ms delay, all chunks arrive before the
+	// 1-second rate-limiting ticker fires, so they are batched into one
+	// progress event. The rate limiter batches, it does not drop.
+	if len(progressEvents) < 1 {
+		t.Fatalf("expected at least 1 progress event, got %d", len(progressEvents))
 	}
-	for i, pe := range progressEvents {
-		if pe.Text != streamTool.chunks[i] {
-			t.Errorf("progress[%d]: expected %q, got %q", i, streamTool.chunks[i], pe.Text)
-		}
+	for _, pe := range progressEvents {
 		if pe.ToolCallID != "call_abc" {
-			t.Errorf("progress[%d]: expected ToolCallID=call_abc, got %q", i, pe.ToolCallID)
+			t.Errorf("progress expected ToolCallID=call_abc, got %q", pe.ToolCallID)
 		}
+	}
+	// Verify all chunk content is present in the batched event(s).
+	combined := ""
+	for _, pe := range progressEvents {
+		combined += pe.Text
+	}
+	expected := strings.Join(streamTool.chunks, "")
+	if combined != expected {
+		t.Errorf("combined progress text: expected %q, got %q", expected, combined)
 	}
 
 	// Verify final result aggregates all chunks.
@@ -289,14 +297,17 @@ func TestConcurrentStreamingToolsDisambiguated(t *testing.T) {
 	}()
 	wg.Wait()
 
-	// Verify both tool call IDs received progress events.
+	// With 0ms delay, chunks arrive before the 1-second ticker fires.
+	// Each tool's chunks are batched into one progress event. The rate
+	// limiter batches by tool-call-id — they don't merge across tools.
+	// Verify at least one progress event per tool and correct content.
 	aChunks := progressByID["call_aaa"]
 	bChunks := progressByID["call_bbb"]
-	if len(aChunks) != 3 {
-		t.Errorf("tool_a: expected 3 chunks, got %d: %v", len(aChunks), aChunks)
+	if len(aChunks) < 1 {
+		t.Errorf("tool_a: expected at least 1 chunk, got %d", len(aChunks))
 	}
-	if len(bChunks) != 2 {
-		t.Errorf("tool_b: expected 2 chunks, got %d: %v", len(bChunks), bChunks)
+	if len(bChunks) < 1 {
+		t.Errorf("tool_b: expected at least 1 chunk, got %d", len(bChunks))
 	}
 	if strings.Join(aChunks, "") != "a1a2a3" {
 		t.Errorf("tool_a: expected 'a1a2a3', got %q", strings.Join(aChunks, ""))

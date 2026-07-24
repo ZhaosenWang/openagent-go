@@ -159,7 +159,10 @@ func (r *runner) run(ctx context.Context, session Session, prefix []Message, inp
 						}
 						r.appendMemory(bg, session, cancelled)
 						if ch != nil {
-							ch <- StreamEvent{Type: StreamToolResult, Message: cancelled}
+							select {
+							case ch <- StreamEvent{Type: StreamToolResult, Message: cancelled}:
+							default:
+							}
 						}
 						result.Messages = append(result.Messages, cancelled)
 					}
@@ -170,7 +173,10 @@ func (r *runner) run(ctx context.Context, session Session, prefix []Message, inp
 			}
 			runErr = ctx.Err()
 			if ch != nil {
-				ch <- StreamEvent{Type: StreamAborted, Error: runErr}
+				select {
+				case ch <- StreamEvent{Type: StreamAborted, Error: runErr}:
+				default:
+				}
 			}
 			return result, runErr
 		default:
@@ -251,7 +257,10 @@ func (r *runner) run(ctx context.Context, session Session, prefix []Message, inp
 					runErr = fmt.Errorf("input guard blocked: %s", gr.Reason)
 					r.observe(ctx, StageGuardIn, "leave", nil, giStart, runErr)
 					if ch != nil {
-						ch <- StreamEvent{Type: StreamError, Error: runErr}
+						select {
+						case ch <- StreamEvent{Type: StreamError, Error: runErr}:
+						default:
+						}
 					}
 					return result, runErr
 				}
@@ -259,7 +268,10 @@ func (r *runner) run(ctx context.Context, session Session, prefix []Message, inp
 					runErr = fmt.Errorf("input guard tripwire: %s", gr.Reason)
 					r.observe(ctx, StageGuardIn, "leave", nil, giStart, runErr)
 					if ch != nil {
-						ch <- StreamEvent{Type: StreamError, Error: runErr}
+						select {
+						case ch <- StreamEvent{Type: StreamError, Error: runErr}:
+						default:
+						}
 					}
 					return result, runErr
 				}
@@ -324,10 +336,13 @@ func (r *runner) run(ctx context.Context, session Session, prefix []Message, inp
 		if err != nil {
 			r.observe(ctx, StageModelCall, "leave", nil, mcStart, err)
 			if ch != nil {
+				evtType := StreamError
 				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-					ch <- StreamEvent{Type: StreamAborted, Error: err}
-				} else {
-					ch <- StreamEvent{Type: StreamError, Error: err}
+					evtType = StreamAborted
+				}
+				select {
+				case ch <- StreamEvent{Type: evtType, Error: err}:
+				default:
 				}
 			}
 			runErr = fmt.Errorf("model call: %w", err)
@@ -345,7 +360,10 @@ func (r *runner) run(ctx context.Context, session Session, prefix []Message, inp
 		if len(resp.Choices) == 0 {
 			runErr = fmt.Errorf("model returned no choices")
 			if ch != nil {
-				ch <- StreamEvent{Type: StreamError, Error: runErr}
+				select {
+				case ch <- StreamEvent{Type: StreamError, Error: runErr}:
+				default:
+				}
 			}
 			return result, runErr
 		}
@@ -359,7 +377,10 @@ func (r *runner) run(ctx context.Context, session Session, prefix []Message, inp
 		// Emit tool call events
 		for _, tc := range choice.Message.ToolCalls {
 			if ch != nil {
-				ch <- StreamEvent{Type: StreamToolCall, Message: Message{ToolCalls: []ToolCall{tc}}}
+				select {
+				case ch <- StreamEvent{Type: StreamToolCall, Message: Message{ToolCalls: []ToolCall{tc}}}:
+				default:
+				}
 			}
 		}
 
@@ -385,7 +406,10 @@ func (r *runner) run(ctx context.Context, session Session, prefix []Message, inp
 				runErr = fmt.Errorf("output guard blocked: %s", gr.Reason)
 				r.observe(ctx, StageGuardOut, "leave", nil, guardOutStart, runErr)
 				if ch != nil {
-					ch <- StreamEvent{Type: StreamError, Error: runErr}
+					select {
+					case ch <- StreamEvent{Type: StreamError, Error: runErr}:
+					default:
+					}
 				}
 				return result, runErr
 			}
@@ -393,7 +417,10 @@ func (r *runner) run(ctx context.Context, session Session, prefix []Message, inp
 				runErr = fmt.Errorf("output guard tripwire: %s", gr.Reason)
 				r.observe(ctx, StageGuardOut, "leave", nil, guardOutStart, runErr)
 				if ch != nil {
-					ch <- StreamEvent{Type: StreamError, Error: runErr}
+					select {
+					case ch <- StreamEvent{Type: StreamError, Error: runErr}:
+					default:
+					}
 				}
 				return result, runErr
 			}
@@ -430,7 +457,10 @@ func (r *runner) run(ctx context.Context, session Session, prefix []Message, inp
 					runErr = fmt.Errorf("output guard tripwire on tool result: %s", gr.Reason)
 					r.observe(ctx, StageGuardOut, "leave", nil, guardOutStart, runErr)
 					if ch != nil {
-						ch <- StreamEvent{Type: StreamError, Error: runErr}
+						select {
+						case ch <- StreamEvent{Type: StreamError, Error: runErr}:
+						default:
+						}
 					}
 					return result, runErr
 				}
@@ -439,7 +469,10 @@ func (r *runner) run(ctx context.Context, session Session, prefix []Message, inp
 				}
 			}
 			if ch != nil {
-				ch <- StreamEvent{Type: StreamToolResult, Message: tr}
+				select {
+				case ch <- StreamEvent{Type: StreamToolResult, Message: tr}:
+				case <-ctx.Done():
+				}
 			}
 			result.Messages = append(result.Messages, tr)
 			r.appendMemory(ctx, session, tr)
@@ -469,7 +502,10 @@ func (r *runner) run(ctx context.Context, session Session, prefix []Message, inp
 	result.TurnCount = turn
 	result.ContextWindow = r.runModel.ContextWindow()
 	if ch != nil {
-		ch <- StreamEvent{Type: StreamDone, Result: result}
+		select {
+		case ch <- StreamEvent{Type: StreamDone, Result: result}:
+		case <-ctx.Done():
+		}
 	}
 	return result, nil
 }
@@ -930,10 +966,13 @@ func (r *runner) executeOneToolInternal(ctx context.Context, session Session, ca
 		var pending string
 		flush := func() {
 			if pending != "" && ch != nil {
-				ch <- StreamEvent{
+				select {
+				case ch <- StreamEvent{
 					Type:       StreamToolProgress,
 					Text:       pending,
 					ToolCallID: call.ID,
+				}:
+				case <-toolCtx.Done():
 				}
 				pending = ""
 			}
@@ -953,6 +992,9 @@ func (r *runner) executeOneToolInternal(ctx context.Context, session Session, ca
 				}
 			case <-ticker.C:
 				flush()
+			case <-toolCtx.Done():
+				flush()
+				done = true
 			}
 		}
 		flush()
@@ -1206,7 +1248,10 @@ func (r *runner) callModel(ctx context.Context, req ChatCompletionRequest, ch ch
 				backoff = re.RetryAfter
 			}
 			if ch != nil {
-				ch <- StreamEvent{Type: StreamRetrying, Error: lastErr}
+				select {
+				case ch <- StreamEvent{Type: StreamRetrying, Error: lastErr}:
+				default:
+				}
 			}
 			select {
 			case <-time.After(backoff):
@@ -1236,7 +1281,7 @@ func (r *runner) callModelOnce(ctx context.Context, req ChatCompletionRequest, c
 	}
 	if reader != nil {
 		defer reader.Close()
-		return accumulateStream(reader, ch)
+		return accumulateStream(ctx, reader, ch)
 	}
 	// Non-streaming fallback: the model doesn't support streaming.
 	// Emit the full response as a single text_delta so consumers (WebUI, TUI)
@@ -1247,18 +1292,25 @@ func (r *runner) callModelOnce(ctx context.Context, req ChatCompletionRequest, c
 	}
 	if ch != nil && len(resp.Choices) > 0 {
 		if rc := resp.Choices[0].Message.ReasoningContent; rc != "" {
-			ch <- StreamEvent{Type: StreamThought, Text: rc}
+			select {
+			case ch <- StreamEvent{Type: StreamThought, Text: rc}:
+			case <-ctx.Done():
+			}
 		}
 		if resp.Choices[0].Message.Content != "" {
-			ch <- StreamEvent{Type: StreamTextDelta, Text: resp.Choices[0].Message.Content}
+			select {
+			case ch <- StreamEvent{Type: StreamTextDelta, Text: resp.Choices[0].Message.Content}:
+			case <-ctx.Done():
+			}
 		}
 	}
 	return resp, nil
 }
 
 // accumulateStream drains a StreamReader, assembling the full ChatCompletionResponse.
-// Sends text_delta events to ch (if non-nil) as content arrives.
-func accumulateStream(reader StreamReader, ch chan<- StreamEvent) (*ChatCompletionResponse, error) {
+// Sends text_delta events to ch (if non-nil) as content arrives. All sends are
+// cancellable via ctx to prevent deadlocks when the downstream consumer is gone.
+func accumulateStream(ctx context.Context, reader StreamReader, ch chan<- StreamEvent) (*ChatCompletionResponse, error) {
 	var (
 		content      string
 		reasoning    string
@@ -1280,10 +1332,16 @@ func accumulateStream(reader StreamReader, ch chan<- StreamEvent) (*ChatCompleti
 			}
 			if ch != nil {
 				if delta.ReasoningContent != "" {
-					ch <- StreamEvent{Type: StreamThought, Text: delta.ReasoningContent}
+					select {
+					case ch <- StreamEvent{Type: StreamThought, Text: delta.ReasoningContent}:
+					case <-ctx.Done():
+					}
 				}
 				if delta.Content != "" {
-					ch <- StreamEvent{Type: StreamTextDelta, Text: delta.Content}
+					select {
+					case ch <- StreamEvent{Type: StreamTextDelta, Text: delta.Content}:
+					case <-ctx.Done():
+					}
 				}
 			}
 			for _, tcd := range delta.ToolCalls {
@@ -1521,47 +1579,76 @@ func (r *runner) executeSubAgent(ctx context.Context, session Session, call Tool
 	}
 
 	// Streaming: forward sub-agent output as tool progress events.
+	// Rate-limited to 1/sec to prevent pipe deadlocks when the ACP
+	// transport or downstream SSE consumer reads slower than the
+	// sub-agent produces text deltas. Same pattern as the StreamExecutor
+	// path in executeOneToolInternal.
 	if ch != nil {
 		streamCh := sub.RunStream(ctx, subSession, UserMessage(args.Task))
 		var buf strings.Builder
 		var finalOutput string
-		for evt := range streamCh {
-			switch evt.Type {
-			case StreamThought:
-				ch <- StreamEvent{
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		var pending string
+		flush := func() {
+			if pending != "" {
+				select {
+				case ch <- StreamEvent{
 					Type:       StreamToolProgress,
-					Text:       evt.Text,
+					Text:       pending,
 					ToolCallID: call.ID,
+				}:
+				case <-ctx.Done():
 				}
-			case StreamTextDelta:
-				buf.WriteString(evt.Text)
-				ch <- StreamEvent{
-					Type:       StreamToolProgress,
-					Text:       evt.Text,
-					ToolCallID: call.ID,
-				}
-			case StreamError:
-				errText := "unknown error"
-				if evt.Error != nil {
-					errText = evt.Error.Error()
-				}
-				return Message{
-					Role:       RoleTool,
-					ToolCallID: call.ID,
-					Content:    fmt.Sprintf("subagent: %s", errText),
-				}
-			case StreamAborted:
-				return Message{
-					Role:       RoleTool,
-					ToolCallID: call.ID,
-					Content:    buf.String(),
-				}
-			case StreamDone:
-				if evt.Result != nil && evt.Result.FinalOutput != "" {
-					finalOutput = evt.Result.FinalOutput
-				}
+				pending = ""
 			}
 		}
+		done := false
+		for !done {
+			select {
+			case evt, ok := <-streamCh:
+				if !ok {
+					done = true
+				} else {
+					switch evt.Type {
+					case StreamThought, StreamTextDelta:
+						buf.WriteString(evt.Text)
+						pending += evt.Text
+					case StreamError:
+						flush()
+						errText := "unknown error"
+						if evt.Error != nil {
+							errText = evt.Error.Error()
+						}
+						return Message{
+							Role:       RoleTool,
+							ToolCallID: call.ID,
+							Content:    fmt.Sprintf("subagent: %s", errText),
+						}
+					case StreamAborted:
+						flush()
+						return Message{
+							Role:       RoleTool,
+							ToolCallID: call.ID,
+							Content:    buf.String(),
+						}
+					case StreamDone:
+						if evt.Result != nil && evt.Result.FinalOutput != "" {
+							finalOutput = evt.Result.FinalOutput
+						}
+					}
+				}
+			case <-ticker.C:
+				flush()
+			case <-ctx.Done():
+				flush()
+				if buf.Len() > 0 {
+					return Message{Role: RoleTool, ToolCallID: call.ID, Content: buf.String()}
+				}
+				return Message{Role: RoleTool, ToolCallID: call.ID, Content: "(cancelled)"}
+			}
+		}
+		flush()
 		if buf.Len() > 0 {
 			return Message{Role: RoleTool, ToolCallID: call.ID, Content: buf.String()}
 		}
