@@ -48,7 +48,7 @@ func (t *Shell) WithLanguage(lang string) *Shell {
 }
 
 func (t *Shell) Definition() openagent.FunctionDefinition {
-	desc := "Execute a shell command. The command runs in the background — the shell waits up to 30s for it to finish. If the command is still running after the timeout, you'll get a process ID, PID, and paths to stdout.log / stderr.log. Use `read` to check progress and `shell kill <PID>` to stop it. The shell starts in the workspace root — use relative paths."
+	desc := "Execute a shell command. Returns stdout, stderr, and exit code."
 	if t.language != "" {
 		desc = fmt.Sprintf("Execute a shell command in a %s sandbox. CWD is the workspace root.", t.language)
 	}
@@ -70,10 +70,6 @@ func (t *Shell) Definition() openagent.FunctionDefinition {
 				"description": {
 					"type": "string",
 					"description": "A short description of what this command does (for audit/logging)"
-				},
-				"timeout": {
-					"type": "integer",
-					"description": "Timeout in milliseconds (default: 30000 = 30 seconds)"
 				}
 			},
 			"required": ["command"]
@@ -85,7 +81,6 @@ func (t *Shell) Execute(ctx context.Context, args json.RawMessage) (string, erro
 	var params struct {
 		Command     string `json:"command"`
 		Description string `json:"description"`
-		Timeout     int    `json:"timeout"` // milliseconds, 0 = default (30s)
 	}
 	if err := json.Unmarshal(args, &params); err != nil {
 		return "", fmt.Errorf("shell: %w", err)
@@ -96,11 +91,7 @@ func (t *Shell) Execute(ctx context.Context, args json.RawMessage) (string, erro
 	if t.sandbox == nil {
 		return "", fmt.Errorf("shell: no sandbox configured")
 	}
-	timeout := params.Timeout
-	if timeout <= 0 {
-		timeout = 30000 // 30 seconds
-	}
-	shellCtx, cancel := context.WithTimeout(ctx, time.Duration(timeout)*time.Millisecond)
+	shellCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
 	cmd := openagent.Command{
@@ -150,7 +141,6 @@ func (t *Shell) ExecuteStream(ctx context.Context, args json.RawMessage) <-chan 
 	var params struct {
 		Command     string `json:"command"`
 		Description string `json:"description"`
-		Timeout     int    `json:"timeout"`
 	}
 	if err := json.Unmarshal(args, &params); err != nil || params.Command == "" || t.sandbox == nil {
 		ch := make(chan openagent.ToolStreamChunk, 1)
@@ -165,11 +155,7 @@ func (t *Shell) ExecuteStream(ctx context.Context, args json.RawMessage) <-chan 
 		return ch
 	}
 
-	timeout := params.Timeout
-	if timeout <= 0 {
-		timeout = 30000
-	}
-	streamCtx, cancel := context.WithTimeout(ctx, time.Duration(timeout)*time.Millisecond)
+	streamCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 
 	cmd := openagent.Command{
 		Program: "/bin/bash",
