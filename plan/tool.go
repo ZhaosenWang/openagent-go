@@ -31,7 +31,7 @@ func (t *CreateTool) Definition() openagent.FunctionDefinition {
 		Name: "plan_create",
 		Description: `Create a structured execution plan for a complex task. Use this when a task involves multiple steps, spans multiple files, or requires careful sequencing.
 
-After creating the plan and having it reviewed by the user, call exit_plan_mode to return to your previous mode and begin executing each step. Use plan_update to track progress during execution.`,
+Once the plan is complete, call exit_plan_mode to return to your previous mode and begin executing each step. Use plan_update to track progress during execution.`,
 		Parameters: json.RawMessage(`{
   "type": "object",
   "properties": {
@@ -227,7 +227,7 @@ func (t *EnterTool) Definition() openagent.FunctionDefinition {
 
 After entering plan mode, you will have access to plan_create, plan_update, and exit_plan_mode. Your execution tools (shell, file writes, terminal) will be temporarily unavailable — they will be restored when you call exit_plan_mode.
 
-Workflow: enter_plan_mode → plan_create → (user reviews plan) → exit_plan_mode → execute`,
+Workflow: enter_plan_mode → plan_create → exit_plan_mode → execute`,
 		Parameters: json.RawMessage(`{
   "type": "object",
   "properties": {},
@@ -270,7 +270,7 @@ func NewExitTool(onExit func() error) *ExitTool {
 func (t *ExitTool) Definition() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
 		Name: "exit_plan_mode",
-		Description: `Exit plan mode and return to the previous mode (auto or manual) to begin executing the plan. Call this AFTER you have created a complete plan with plan_create and the user has reviewed it. You will gain access to execution tools (shell, write, terminal, etc.).
+		Description: `Exit plan mode and return to the previous mode (auto or manual) to begin executing the plan. Call this once you have created a complete plan with plan_create. You will regain access to execution tools (shell, write, terminal, etc.).
 
 Only call this once, and only when you are ready to start executing the plan steps.`,
 		Parameters: json.RawMessage(`{

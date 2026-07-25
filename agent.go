@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -27,6 +28,14 @@ type Agent struct {
 
 	Model Model
 	Tools []Tool
+	// toolsMu guards Tools. The runner reads Tools (findTool /
+	// toolDefinitions) from executeTools' parallel tool goroutines, and a
+	// tool callback (exit_plan_mode via injectExecutionTools) can append
+	// execution tools to the SAME per-turn clone during that same
+	// executeTools batch — so Tools is a concurrency-shared mutable field
+	// within a turn. Readers use SnapshotTools; mutators use AppendTools.
+	// Both lock; the slice is NOT accessed directly outside these methods.
+	toolsMu sync.RWMutex
 
 	// Pluggable modules — nil means the capability is absent.
 	Memory      Memory
@@ -55,6 +64,29 @@ type Agent struct {
 	NoSpawn bool
 }
 
+// AppendTools appends tools to the agent's tool set under the tools lock.
+// Use this instead of mutating a.Tools directly so the runner's concurrent
+// SnapshotTools readers (called from executeTools' parallel goroutines) see
+// a consistent slice — a bare `a.Tools = append(...)` from a tool callback
+// races those readers under -race.
+func (a *Agent) AppendTools(tools ...Tool) {
+	a.toolsMu.Lock()
+	defer a.toolsMu.Unlock()
+	a.Tools = append(a.Tools, tools...)
+}
+
+// SnapshotTools returns a copy of the agent's current tool set under the
+// tools lock. The runner uses this for findTool / toolDefinitions so tool
+// callbacks that AppendTools concurrently (e.g. exit_plan_mode injecting
+// execution tools within an executeTools batch) cannot race the read.
+func (a *Agent) SnapshotTools() []Tool {
+	a.toolsMu.RLock()
+	defer a.toolsMu.RUnlock()
+	out := make([]Tool, len(a.Tools))
+	copy(out, a.Tools)
+	return out
+}
+
 // Clone returns a shallow copy of the Agent that is safe to mutate.
 // Strings and ints are copied by value. Interface fields (Model, Memory,
 // Approver, etc.) share the same underlying implementation — this is
@@ -62,10 +94,15 @@ type Agent struct {
 // The Tools slice header is copied but gets its own backing array so the
 // caller can append/remove tools without affecting the original.
 func (a *Agent) Clone() *Agent {
+	// Copy Tools under the lock so a concurrent AppendTools on the source
+	// cannot race this read. The clone gets its own backing array and its
+	// own (zero-valued) toolsMu — clones append through AppendTools too.
+	tools := a.SnapshotTools()
 	clone := *a
-	if len(a.Tools) > 0 {
-		clone.Tools = make([]Tool, len(a.Tools))
-		copy(clone.Tools, a.Tools)
+	clone.toolsMu = sync.RWMutex{}
+	if len(tools) > 0 {
+		clone.Tools = make([]Tool, len(tools))
+		copy(clone.Tools, tools)
 	}
 	return &clone
 }

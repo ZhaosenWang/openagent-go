@@ -95,9 +95,10 @@ func (r *runner) run(ctx context.Context, session Session, prefix []Message, inp
 	var agentHookState any
 
 	// ── RunHooks.OnAgentStart ──
-	// Build the tool list once so hooks see the full set (including built-in
-	// skill tools) that will be sent to the model.
-	allToolDefs := toolDefinitions(r.agent.Tools)
+	// Snapshot the tool set under the lock (toolsMu) before iterating; a
+	// tool callback (exit_plan_mode) may AppendTools concurrently within
+	// an executeTools batch. Build the definitions from the snapshot.
+	allToolDefs := toolDefinitions(r.agent.SnapshotTools())
 	if len(r.builtinTools) > 0 {
 		allToolDefs = append(allToolDefs, r.builtinTools...)
 	}
@@ -789,7 +790,7 @@ func buildCompressedSection(cc *CompressedContext) string {
 }
 
 func (r *runner) buildModelRequest(session Session, messages []Message) ChatCompletionRequest {
-	tools := toolDefinitions(r.agent.Tools)
+	tools := toolDefinitions(r.agent.SnapshotTools())
 	if len(r.builtinTools) > 0 {
 		tools = append(tools, r.builtinTools...)
 	}
@@ -1067,7 +1068,7 @@ var (
 )
 
 func (r *runner) findTool(name string) Tool {
-	for _, t := range r.agent.Tools {
+	for _, t := range r.agent.SnapshotTools() {
 		if t.Definition().Name == name {
 			return t
 		}
@@ -1567,7 +1568,7 @@ func (r *runner) executeSubAgent(ctx context.Context, session Session, call Tool
 		SystemPrompts: []string{args.Prompt},
 		Prompt:        BuildPrompt,
 		Model:         r.runModel,
-		Tools:         stripAgentTools(r.agent.Tools),
+		Tools:         stripAgentTools(r.agent.SnapshotTools()),
 		MaxTurns:      3,
 		NoSpawn:       true,
 		// no Approver, no Memory — safe sub-agent

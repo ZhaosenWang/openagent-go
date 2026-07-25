@@ -88,8 +88,30 @@ type agentSession struct {
 	id           openacp.SessionId
 	cwd          string
 	createdAt    time.Time
-	mode         string                          // "auto", "manual", or "plan"
-	previousMode string                          // mode before entering plan; used by exit_plan_mode
+
+	// modeMu guards the session mode state machine and cached plan entries
+	// (mode, previousMode, planEntries, injectedPlanTools). It supersedes
+	// the former planMu. All reads/writes of these four fields go through
+	// the accessors below (Mode/PreviousMode/PlanEntries/SetPlanEntries/
+	// ApplyPlanUpdates/ClearPlanEntries/transitionModeLocked/...), EXCEPT
+	// transitionModeLocked which callers invoke while already holding the
+	// write lock.
+	//
+	// The runner runs tool calls in parallel goroutines (runner.go
+	// executeTools), and plan_create/plan_update/enter_plan_mode/
+	// exit_plan_mode closures all touch this state, so it MUST be guarded.
+	// Notifications are sent to the ACP single-writer queue (non-blocking,
+	// FIFO — see acp/sdk/server.go writeQueue), so holding modeMu across
+	// SendPlanUpdate is safe and preserves wire ordering
+	// (entries-before-empty-plan).
+	//
+	// Lock-order: modeMu is acquired on its own. getSession takes s.mu
+	// and returns, releasing it before any modeMu use. modeMu is never
+	// held across saveMode/savePlan SessionStore I/O (those run after
+	// unlock; the snapshot is captured under the lock).
+	modeMu       sync.RWMutex
+	mode         string      // "auto", "manual", or "plan"
+	previousMode string      // mode saved when plan was entered; used by exit_plan_mode
 	config       map[openacp.SessionConfigId]any // config option values
 	cancel       context.CancelFunc
 
@@ -114,26 +136,127 @@ type agentSession struct {
 	// connect time; injected into every agentForTurn clone.
 	mcpTools []openagent.Tool
 
-	// Cached plan entries (mirrors SessionStore._meta["plan"]).
+	// Cached plan entries (mirrors SessionStore._meta["plan"]). Guarded
+	// by modeMu.
 	planEntries []plan.Entry
-
-	// planMu guards plan notification sends so that exit_plan_mode's
-	// mode change + empty-plan notification is atomic with respect to
-	// plan_create / plan_update notification sends. Without this, when
-	// tools execute concurrently (runner.go executeTools goroutines),
-	// plan entries can arrive at the client after the mode change,
-	// causing the VS Code plugin to keep showing plan mode.
-	planMu sync.Mutex
 
 	// injectedPlanTools is set to true after enter_plan_mode injects
 	// plan_create + exit_plan_mode into the agent clone. Prevents
-	// duplicate injection on repeated enter_plan_mode calls within
-	// the same turn.
+	// duplicate injection on repeated enter_plan_mode calls within the
+	// same turn. Guarded by modeMu.
 	injectedPlanTools bool
 
 	// processMgr tracks background processes started by the shell tool.
 	// Created on session start, cleaned up on deletion.
 	processMgr *process.Manager
+}
+
+// ── agentSession plan/mode state accessors (modeMu-guarded) ──
+
+// Mode returns the current session mode. Safe for concurrent hot-path
+// readers (agentForTurn, buildDynamicContext, buildConfigOptions, ...).
+func (ss *agentSession) Mode() string {
+	ss.modeMu.RLock()
+	defer ss.modeMu.RUnlock()
+	return ss.mode
+}
+
+// PreviousMode returns the mode saved when plan was entered ("" if never).
+func (ss *agentSession) PreviousMode() string {
+	ss.modeMu.RLock()
+	defer ss.modeMu.RUnlock()
+	return ss.previousMode
+}
+
+// PlanEntries returns a deep-copy snapshot of current plan entries. Callers
+// that need a snapshot consistent with the mode (e.g. gating a notification
+// on mode=="plan") MUST use the WithLock helpers (SetPlanEntries/
+// ApplyPlanUpdates/transitionModeLocked) rather than PlanEntries()+Mode()
+// separately.
+func (ss *agentSession) PlanEntries() []plan.Entry {
+	ss.modeMu.RLock()
+	defer ss.modeMu.RUnlock()
+	return copyPlanEntries(ss.planEntries)
+}
+
+// SetPlanEntries replaces the whole planEntries slice. Returns a copy of
+// the new entries (for the caller to persist/notify). Used by plan_create.
+// Caller must NOT hold modeMu.
+func (ss *agentSession) SetPlanEntries(entries []plan.Entry) []plan.Entry {
+	ss.modeMu.Lock()
+	defer ss.modeMu.Unlock()
+	ss.planEntries = copyPlanEntries(entries)
+	return copyPlanEntries(ss.planEntries)
+}
+
+// ApplyPlanUpdates validates-then-applies per-id status updates in place.
+// If all ids are valid, the new statuses are committed and underLock is
+// invoked while still holding modeMu (so the caller can send a
+// mode-gated notification atomically with the mutation). Returns the
+// resulting snapshot. On any unknown id, nothing is mutated.
+func (ss *agentSession) ApplyPlanUpdates(updates []plan.Update, underLock func(snap []plan.Entry)) ([]plan.Entry, error) {
+	ss.modeMu.Lock()
+	defer ss.modeMu.Unlock()
+	idxByID := make(map[string]int, len(ss.planEntries))
+	for i, e := range ss.planEntries {
+		idxByID[e.ID] = i
+	}
+	for _, u := range updates {
+		if _, ok := idxByID[u.ID]; !ok {
+			return nil, fmt.Errorf("plan_update: unknown step id %q", u.ID)
+		}
+	}
+	next := copyPlanEntries(ss.planEntries)
+	for _, u := range updates {
+		next[idxByID[u.ID]].Status = plan.Status(u.Status)
+	}
+	ss.planEntries = next
+	snap := copyPlanEntries(next)
+	if underLock != nil {
+		underLock(snap)
+	}
+	return snap, nil
+}
+
+// ClearPlanEntries empties the plan (used by slash /clear). Returns the
+// previous snapshot.
+func (ss *agentSession) ClearPlanEntries() []plan.Entry {
+	ss.modeMu.Lock()
+	defer ss.modeMu.Unlock()
+	prev := ss.planEntries
+	ss.planEntries = nil
+	return prev
+}
+
+// PlanToolsInjected reports the per-turn injection gate.
+func (ss *agentSession) PlanToolsInjected() bool {
+	ss.modeMu.RLock()
+	defer ss.modeMu.RUnlock()
+	return ss.injectedPlanTools
+}
+
+// MarkPlanToolsInjected sets the injection gate. Used by enter_plan_mode
+// once it has appended plan_create + exit_plan_mode to the clone.
+func (ss *agentSession) MarkPlanToolsInjected() {
+	ss.modeMu.Lock()
+	defer ss.modeMu.Unlock()
+	ss.injectedPlanTools = true
+}
+
+// ResetPlanToolsInjected clears the per-turn injection gate at turn start.
+func (ss *agentSession) ResetPlanToolsInjected() {
+	ss.modeMu.Lock()
+	defer ss.modeMu.Unlock()
+	ss.injectedPlanTools = false
+}
+
+// transitionModeLocked swaps the session mode, saving the current mode to
+// previousMode when entering plan. Caller MUST hold the modeMu write lock.
+func (ss *agentSession) transitionModeLocked(newMode string) {
+	if newMode == "plan" && ss.mode != "plan" {
+		ss.previousMode = ss.mode
+	}
+	ss.mode = newMode
 }
 
 // NewAgentServer creates an AgentServer wrapping the given agent.
@@ -549,7 +672,7 @@ func (s *AgentServer) OnLoadSession(ctx context.Context, req openacp.LoadSession
 
 	// Replay persisted plan if present.
 	if entries := s.loadPlan(ctx, string(req.SessionID)); len(entries) > 0 {
-		ss.planEntries = entries
+		ss.SetPlanEntries(entries)
 		s.replayPlan(sender, entries)
 	}
 
@@ -681,8 +804,8 @@ func (s *AgentServer) OnResumeSession(ctx context.Context, req openacp.ResumeSes
 	}
 	// Load persisted plan into memory (no replay per ACP spec:
 	// session/resume MUST NOT replay history).
-	if ss.planEntries == nil {
-		ss.planEntries = s.loadPlan(ctx, string(req.SessionID))
+	if ss.PlanEntries() == nil {
+		ss.SetPlanEntries(s.loadPlan(ctx, string(req.SessionID)))
 	}
 	return &openacp.ResumeSessionResponse{
 		ConfigOptions: s.buildConfigOptions(req.SessionID),
@@ -753,7 +876,7 @@ func (s *AgentServer) buildConfigOptions(sid openacp.SessionId) []openacp.Sessio
 	thoughtLevel := "medium"
 	modelID := s.defaultModelID
 	if ss != nil {
-		mode = ss.mode
+		mode = ss.Mode()
 		if v, ok := ss.config["thought_level"]; ok {
 			if val, ok := v.(string); ok {
 				thoughtLevel = val
@@ -819,7 +942,7 @@ func (s *AgentServer) buildModeState(sid openacp.SessionId) *openacp.SessionMode
 	ss := s.getSession(sid)
 	current := "auto"
 	if ss != nil {
-		current = ss.mode
+		current = ss.Mode()
 	}
 	return &openacp.SessionModeState{
 		CurrentModeID: openacp.SessionModeId(current),
@@ -857,13 +980,32 @@ func (s *AgentServer) setSessionMode(ctx context.Context, sid openacp.SessionId,
 		return fmt.Errorf("session %s not found", sid)
 	}
 
-	// Save previous mode when entering plan (unless already in plan).
-	if mode == "plan" && ss.mode != "plan" {
-		ss.previousMode = ss.mode
+	// Swap mode under the lock; the no-op "already in plan" early return
+	// keeps previousMode from being clobbered on a redundant re-enter.
+	ss.modeMu.Lock()
+	if mode == "plan" && ss.mode == "plan" {
+		ss.modeMu.Unlock()
+		return nil
 	}
-	ss.mode = mode
-	s.saveMode(ctx, string(sid), mode)
+	ss.transitionModeLocked(mode)
+	ss.modeMu.Unlock()
 
+	// Persist + notify OUTSIDE the lock. Notifications go to the ACP
+	// single-writer queue (non-blocking), so total mode-change ordering
+	// relative to plan notifications emitted by concurrent callbacks is
+	// preserved by the FIFO queue — see exit_plan_mode helper.
+	s.persistAndNotifyMode(ctx, sid, mode)
+	return nil
+}
+
+// persistAndNotifyMode persists the mode to the session store and sends
+// the current_mode_update + config_option_update notifications. It does
+// NOT swap the in-memory mode (already done by transitionModeLocked).
+// Split out so exit_plan_mode can skip the swap (it flips mode itself
+// while taking the empty-plan notification under the lock) and still
+// persist + notify.
+func (s *AgentServer) persistAndNotifyMode(ctx context.Context, sid openacp.SessionId, mode string) {
+	s.saveMode(ctx, string(sid), mode)
 	if s.updateSender != nil {
 		s.updateSender.SendSessionUpdate(sid, openacp.SessionUpdate{
 			SessionUpdate: "current_mode_update",
@@ -872,11 +1014,10 @@ func (s *AgentServer) setSessionMode(ctx context.Context, sid openacp.SessionId,
 		// Also send config_option_update so the client's mode dropdown
 		// (which reads the "mode" config option) stays in sync.
 		s.updateSender.SendSessionUpdate(sid, openacp.SessionUpdate{
-			SessionUpdate: "config_option_update",
-			ConfigOptions: s.buildConfigOptions(sid),
+			SessionUpdate:   "config_option_update",
+			ConfigOptions:   s.buildConfigOptions(sid),
 		})
 	}
-	return nil
 }
 
 // enterPlanMode transitions the session into plan mode. Called by
@@ -885,9 +1026,6 @@ func (s *AgentServer) setSessionMode(ctx context.Context, sid openacp.SessionId,
 // are not mutated — the next OnPrompt turn picks up plan mode and
 // registers plan_create + exit_plan_mode.
 func (s *AgentServer) enterPlanMode(ctx context.Context, sid openacp.SessionId, ss *agentSession) error {
-	if ss.mode == "plan" {
-		return nil // already in plan mode, no-op
-	}
 	return s.setSessionMode(ctx, sid, "plan")
 }
 
@@ -966,14 +1104,9 @@ func (s *AgentServer) OnPrompt(ctx context.Context, req openacp.PromptRequest, s
 	}
 
 	// ── Per-prompt cancellable context ──
-	// Track whether non-plan tools are used during this turn.
-	// If mode is still "plan" at the end and execution tools
-	// were used (meaning the system exited plan mode without
-	// calling openagent-go's exit_plan_mode), auto-exit.
-	var usedNonPlanTool bool
 	// Reset per-turn injectedPlanTools flag so enter_plan_mode
 	// can inject plan_create + exit_plan_mode again this turn.
-	ss.injectedPlanTools = false
+	ss.ResetPlanToolsInjected()
 	ctx, cancel := context.WithCancel(ctx)
 	ss.cancel = cancel
 	defer func() {
@@ -1029,135 +1162,63 @@ func (s *AgentServer) OnPrompt(ctx context.Context, req openacp.PromptRequest, s
 	}
 
 	// ── Register mode-specific planning tools ──
-	if ss.mode == "plan" {
+	if ss.Mode() == "plan" {
 		// plan_create: only available in plan mode.
-		pt := plan.NewCreateTool(func(entries []plan.Entry) {
-			ss.planEntries = entries
-			s.savePlan(ctx, string(req.SessionID), entries)
-			// planMu + mode check prevents a race with concurrent
-			// exit_plan_mode (runner.go executes tools in goroutines).
-			ss.planMu.Lock()
-			if ss.mode == "plan" {
-				sender.SendPlanUpdate(s.entriesToACP(entries))
-			}
-			ss.planMu.Unlock()
-		})
-		agent.Tools = append(agent.Tools, pt)
-
-		// exit_plan_mode: only available in plan mode.
-		// In plan mode the agent has no execution tools. exit_plan_mode
-		// restores the mode that was active before entering plan mode and
-		// unlocks the full tool set. If the session started in plan (no
-		// previous mode), defaults to auto.
-		et := plan.NewExitTool(func() error {
-			target := ss.previousMode
-			if target == "" || target == "plan" {
-				target = "auto"
-			}
-
-			// Persist mode change and notify client (sends both
-			// current_mode_update and config_option_update).
-			if err := s.setSessionMode(ctx, req.SessionID, target); err != nil {
-				return err
-			}
-
-			// Clear the client's plan panel. planMu ensures
-			// atomicity with concurrent plan_create / plan_update
-			// goroutines: either this empty-plan notification
-			// arrives after the entries (correct order), or the
-			// mode check in those callbacks skips the entries
-			// (client never sees stale plan data after exit).
-			ss.planMu.Lock()
-			sender.SendPlanUpdate(nil)
-			ss.planMu.Unlock()
-
-			// Inject execution tools into the running agent clone
-			// for subsequent model calls this turn.
-			s.injectExecutionTools(agent, req.SessionID, ss)
-
-			// Set approver based on target mode.
-			if target == "manual" && s.clientRPC != nil {
-				agent.Approver = &acpApprover{client: s.clientRPC, sessionID: req.SessionID}
-			} else {
-				agent.Approver = nil
-			}
-
-			return nil
-		})
-		agent.Tools = append(agent.Tools, et)
+		agent.AppendTools(plan.NewCreateTool(s.makeCreateCallback(ctx, req.SessionID, ss, sender)))
+		// exit_plan_mode: only available in plan mode. Restores the mode
+		// that was active before entering plan (auto/manual), injects the
+		// full tool set, and wires the approver for manual.
+		agent.AppendTools(plan.NewExitTool(s.makeExitCallback(ctx, req.SessionID, ss, agent, sender)))
 	} else {
-		// enter_plan_mode: available in auto and manual mode.
-		// Changes session mode to "plan" AND immediately injects
-		// plan_create + exit_plan_mode into the agent clone so they
-		// are available this same turn. Without immediate injection,
-		// the model would use system-provided plan tools that don't
-		// sync the ACP session mode.
+		// enter_plan_mode: available in auto and manual mode. Changes the
+		// session mode to "plan" and immediately injects plan_create +
+		// exit_plan_mode into the agent clone so they are available this
+		// same turn.
 		enterTool := plan.NewEnterTool(func() error {
-			wasPlan := ss.mode == "plan"
+			wasPlan := ss.Mode() == "plan"
 			if err := s.enterPlanMode(ctx, req.SessionID, ss); err != nil {
 				return err
 			}
-
-			// Inject plan_create + exit_plan_mode on the FIRST
-			// transition into plan mode within this turn. Use
-			// wasPlan to guard against re-injection on
-			// subsequent enter_plan_mode calls (enter→exit→enter).
+			// Inject plan_create + exit_plan_mode on the FIRST transition
+			// into plan mode within this turn. The injection block is
+			// serialized under modeMu so two concurrent enter_plan_mode
+			// calls in one model response make the second a no-op (the
+			// flag is already set) and only one injection happens.
+			ss.modeMu.Lock()
 			if !wasPlan && !ss.injectedPlanTools {
 				ss.injectedPlanTools = true
-				pt := plan.NewCreateTool(func(entries []plan.Entry) {
-					ss.planEntries = entries
-					s.savePlan(ctx, string(req.SessionID), entries)
-					ss.planMu.Lock()
-					if ss.mode == "plan" {
-						sender.SendPlanUpdate(s.entriesToACP(entries))
-					}
-					ss.planMu.Unlock()
-				})
-				agent.Tools = append(agent.Tools, pt)
-
-				et := plan.NewExitTool(func() error {
-					target := ss.previousMode
-					if target == "" || target == "plan" {
-						target = "auto"
-					}
-					if err := s.setSessionMode(ctx, req.SessionID, target); err != nil {
-						return err
-					}
-					ss.planMu.Lock()
-					sender.SendPlanUpdate(nil)
-					ss.planMu.Unlock()
-					return nil
-				})
-				agent.Tools = append(agent.Tools, et)
+				ss.modeMu.Unlock()
+				agent.AppendTools(
+					plan.NewCreateTool(s.makeCreateCallback(ctx, req.SessionID, ss, sender)))
+				agent.AppendTools(
+					plan.NewExitTool(s.makeExitCallback(ctx, req.SessionID, ss, agent, sender)))
+			} else {
+				ss.modeMu.Unlock()
 			}
-
 			return nil
 		})
-		agent.Tools = append(agent.Tools, enterTool)
+		agent.AppendTools(enterTool)
 	}
 
 	// ── Register plan_update tool (all modes) ──
-	// Always registered so it can track plan progress. At execution time
-	// the tool reads ss.planEntries to resolve IDs — no stale closures.
+	// Always registered so it can track plan progress. ApplyPlanUpdates
+	// validates-then-mutates under modeMu and runs the mode-gated
+	// notification in the same critical section, so the notified snapshot
+	// is consistent with the mutation and ordered relative to a
+	// concurrent exit_plan_mode's empty-plan notification.
 	pu := plan.NewUpdateTool(func(updates []plan.Update) ([]plan.Entry, error) {
-		idxByID := make(map[string]int, len(ss.planEntries))
-		for i, e := range ss.planEntries {
-			idxByID[e.ID] = i
-		}
-		for _, u := range updates {
-			idx, ok := idxByID[u.ID]
-			if !ok {
-				return nil, fmt.Errorf("plan_update: unknown step id %q", u.ID)
+		snap, err := ss.ApplyPlanUpdates(updates, func(snap []plan.Entry) {
+			if ss.mode == "plan" {
+				sender.SendPlanUpdate(s.entriesToACP(snap))
 			}
-			ss.planEntries[idx].Status = plan.Status(u.Status)
+		})
+		if err != nil {
+			return nil, err
 		}
-		s.savePlan(ctx, string(req.SessionID), ss.planEntries)
-		ss.planMu.Lock()
-		sender.SendPlanUpdate(s.entriesToACP(ss.planEntries))
-		ss.planMu.Unlock()
-		return copyPlanEntries(ss.planEntries), nil
+		s.savePlan(ctx, string(req.SessionID), snap)
+		return snap, nil
 	})
-	agent.Tools = append(agent.Tools, pu)
+	agent.AppendTools(pu)
 	// ── Run the agent ──
 	ch := agent.RunStream(ctx, oaSession, input)
 	var usage openagent.Usage
@@ -1176,11 +1237,6 @@ func (s *AgentServer) OnPrompt(ctx context.Context, req openacp.PromptRequest, s
 		case openagent.StreamToolCall:
 			if len(evt.Message.ToolCalls) > 0 {
 				for _, tc := range evt.Message.ToolCalls {
-					// Detect execution tool usage in plan mode
-					// for auto-exit fallback.
-					if ss.mode == "plan" && !isPlanTool(tc.Function.Name) {
-						usedNonPlanTool = true
-					}
 					sender.SendToolCall(openacp.ToolCallUpdate{
 						ToolCallID: tc.ID,
 						Title:      toolTitle(tc.Function.Name, tc.Function.Arguments),
@@ -1225,7 +1281,7 @@ func (s *AgentServer) OnPrompt(ctx context.Context, req openacp.PromptRequest, s
 			return nil, evt.Error
 
 		case openagent.StreamAborted:
-			return &openacp.PromptResponse{StopReason: openacp.StopReasonCancelled, Meta: map[string]any{"mode": ss.mode}}, nil
+			return &openacp.PromptResponse{StopReason: openacp.StopReasonCancelled, Meta: map[string]any{"mode": ss.Mode()}}, nil
 		}
 	}
 
@@ -1243,25 +1299,12 @@ func (s *AgentServer) OnPrompt(ctx context.Context, req openacp.PromptRequest, s
 	}
 
 	if ctx.Err() != nil {
-		return &openacp.PromptResponse{StopReason: openacp.StopReasonCancelled, Meta: map[string]any{"mode": ss.mode}}, nil
+		return &openacp.PromptResponse{StopReason: openacp.StopReasonCancelled, Meta: map[string]any{"mode": ss.Mode()}}, nil
 	}
 	if stopReason == "" {
 		stopReason = openacp.StopReasonEndTurn
 	}
-	// Auto-exit plan mode if the turn started in plan mode,
-	// execution tools were used (meaning the system already
-	// exited plan mode), but openagent-go's exit_plan_mode
-	// was not called (mode is still "plan").
-	// Restore previousMode (same as exit_plan_mode) instead
-	// of hardcoding "auto" — preserves manual mode.
-	if ss.mode == "plan" && usedNonPlanTool {
-		target := ss.previousMode
-		if target == "" || target == "plan" {
-			target = "auto"
-		}
-		_ = s.setSessionMode(ctx, req.SessionID, target)
-	}
-	return &openacp.PromptResponse{StopReason: stopReason, Meta: map[string]any{"mode": ss.mode}}, nil
+	return &openacp.PromptResponse{StopReason: stopReason, Meta: map[string]any{"mode": ss.Mode()}}, nil
 }
 
 // ── Content block conversion ──
@@ -1397,7 +1440,7 @@ func (s *AgentServer) agentForTurn(sid openacp.SessionId) *openagent.Agent {
 		}
 
 		// ── Mode-gated tool injection ──
-		switch ss.mode {
+		switch ss.Mode() {
 		case "plan":
 			// Plan mode: read-only tools only. No execution tools, no
 			// approver (no side effects to approve).
@@ -1447,15 +1490,21 @@ func (s *AgentServer) agentForTurn(sid openacp.SessionId) *openagent.Agent {
 // injectExecutionTools appends all execution-capable tools to the agent
 // clone. Called in manual mode and after exit_plan_mode transitions.
 // Mirrors the original flat injection — MCP tools, ToolFactory tools,
-// and Agent→Client RPC tools all go through here.
+// and Agent→Client RPC tools all go through here. The injection goes
+// through AppendTools (toolsMu-guarded): this runs inside exit_plan_mode's
+// callback, which executes within an executeTools parallel-goroutine
+// batch, so sibling tool goroutines read the clone's Tools via the
+// runner's SnapshotTools/findTool concurrently with this append.
 func (s *AgentServer) injectExecutionTools(clone *openagent.Agent, sid openacp.SessionId, ss *agentSession) {
+	var add []openagent.Tool
+
 	// MCP tools from connected servers.
-	clone.Tools = append(clone.Tools, ss.mcpTools...)
+	add = append(add, ss.mcpTools...)
 
 	// Per-turn tools scoped to the session cwd.
 	if s.ToolFactory != nil && ss.cwd != "" {
 		if tools := s.ToolFactory(ss.cwd); len(tools) > 0 {
-			clone.Tools = append(clone.Tools, tools...)
+			add = append(add, tools...)
 		}
 	}
 
@@ -1465,12 +1514,12 @@ func (s *AgentServer) injectExecutionTools(clone *openagent.Agent, sid openacp.S
 	// LLM is never offered a tool whose RPC the client will reject.
 	if s.clientRPC != nil {
 		if s.clientCanWriteFile() {
-			clone.Tools = append(clone.Tools,
+			add = append(add,
 				opentool.NewACPWriteFile(s.clientRPC, sid),
 			)
 		}
 		if s.clientCanTerminal() {
-			clone.Tools = append(clone.Tools,
+			add = append(add,
 				opentool.NewACPTerminalCreate(s.clientRPC, sid),
 				opentool.NewACPTerminalOutput(s.clientRPC, sid),
 				opentool.NewACPTerminalWait(s.clientRPC, sid),
@@ -1478,6 +1527,80 @@ func (s *AgentServer) injectExecutionTools(clone *openagent.Agent, sid openacp.S
 				opentool.NewACPTerminalRelease(s.clientRPC, sid),
 			)
 		}
+	}
+
+	if len(add) > 0 {
+		clone.AppendTools(add...)
+	}
+}
+
+// makeCreateCallback builds the OnPlan callback shared by the plan-mode
+// plan_create tool and the enter_plan_mode-injected plan_create tool.
+// It atomically swaps ss.planEntries under modeMu, sends a mode-gated
+// notification (only while still in plan mode — see makeExitCallback for
+// why gating here closes the old race), then persists outside the lock.
+// Shared by both injection sites so there is one canonical create path.
+func (s *AgentServer) makeCreateCallback(
+	ctx context.Context, sid openacp.SessionId, ss *agentSession,
+	sender openacp.SessionEventSender,
+) plan.OnPlan {
+	return func(entries []plan.Entry) {
+		ss.modeMu.Lock()
+		ss.planEntries = copyPlanEntries(entries)
+		snap := copyPlanEntries(ss.planEntries)
+		if ss.mode == "plan" {
+			sender.SendPlanUpdate(s.entriesToACP(snap))
+		}
+		ss.modeMu.Unlock()
+		s.savePlan(ctx, string(sid), snap)
+	}
+}
+
+// makeExitCallback builds the onExit callback shared by the plan-mode
+// exit_plan_mode tool and the enter_plan_mode-injected exit_plan_mode
+// tool. Idempotent under concurrent exit calls: a second concurrent exit
+// sees mode != "plan" (already flipped by the first) and no-ops. The
+// mode flip + empty-plan notification happen under modeMu so concurrent
+// plan_create/plan_update closures either fully see mode=="plan" (and
+// notify their entries, which the FIFO writer emits first) or fully see
+// mode!=plan (and skip). The mode-change notifications + execution-tool
+// injection + approver wiring happen after unlock.
+func (s *AgentServer) makeExitCallback(
+	ctx context.Context, sid openacp.SessionId, ss *agentSession,
+	agent *openagent.Agent, sender openacp.SessionEventSender,
+) func() error {
+	return func() error {
+		target := ss.PreviousMode()
+		if target == "" || target == "plan" {
+			target = "auto"
+		}
+
+		// Flip mode and clear the plan panel atomically with any
+		// concurrent plan_create/plan_update notification.
+		ss.modeMu.Lock()
+		if ss.mode != "plan" {
+			// Already exited (concurrent exit_plan_mode won the race).
+			ss.modeMu.Unlock()
+			return nil
+		}
+		ss.transitionModeLocked(target)
+		sender.SendPlanUpdate(nil) // clear panel before mode-change notif
+		ss.modeMu.Unlock()
+
+		// Persist + notify (current_mode_update + config_option_update).
+		s.persistAndNotifyMode(ctx, sid, target)
+
+		// Inject execution tools into the running clone for subsequent
+		// model calls THIS turn. Safe: runner reads r.agent.Tools next
+		// model call, after executeTools' wg.Wait published the append.
+		s.injectExecutionTools(agent, sid, ss)
+
+		if target == "manual" && s.clientRPC != nil {
+			agent.Approver = &acpApprover{client: s.clientRPC, sessionID: sid}
+		} else {
+			agent.Approver = nil
+		}
+		return nil
 	}
 }
 
@@ -1488,17 +1611,23 @@ func (s *AgentServer) injectExecutionTools(clone *openagent.Agent, sid openacp.S
 func (s *AgentServer) buildDynamicContext(ss *agentSession) string {
 	var b strings.Builder
 
+	// Take one consistent snapshot of the plan entries for the whole
+	// render; a torn read between the count and loop has no safety impact
+	// (worst case: a one-turn-stale plan block in the system prompt).
+	entries := ss.PlanEntries()
+	mode := ss.Mode()
+
 	// ── Plan entries with current status ──
-	if len(ss.planEntries) > 0 {
+	if len(entries) > 0 {
 		b.WriteString("## Current Plan\n")
-		for _, e := range ss.planEntries {
+		for _, e := range entries {
 			fmt.Fprintf(&b, "- [%s] [%s] %s\n", e.Priority, e.Status, e.Content)
 		}
 		b.WriteString("\nUpdate plan status with plan_update when starting or completing each step.\n\n")
 	}
 
 	// ── Mode instruction ──
-	if ss.mode == "plan" {
+	if mode == "plan" {
 		b.WriteString("## Session Mode\n")
 		b.WriteString("You are in **plan mode**. You have NO execution tools — you cannot modify files, run shell commands, or create terminals. ")
 		if s.clientCanReadFile() {
@@ -1511,13 +1640,12 @@ func (s *AgentServer) buildDynamicContext(ss *agentSession) string {
 			b.WriteString("1. Analyze the task from the user's description and available context\n")
 		}
 		b.WriteString("2. Call plan_create with concrete, actionable steps\n")
-		b.WriteString("3. Wait for the user to review the plan\n")
-		b.WriteString("4. Call exit_plan_mode to leave plan mode and begin execution\n\n")
-		b.WriteString("Do NOT call exit_plan_mode until you have a complete plan that the user has reviewed.\n")
-	} else if len(ss.planEntries) == 0 {
+		b.WriteString("3. Call exit_plan_mode to leave plan mode and begin execution\n\n")
+		b.WriteString("Create a complete plan before calling exit_plan_mode.\n")
+	} else if len(entries) == 0 {
 		// Auto/manual mode without a plan: hint about enter_plan_mode.
 		b.WriteString("## Task Planning\n")
-		b.WriteString("If this task is complex (involves multiple steps, multiple files, or requires careful sequencing), consider calling **enter_plan_mode** first. This will give you access to plan_create for structured planning. After creating a plan and having it reviewed, call exit_plan_mode to regain your execution tools and work through the plan.\n\n")
+		b.WriteString("If this task is complex (involves multiple steps, multiple files, or requires careful sequencing), consider calling **enter_plan_mode** first. This will give you access to plan_create for structured planning. After creating a plan, call exit_plan_mode to regain your execution tools and work through the plan.\n\n")
 	}
 
 	return b.String()
@@ -1528,7 +1656,7 @@ func (s *AgentServer) buildSlashContext(ctx context.Context, sid openacp.Session
 	return slash.Context{
 		SessionID:   string(sid),
 		Cwd:         ss.cwd,
-		Mode:        ss.mode,
+		Mode:        ss.Mode(),
 		TotalTokens: ss.totalTokens,
 		CreatedAt:   ss.createdAt,
 		SetMode: func(mode string) error {
@@ -1544,7 +1672,7 @@ func (s *AgentServer) buildSlashContext(ctx context.Context, sid openacp.Session
 				}
 			}
 			ss.totalTokens = 0
-			ss.planEntries = nil
+			ss.ClearPlanEntries()
 			s.savePlan(ctx, string(sid), nil)
 			return nil
 		},
