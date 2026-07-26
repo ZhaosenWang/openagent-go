@@ -1140,6 +1140,12 @@ func (s *AgentServer) OnPrompt(ctx context.Context, req openacp.PromptRequest, s
 		ID:        string(req.SessionID),
 		ModelID:   modelID,
 		Provider:  providerID,
+		// Carry the resolved Model instance so downstream consumers
+		// (RunHooks via SessionFromContext, e.g. the artifact hook's
+		// context-window threshold) can read ContextWindow() without
+		// depending on every call site to re-resolve from ModelID.
+		// agentForTurn already set clone.Model to the selected model.
+		Model:     agent.Model,
 		CreatedAt: ss.createdAt,
 		Metadata: map[string]any{
 			"cwd":                   ss.cwd,

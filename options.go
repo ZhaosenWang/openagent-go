@@ -49,9 +49,15 @@ func WithApprover(ap Approver) AgentOption {
 	return func(a *Agent) { a.Approver = ap }
 }
 
-// WithRunHooks sets lifecycle hooks for the agent.
-func WithRunHooks(h RunHooks) AgentOption {
+// WithRunHook sets a single lifecycle hook for the agent.
+func WithRunHook(h RunHooks) AgentOption {
 	return func(a *Agent) { a.Hooks = h }
+}
+
+// WithRunHooks combines multiple RunHooks into one via MultiHooks.
+// Use this to stack hooks: OTEL tracing + slog logging + custom audit.
+func WithRunHooks(hooks ...RunHooks) AgentOption {
+	return WithRunHook(MultiHooks(hooks...))
 }
 
 // WithRunObserver sets the stage-level observer for the agent.

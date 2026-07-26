@@ -10,6 +10,7 @@ import (
 
 	openagent "github.com/yusheng-g/openagent-go"
 	"github.com/yusheng-g/openagent-go/guard/llm"
+	artifacthook "github.com/yusheng-g/openagent-go/hooks/artifact"
 	sloghooks "github.com/yusheng-g/openagent-go/hooks/slog"
 	"github.com/yusheng-g/openagent-go/memory/sqlite"
 	"github.com/yusheng-g/openagent-go/model/openai"
@@ -286,7 +287,10 @@ func buildOpts(opts []openagent.AgentOption, caps Capabilities, model openagent.
 		opts = append(opts, openagent.WithOutputGuard(g.Output()))
 	}
 	if caps.OnHooks() {
-		opts = append(opts, openagent.WithRunHooks(buildSlogHooks()))
+		opts = append(opts, openagent.WithRunHooks(
+			buildSlogHooks(),
+			artifacthook.NewHook(),
+		))
 	}
 	if caps.OnObserver() {
 		opts = append(opts, openagent.WithRunObserver(buildSlogObserver()))

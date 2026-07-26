@@ -15,6 +15,8 @@ import (
 	"github.com/openai/openai-go/v3/shared"
 
 	openagent "github.com/yusheng-g/openagent-go"
+
+	"github.com/yusheng-g/openagent-go/utils"
 )
 
 // Model implements openagent.Model via openai-go v3.
@@ -25,6 +27,8 @@ type Model struct {
 }
 
 // New creates a Model with the given API key, model ID, and base URL.
+// The context window is automatically detected from the model ID. Call
+// WithContextWindow to override.
 func New(apiKey, modelID, baseURL string) *Model {
 	return &Model{
 		client: openaisdk.NewClient(
@@ -34,13 +38,23 @@ func New(apiKey, modelID, baseURL string) *Model {
 				Timeout: 5 * time.Minute,
 			}),
 		),
-		modelID: modelID,
+		modelID:       modelID,
+		contextWindow: modelContextWindow(modelID),
 	}
 }
 
 func (m *Model) WithContextWindow(tokens int) *Model { m.contextWindow = tokens; return m }
 func (m *Model) ContextWindow() int                  { return m.contextWindow }
 func (m *Model) TokenizerModel() string               { return m.modelID }
+
+// modelContextWindow resolves the context window for a model ID. Falls
+// back to the shared model.ContextWindow lookup table.
+func modelContextWindow(modelID string) int {
+	if modelID == "" {
+		return 0
+	}
+	return utils.ModelContextWindow(modelID)
+}
 
 // Ensure *Model implements the optional TokenizerModeler interface.
 var _ openagent.TokenizerModeler = (*Model)(nil)

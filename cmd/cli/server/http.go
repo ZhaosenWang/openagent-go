@@ -72,7 +72,11 @@ func RunREST(ctx context.Context, cfg *config.Config, caps Capabilities) error {
 	handler := rest.NewHandler(agent).
 		WithSessionStore(store).
 		WithCleanupDir(func(sessionID string) {
-			dir := filepath.Join(opentool.ArtifactRoot(), sessionID)
+			// Matches the artifact hook's layout
+			// (<ArtifactRoot()>/sess-<sessionID>/) and the REST
+			// handler's process dir layout (sess-<id>), so a single
+			// call cleans both artifacts and process output.
+			dir := filepath.Join(opentool.ArtifactRoot(), "sess-"+sessionID)
 			_ = os.RemoveAll(dir)
 		}).
 		WithApproverEnabled(caps.OnApprover()).

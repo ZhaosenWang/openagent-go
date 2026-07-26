@@ -96,15 +96,41 @@ func (a *Agent) SnapshotTools() []Tool {
 func (a *Agent) Clone() *Agent {
 	// Copy Tools under the lock so a concurrent AppendTools on the source
 	// cannot race this read. The clone gets its own backing array and its
-	// own (zero-valued) toolsMu — clones append through AppendTools too.
+	// own zero-valued toolsMu (a fresh lock — never copied by value, which
+	// go vet forbids for sync.RWMutex). Build the clone field-by-field
+	// rather than `clone := *a` to avoid copying the lock.
 	tools := a.SnapshotTools()
-	clone := *a
-	clone.toolsMu = sync.RWMutex{}
+
+	// Snapshot the other mutable config fields under no lock — these are
+	// only written at agent/clone build time, never concurrently with
+	// Run, so a plain read is safe and copying them is the documented
+	// Clone contract ("interface fields share the same implementation").
+	clone := &Agent{
+		Name:              a.Name,
+		Description:       a.Description,
+		SystemPrompts:     a.SystemPrompts,
+		Model:             a.Model,
+		Tools:             nil, // set below from the snapshot
+		Memory:            a.Memory,
+		Prompt:            a.Prompt,
+		InGuard:           a.InGuard,
+		OutGuard:          a.OutGuard,
+		Approver:          a.Approver,
+		Hooks:             a.Hooks,
+		Observer:          a.Observer,
+		SkillLoader:       a.SkillLoader,
+		MaxTurns:          a.MaxTurns,
+		MaxWorkingTokens:  a.MaxWorkingTokens,
+		MaxCompressedTokens: a.MaxCompressedTokens,
+		ReasoningEffort:   a.ReasoningEffort,
+		NoSpawn:           a.NoSpawn,
+		// toolsMu zero value — a fresh, independent lock for the clone.
+	}
 	if len(tools) > 0 {
 		clone.Tools = make([]Tool, len(tools))
 		copy(clone.Tools, tools)
 	}
-	return &clone
+	return clone
 }
 
 // NewAgent creates an Agent with the given name and options.
