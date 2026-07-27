@@ -32,6 +32,8 @@ import (
 
 	openagent "github.com/yusheng-g/openagent-go"
 	opentool "github.com/yusheng-g/openagent-go/tool"
+	"github.com/yusheng-g/openagent-go/tokenizer"
+	"github.com/yusheng-g/openagent-go/utils"
 )
 
 // fraction is the percentage of the model's context window that a single
@@ -61,6 +63,12 @@ func (h *Hook) OnToolStart(ctx context.Context, tool openagent.FunctionDefinitio
 // OnToolEnd checks the result size against the model's context window.
 // If it exceeds 5% of the window, the result is saved to disk and
 // replaced with a pointer.
+//
+// The threshold is measured in tokens (not bytes) using the same
+// tokenizer the runner uses for its trimToContextWindow line, so the
+// artifact protection line and the context-window drop line agree on
+// one ruler. A result that survives this hook (≤ threshold tokens) will
+// not, by itself, push the next turn past the window.
 func (h *Hook) OnToolEnd(ctx context.Context, tool openagent.FunctionDefinition, args json.RawMessage, result *string, err *error, startState any) {
 	if result == nil || *result == "" {
 		return
@@ -69,19 +77,33 @@ func (h *Hook) OnToolEnd(ctx context.Context, tool openagent.FunctionDefinition,
 		return
 	}
 
-	threshold := 128 << 10 // fallback default
-	session, ok := openagent.SessionFromContext(ctx)
-	if ok && session.Model != nil {
-		if cw := session.Model.ContextWindow(); cw > 0 {
-			threshold = cw * fraction / 100
+	// Resolve the context window (tokens) and tokenizer model ID from the
+	// session's active model. Window defaults to Window128K when unknown
+	// (session unavailable or ContextWindow <= 0) so we still protect
+	// small-result paths with a sane budget rather than skipping.
+	cw := utils.Window128K
+	modelID := "gpt-4" // tokenizer fallback (cl100k_base)
+	var sessionID string
+	if session, ok := openagent.SessionFromContext(ctx); ok {
+		sessionID = session.ID
+		if session.Model != nil {
+			if w := session.Model.ContextWindow(); w > 0 {
+				cw = w
+			}
+			if tm, ok := session.Model.(openagent.TokenizerModeler); ok {
+				if name := tm.TokenizerModel(); name != "" {
+					modelID = name
+				}
+			}
 		}
 	}
 
-	if len(*result) <= threshold {
+	threshold := cw * fraction / 100 // tokens
+	if tokenizer.Count(modelID, *result) <= threshold {
 		return
 	}
 
-	dir := filepath.Join(opentool.ArtifactRoot(), sessionDirName(session.ID))
+	dir := filepath.Join(opentool.ArtifactRoot(), sessionDirName(sessionID))
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return
 	}

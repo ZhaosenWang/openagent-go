@@ -39,10 +39,13 @@ func TestHook_UsesSessionModelContextWindow(t *testing.T) {
 		t.Fatalf("ArtifactRoot=%q not under TMPDIR scratch %q", root, scratch)
 	}
 
-	// Window = 10_000 tokens → threshold = 10_000 * 5 / 100 = 500 bytes.
-	// A result of 600 bytes should trigger a save; one of 400 must NOT.
-	const big = 600
-	const small = 400
+	// Window = 10_000 tokens → threshold = 10_000 * 5 / 100 = 500 tokens.
+	// The hook measures the result in tokens (same tokenizer as the
+	// runner's trim line), so a result must exceed 500 tokens to trigger.
+	// 5000 ASCII bytes = 625 tokens > 500 → saves; 1000 bytes = 250
+	// tokens < 500 → does not.
+	const big = 5000
+	const small = 1000
 
 	sess := openagent.Session{
 		ID:    "s-test",
