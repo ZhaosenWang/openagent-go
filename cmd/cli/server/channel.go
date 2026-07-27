@@ -289,6 +289,13 @@ func streamReply(reply channel.ReplyFunc, stream <-chan openagent.StreamEvent) {
 		}
 	}
 
+	// Stream closed without StreamDone/Error/Aborted — finalize the card so
+	// the title doesn't freeze on "回答中". If a terminal event already
+	// set stageDone this is a harmless re-mark.
+	if runCardID != "" && stage != stageDone {
+		stage = stageDone
+		flushRunCard()
+	}
 	pq.stop()
 }
 
