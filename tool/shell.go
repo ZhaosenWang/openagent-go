@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
 	"strings"
 	"time"
 
@@ -34,24 +35,35 @@ import (
 //
 // Implements both [openagent.Tool] and [openagent.StreamExecutor].
 type Shell struct {
-	sandbox  openagent.Sandbox
-	language string
+	sandbox openagent.Sandbox
 }
 
 func NewShell(sandbox openagent.Sandbox) *Shell {
 	return &Shell{sandbox: sandbox}
 }
 
-func (t *Shell) WithLanguage(lang string) *Shell {
-	t.language = lang
-	return t
+// platformShell returns the default shell program: /bin/sh on Unix
+// (POSIX, present on every Unix including Alpine which ships no bash),
+// cmd.exe on Windows.
+func platformShell() string {
+	if runtime.GOOS == "windows" {
+		return "cmd.exe"
+	}
+	return "/bin/sh"
+}
+
+// platformShellArg returns the flag that runs a one-shot command string
+// via the program from platformShell ("-c" on Unix, "/C" on Windows).
+func platformShellArg() string {
+	if runtime.GOOS == "windows" {
+		return "/C"
+	}
+	return "-c"
 }
 
 func (t *Shell) Definition() openagent.FunctionDefinition {
-	desc := "Execute a shell command in the background. If the command finishes quickly, stdout/stderr/exit code are returned directly. If it runs longer, you'll get file paths to monitor progress — use `read` to check stdout.log, stderr.log, and exit.code."
-	if t.language != "" {
-		desc = fmt.Sprintf("Execute a shell command in a %s sandbox. CWD is the workspace root.", t.language)
-	}
+	program := platformShell()
+	desc := fmt.Sprintf("Execute a command via %s. If the command finishes quickly, stdout/stderr/exit code are returned directly. If it runs longer, you'll get file paths to monitor progress — use `read` to check stdout.log, stderr.log, and exit.code.", program)
 	if t.sandbox == nil {
 		desc += " [UNAVAILABLE: no sandbox configured]"
 	} else if cwd := t.sandbox.CWD(); cwd != "" {
@@ -94,9 +106,10 @@ func (t *Shell) Execute(ctx context.Context, args json.RawMessage) (string, erro
 	shellCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
+	program, flag := platformShell(), platformShellArg()
 	cmd := openagent.Command{
-		Program: "/bin/bash",
-		Args:    []string{"-c", params.Command},
+		Program: program,
+		Args:    []string{flag, params.Command},
 		WorkDir: t.sandbox.CWD(),
 	}
 
@@ -158,9 +171,10 @@ func (t *Shell) ExecuteStream(ctx context.Context, args json.RawMessage) <-chan 
 
 	streamCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 
+	program, flag := platformShell(), platformShellArg()
 	cmd := openagent.Command{
-		Program: "/bin/bash",
-		Args:    []string{"-c", params.Command},
+		Program: program,
+		Args:    []string{flag, params.Command},
 		WorkDir: t.sandbox.CWD(),
 	}
 

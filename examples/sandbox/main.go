@@ -131,7 +131,7 @@ func main() {
 
 	// ── Test 6: Shell tool ──
 	fmt.Println("─── Test 6: Shell tool (full integration) ──")
-	shell := tool.NewShell(sb).WithLanguage("go")
+	shell := tool.NewShell(sb)
 	def := shell.Definition()
 	fmt.Printf("  Tool name: %s\n", def.Name)
 	fmt.Printf("  Description: %s\n", def.Description)
