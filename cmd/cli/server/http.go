@@ -10,6 +10,7 @@ import (
 	"time"
 
 	openagent "github.com/yusheng-g/openagent-go"
+	"github.com/yusheng-g/openagent-go/keyring"
 	"github.com/yusheng-g/openagent-go/rest"
 	"github.com/yusheng-g/openagent-go/sandbox/native"
 	"github.com/yusheng-g/openagent-go/summarizer"
@@ -88,7 +89,7 @@ func RunREST(ctx context.Context, cfg *config.Config, caps Capabilities) error {
 
 	// Plugin manager — loads agent:tools, agent:observers, agent:sessions.
 	pluginDir := filepath.Join(profilesDir, "plugins")
-	mgr := wasm.NewManager(pluginDir).WithHostAPI(wasmhost.NewHostAPI(openKeyring()))
+	mgr := wasm.NewManager(pluginDir).WithHostAPI(wasmhost.NewHostAPI(keyring.NewKeyring()))
 	if err := mgr.Discover(ctx); err != nil {
 		slog.Warn("plugin discover failed", "error", err)
 	} else {

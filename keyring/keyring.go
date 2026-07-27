@@ -14,6 +14,7 @@ package keyring
 import (
 	"encoding/base64"
 	"errors"
+	"log/slog"
 	"sync"
 
 	gkr "github.com/zalando/go-keyring"
@@ -22,6 +23,33 @@ import (
 // ErrKeyringUnavailable is returned by Open when no persistent keyring
 // backend can be initialized.
 var ErrKeyringUnavailable = errors.New("keyring: no usable backend available")
+
+// Keyring is the common interface satisfied by Store (persistent system
+// backend) and MemStore (in-memory fallback). Factory functions in this
+// package return Keyring so callers do not depend on a concrete type.
+// Consumers that define their own equivalent interface (e.g.
+// plugin/wasmhost.Keyring) accept values of this type via Go's
+// structural typing — no conversion needed.
+type Keyring interface {
+	Get(service, key string) (string, error)
+	Set(service, key, value string) error
+	Delete(service, key string) error
+}
+
+// NewKeyring returns a persistent system keyring, falling back to an
+// in-memory store (with a warning) when no backend is available. Use this
+// for callers that tolerate secret loss across process restarts (e.g.
+// long-running servers). Callers that must persist (e.g. `keyring set`)
+// should call Open directly and surface the error.
+func NewKeyring() Keyring {
+	sysKr, err := Open()
+	if err != nil {
+		slog.Warn("keyring unavailable, using in-memory fallback (secrets will not persist)",
+			"error", err)
+		return NewMemStore()
+	}
+	return sysKr
+}
 
 // Store wraps a persistent system backend. Methods accept a service name
 // so callers (including WASM plugins) can access keys under different

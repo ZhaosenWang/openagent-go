@@ -3,13 +3,10 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -20,7 +17,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/yusheng-g/openagent-go/cmd/cli/config"
-	"github.com/yusheng-g/openagent-go/cmd/cli/keyring"
+	"github.com/yusheng-g/openagent-go/keyring"
 	"github.com/yusheng-g/openagent-go/cmd/cli/server"
 	plugin "github.com/yusheng-g/openagent-go/plugin/cli"
 	cliwasm "github.com/yusheng-g/openagent-go/plugin/cli/wasm"
@@ -47,14 +44,11 @@ func main() {
 		pluginPaths = preCfg.Plugins
 	}
 
-	// 3. Keyring + runtime.
-	kr := openKeyring()
-	httpClient := &defaultHTTPClient{client: http.DefaultClient}
-
+	// 3. Plugin runtime (keyring + HTTP + logger wired internally).
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	wasmRuntime, err := cliwasm.NewRuntime(ctx, kr, httpClient, &stdLogger{})
+	wasmRuntime, err := cliwasm.NewRuntime(ctx)
 	if err != nil {
 		log.Fatalf("wasm runtime: %v", err)
 	}
@@ -376,19 +370,6 @@ func parseCapabilities(cmd *cobra.Command, caps *server.Capabilities) {
 
 // ── keyring ──
 
-// openKeyring returns the system keyring, falling back to an in-memory
-// store with a warning when the system keychain is unavailable. Intended
-// for read-only / fall-through callers (e.g. `serve`) that can still
-// operate without persisted secrets.
-func openKeyring() plugin.Keyring {
-	sysKr, err := keyring.Open()
-	if err != nil {
-		log.Printf("WARNING: keyring unavailable, using in-memory fallback (secrets will not persist): %v", err)
-		return keyring.NewMemStore()
-	}
-	return sysKr
-}
-
 // keyringOrFail returns the system keyring or exits with a clear message
 // when no persistent backend is available. Used by `keyring set` /
 // `keyring delete` — silently storing in MemStore would be data loss
@@ -413,7 +394,7 @@ var keyringSetCmd = &cobra.Command{
 var keyringGetCmd = &cobra.Command{
 	Use: "get <key>", Short: "Read a credential", Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		kr := openKeyring()
+		kr := keyring.NewKeyring()
 		v, err := kr.Get("openagent", args[0])
 		if err != nil {
 			return fmt.Errorf("keyring get: %w", err)
@@ -434,27 +415,3 @@ var keyringDeleteCmd = &cobra.Command{
 }
 
 func init() { keyringCmd.AddCommand(keyringSetCmd, keyringGetCmd, keyringDeleteCmd) }
-
-// ── HTTP / logger ──
-
-type defaultHTTPClient struct{ client *http.Client }
-
-func (c *defaultHTTPClient) Do(method, url string, headers map[string]string, body []byte) (int, []byte, error) {
-	req, _ := http.NewRequest(method, url, bytes.NewReader(body))
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return 0, nil, err
-	}
-	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
-	return resp.StatusCode, respBody, nil
-}
-
-type stdLogger struct{}
-
-func (l *stdLogger) Info(msg string)  { log.Printf("[plugin] %s", msg) }
-func (l *stdLogger) Warn(msg string)  { log.Printf("[plugin] WARN: %s", msg) }
-func (l *stdLogger) Error(msg string) { log.Printf("[plugin] ERROR: %s", msg) }

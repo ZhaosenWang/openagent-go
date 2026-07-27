@@ -2,6 +2,7 @@ package wasmhost
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -12,16 +13,26 @@ import (
 func NewHostAPI(kr Keyring) *HostAPI {
 	return &HostAPI{
 		Keyring: kr,
-		HTTP:    &defaultHTTPClient{client: http.DefaultClient},
+		HTTP:    NewHTTPClient(),
 		Logger:  &logAdapter{},
 	}
+}
+
+// NewHTTPClient returns an HTTPClient backed by net/http's default client.
+// Exported so non-HostAPI callers (e.g. the CLI plugin runtime) share one
+// implementation instead of each vendoring its own net/http wrapper.
+func NewHTTPClient() HTTPClient {
+	return &defaultHTTPClient{client: http.DefaultClient}
 }
 
 // defaultHTTPClient implements HTTPClient via net/http.
 type defaultHTTPClient struct{ client *http.Client }
 
 func (c *defaultHTTPClient) Do(method, url string, headers map[string]string, body []byte) (int, []byte, error) {
-	req, _ := http.NewRequest(method, url, bytes.NewReader(body))
+	req, err := http.NewRequest(method, url, bytes.NewReader(body))
+	if err != nil {
+		return 0, nil, fmt.Errorf("build request: %w", err)
+	}
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
@@ -30,7 +41,10 @@ func (c *defaultHTTPClient) Do(method, url string, headers map[string]string, bo
 		return 0, nil, err
 	}
 	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return resp.StatusCode, nil, fmt.Errorf("read response body: %w", err)
+	}
 	return resp.StatusCode, respBody, nil
 }
 
