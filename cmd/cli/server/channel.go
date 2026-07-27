@@ -154,112 +154,92 @@ func streamReply(reply channel.ReplyFunc, stream <-chan openagent.StreamEvent) {
 		_ = pq.stop // used via defer-like pattern below
 	)
 
+	// One card per agent run. Title tracks the stage; body stacks
+	// thinking (collapsed) → toolcalls (collapsed) → answer (open).
 	var (
-		textCardID string          // response card ID
-		textBuf    strings.Builder // accumulated text since last patch
-		textLast   = time.Now()    // last patch time
-
-		thoughtCardID string          // reasoning card ID
-		thoughtBuf    strings.Builder // accumulated reasoning text
-
+		runCardID   string
+		thoughtBuf  strings.Builder
+		textBuf     strings.Builder
 		pendingTool = map[string]*tpend{} // toolCallID → {name, args}
-		toolCardID  = map[string]string{} // toolCallID → card message ID
-		toolBuf     = map[string]string{} // toolCallID → accumulated output
+		toolCalls   []toolCallEntry
+		toolCallIdx = map[string]int{} // toolCallID → index in toolCalls
+
+		// Stage only advances (thinking < toolcalling < answering < done),
+		// so a second round of reasoning mid-turn doesn't flicker the title
+		// back to "思考中".
+		stage    = stageThinking
+		lastErr  string
+		lastTime = time.Now()
 	)
 
-	mkCard := func(title, body string, color channel.CardColor) *channel.Card {
-		return &channel.Card{Header: channel.CardHeader{Title: title}, Content: body, Color: color}
-	}
-
-	// ── Periodic flush (ad-hoc, not tick-based) ──
-	// Called after each event. If enough time/content has passed,
-	// marks the text card dirty for the next queue tick.
-
-	flushText := func() {
-		if textBuf.Len() == 0 {
-			return
-		}
-		body := textBuf.String()
-		if textCardID == "" {
-			textCardID = pq.create(channel.ReplyMessage{Card: mkCard("🧠 openagent", body, channel.CardColorGrey)})
+	// flushRunCard rebuilds the single run card from current state and
+	// creates-or-patches it. The 500ms patch debounce bounds API rate.
+	flushRunCard := func() {
+		card := runCard(stage, thoughtBuf.String(), toolCalls, textBuf.String(), lastErr)
+		if runCardID == "" {
+			runCardID = pq.create(channel.ReplyMessage{Card: card})
 		} else {
-			pq.mark(textCardID, mkCard("🧠 openagent", body, channel.CardColorGrey))
-			
+			pq.mark(runCardID, card)
 		}
-		textLast = time.Now()
+		lastTime = time.Now()
 	}
 
-	finalizeThoughtCard := func() {
-		if thoughtCardID == "" {
-			return
+	// maybeFlush throttles patches during streaming output.
+	maybeFlush := func() {
+		if time.Since(lastTime) >= 80*time.Millisecond || textBuf.Len() >= 50 {
+			flushRunCard()
 		}
-		pq.mark(thoughtCardID, mkCard("🤔 thinking — done", thoughtBuf.String(), channel.CardColorYellow))
-		pq.flush()
-		thoughtCardID = ""
-		thoughtBuf.Reset()
-		
-	}
-
-	finalizeTextCard := func() {
-		if textCardID == "" {
-			return
-		}
-		pq.mark(textCardID, mkCard("🧠 openagent", textBuf.String(), channel.CardColorGrey))
-		pq.flush()
-		textCardID = ""
-		textBuf.Reset()
 	}
 
 	for evt := range stream {
 		switch evt.Type {
 		case openagent.StreamThought:
 			thoughtBuf.WriteString(evt.Text)
-			body := thoughtBuf.String()
-			if thoughtCardID == "" {
-				thoughtCardID = pq.create(channel.ReplyMessage{Card: mkCard("🤔 thinking", body, channel.CardColorYellow)})
-			} else {
-				pq.mark(thoughtCardID, mkCard("🤔 thinking", body, channel.CardColorYellow))
-				
-			}
+			flushRunCard()
 
 		case openagent.StreamTextDelta:
-			finalizeThoughtCard()
-			textBuf.WriteString(evt.Text)
-			if time.Since(textLast) >= 80*time.Millisecond || textBuf.Len() >= 50 {
-				flushText()
+			if stage < stageAnswering {
+				stage = stageAnswering
 			}
+			textBuf.WriteString(evt.Text)
+			maybeFlush()
 
 		case openagent.StreamToolCall:
-			finalizeThoughtCard()
-			finalizeTextCard()
+			if stage < stageToolCalling {
+				stage = stageToolCalling
+			}
 			for _, tc := range evt.Message.ToolCalls {
-				if tc.Function.Name == "plan_create" {
+				switch tc.Function.Name {
+				case "plan_create":
 					goal, steps := parsePlanCreate(tc.Function.Arguments)
 					if goal != "" {
 						pq.create(channel.ReplyMessage{Card: mkCard("📋 "+goal, steps, channel.CardColorBlue)})
 					}
 					continue
+				case "plan_update", "enter_plan_mode":
+					pendingTool[tc.ID] = &tpend{name: tc.Function.Name, args: tc.Function.Arguments}
+					continue
 				}
 				pendingTool[tc.ID] = &tpend{name: tc.Function.Name, args: tc.Function.Arguments}
-				toolBuf[tc.ID] = ""
+				toolCallIdx[tc.ID] = len(toolCalls)
+				toolCalls = append(toolCalls, toolCallEntry{
+					name:   tc.Function.Name,
+					args:   tc.Function.Arguments,
+					status: "in_progress",
+				})
 			}
+			flushRunCard()
 
 		case openagent.StreamToolProgress:
-			t, ok := pendingTool[evt.ToolCallID]
+			if _, ok := pendingTool[evt.ToolCallID]; !ok {
+				continue
+			}
+			idx, ok := toolCallIdx[evt.ToolCallID]
 			if !ok {
 				continue
 			}
-			toolBuf[evt.ToolCallID] += evt.Text
-
-			card := toolCard(t.name, t.args, "in_progress", toolBuf[evt.ToolCallID])
-			if msgID, exists := toolCardID[evt.ToolCallID]; exists {
-				pq.mark(msgID, card)
-			} else {
-				id := pq.create(channel.ReplyMessage{Card: card})
-				if id != "" {
-					toolCardID[evt.ToolCallID] = id
-				}
-			}
+			toolCalls[idx].output += evt.Text
+			flushRunCard()
 
 		case openagent.StreamToolResult:
 			t, ok := pendingTool[evt.Message.ToolCallID]
@@ -267,87 +247,170 @@ func streamReply(reply channel.ReplyFunc, stream <-chan openagent.StreamEvent) {
 				continue
 			}
 			delete(pendingTool, evt.Message.ToolCallID)
-			delete(toolBuf, evt.Message.ToolCallID)
-
 			if t.name == "plan_update" || t.name == "enter_plan_mode" {
 				continue
 			}
-
 			output := evt.Message.Content
 			status := "completed"
 			if strings.HasPrefix(output, "error: ") {
 				status = "failed"
 			}
-
-			card := toolCard(t.name, t.args, status, output)
-			if msgID := toolCardID[evt.Message.ToolCallID]; msgID != "" {
-				delete(toolCardID, evt.Message.ToolCallID)
-				pq.mark(msgID, card)
-				pq.flush()
-			} else {
-				pq.create(channel.ReplyMessage{Card: card})
+			if idx, ok := toolCallIdx[evt.Message.ToolCallID]; ok {
+				toolCalls[idx].status = status
+				toolCalls[idx].output = output
 			}
+			flushRunCard()
 
 		case openagent.StreamRetrying:
-			finalizeThoughtCard()
-			finalizeTextCard()
-			errMsg := "retrying..."
 			if evt.Error != nil {
-				errMsg = fmt.Sprintf("retrying: %v", evt.Error)
+				lastErr = fmt.Sprintf("retrying: %v", evt.Error)
+			} else {
+				lastErr = "retrying..."
 			}
-			pq.create(channel.ReplyMessage{Card: mkCard("⚠️ retrying", errMsg, channel.CardColorYellow)})
+			flushRunCard()
 
 		case openagent.StreamDone:
-			finalizeThoughtCard()
-			finalizeTextCard()
+			stage = stageDone
+			flushRunCard()
+			pq.flush()
 
 		case openagent.StreamError:
-			finalizeThoughtCard()
-			finalizeTextCard()
+			stage = stageDone
 			if evt.Error != nil {
-				pq.create(channel.ReplyMessage{Card: mkCard("❌ error", fmt.Sprintf("%v", evt.Error), channel.CardColorRed)})
+				lastErr = fmt.Sprintf("error: %v", evt.Error)
 			}
+			flushRunCard()
 			pq.stop()
 			return
 
 		case openagent.StreamAborted:
-			finalizeThoughtCard()
-			finalizeTextCard()
+			stage = stageDone
+			lastErr = "aborted"
+			flushRunCard()
 			pq.stop()
 			return
 		}
 	}
 
-	finalizeThoughtCard()
-	finalizeTextCard()
 	pq.stop()
+}
+
+// ── Run card ──
+
+// mkCard is a plain card builder used for standalone cards (plan_create).
+func mkCard(title, body string, color channel.CardColor) *channel.Card {
+	return &channel.Card{Header: channel.CardHeader{Title: title}, Content: body, Color: color}
+}
+
+// stage tracks the agent run's progress for the run card title.
+type stage int
+
+const (
+	stageThinking stage = iota // 🤔 思考中
+	stageToolCalling           // 🔧 调用工具中
+	stageAnswering             // 💬 回答中
+	stageDone                  // ✅ 已完成
+)
+
+func (s stage) title() string {
+	switch s {
+	case stageThinking:
+		return "🤔 思考中"
+	case stageToolCalling:
+		return "🔧 调用工具中"
+	case stageAnswering:
+		return "💬 回答中"
+	case stageDone:
+		return "✅ 已完成"
+	}
+	return "🤔 思考中"
+}
+
+func (s stage) color() channel.CardColor {
+	if s == stageDone {
+		return channel.CardColorGrey
+	}
+	return channel.CardColorYellow
+}
+
+// runCard builds the single card for an agent run. The body stacks three
+// sections in fixed order: thinking (collapsed) → toolcalls (collapsed,
+// nested) → answer (open). Empty sections are omitted. errMsg, when set,
+// is appended at the end.
+func runCard(s stage, thought string, calls []toolCallEntry, answer, errMsg string) *channel.Card {
+	var panels []channel.Card
+
+	if thought != "" {
+		panels = append(panels, channel.Card{
+			// Title left empty — subPanel falls back to a content preview.
+			Content:   thought,
+			Collapsed: true,
+		})
+	}
+	if len(calls) > 0 {
+		panels = append(panels, toolCallsSection(calls))
+	}
+
+	body := answer
+	if errMsg != "" {
+		if body != "" {
+			body += "\n\n"
+		}
+		body += errMsg
+	}
+
+	return &channel.Card{
+		Header:  channel.CardHeader{Title: s.title()},
+		Color:   s.color(),
+		Content: body,
+		Panels:  panels,
+	}
 }
 
 // ── Tool card ──
 
-func toolCard(name, args, status, output string) *channel.Card {
-	title := toolEmoji(name) + " " + name
-	color := channel.CardColorGrey
-	switch status {
+// toolCallEntry is the per-call state collected for the run card.
+type toolCallEntry struct {
+	name   string
+	args   string
+	status string // "in_progress" | "completed" | "failed"
+	output string
+}
+
+// toolCallSubCard builds the inner collapsed Card for one tool call.
+// Title is the tool name + status marker (no emoji); body is input + output.
+func toolCallSubCard(e toolCallEntry) channel.Card {
+	title := e.name
+	switch e.status {
 	case "completed":
-		title = toolEmoji(name) + " " + name + " ✓"
-		color = channel.CardColorGreen
+		title = e.name + " ✓"
 	case "failed":
-		title = toolEmoji(name) + " " + name + " ✗"
-		color = channel.CardColorRed
-	case "in_progress":
-		color = channel.CardColorPurple
+		title = e.name + " ✗"
 	}
 
-	body := formatInput(name, args)
-	if output != "" {
-		body += "\n```\n" + output + "\n```"
+	body := formatInput(e.name, e.args)
+	if e.output != "" {
+		body += "\n```\n" + e.output + "\n```"
 	}
 
-	return &channel.Card{
-		Header:  channel.CardHeader{Title: title},
-		Content: body,
-		Color:   color,
+	return channel.Card{
+		Header:    channel.CardHeader{Title: title},
+		Content:   body,
+		Collapsed: true,
+	}
+}
+
+// toolCallsSection builds the collapsed sub-card for the toolcalls section.
+// Title "toolcalls (N)"; expanding reveals one nested panel per call.
+func toolCallsSection(entries []toolCallEntry) channel.Card {
+	subs := make([]channel.Card, 0, len(entries))
+	for _, e := range entries {
+		subs = append(subs, toolCallSubCard(e))
+	}
+	return channel.Card{
+		Header:    channel.CardHeader{Title: fmt.Sprintf("toolcalls (%d)", len(entries))},
+		Collapsed: true,
+		Panels:    subs,
 	}
 }
 

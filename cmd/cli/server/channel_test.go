@@ -3,17 +3,12 @@ package server
 import (
 	"strings"
 	"testing"
-
-	"github.com/yusheng-g/openagent-go/channel"
 )
 
 func TestToolCardCompleted(t *testing.T) {
-	card := toolCard("shell", `{"command":"echo hello"}`, "completed", "hello\n")
-	if card.Header.Title != "\U0001F4BB shell ✓" {
+	card := toolCallSubCard(toolCallEntry{name: "shell", args: `{"command":"echo hello"}`, status: "completed", output: "hello\n"})
+	if card.Header.Title != "shell ✓" {
 		t.Errorf("title = %q", card.Header.Title)
-	}
-	if card.Color != channel.CardColorGreen {
-		t.Errorf("color = %s, want green", card.Color)
 	}
 	if !strings.Contains(card.Content, "echo hello") {
 		t.Errorf("content should contain command: %s", card.Content)
@@ -24,19 +19,16 @@ func TestToolCardCompleted(t *testing.T) {
 }
 
 func TestToolCardFailed(t *testing.T) {
-	card := toolCard("write", `{"path":"/tmp/x"}`, "failed", "error: permission denied")
-	if card.Color != channel.CardColorRed {
-		t.Errorf("color = %s, want red", card.Color)
-	}
+	card := toolCallSubCard(toolCallEntry{name: "write", args: `{"path":"/tmp/x"}`, status: "failed", output: "error: permission denied"})
 	if !strings.Contains(card.Header.Title, "✗") {
 		t.Errorf("failed card should have ✗ in title: %s", card.Header.Title)
 	}
 }
 
 func TestToolCardInProgress(t *testing.T) {
-	card := toolCard("shell", `{"command":"sleep 10"}`, "in_progress", "running...")
-	if card.Color != channel.CardColorPurple {
-		t.Errorf("color = %s, want purple", card.Color)
+	card := toolCallSubCard(toolCallEntry{name: "shell", args: `{"command":"sleep 10"}`, status: "in_progress", output: "running..."})
+	if !strings.Contains(card.Header.Title, "shell") {
+		t.Errorf("in-progress title should contain name: %s", card.Header.Title)
 	}
 }
 

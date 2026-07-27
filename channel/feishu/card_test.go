@@ -26,15 +26,22 @@ func TestBuildCardBasic(t *testing.T) {
 
 	assertString(t, m, "header.title.content", "Hello")
 	assertString(t, m, "header.template", "blue")
-	assertString(t, m, "elements.0.content", "**bold** text")
+	assertString(t, m, "schema", "2.0")
 
-	// Check card config.
-	cfg, ok := m["config"].(map[string]any)
-	if !ok {
-		t.Fatal("config is not a map")
+	// Schema 2.0 — no config/wide_screen_mode.
+	if _, ok := m["config"]; ok {
+		t.Error("schema 2.0 should not have config")
 	}
-	if ws, ok := cfg["wide_screen_mode"].(bool); !ok || !ws {
-		t.Errorf("wide_screen_mode should be true, got %v", cfg["wide_screen_mode"])
+
+	// body.elements[0] is the markdown element.
+	body, _ := m["body"].(map[string]any)
+	elems, _ := body["elements"].([]any)
+	first, _ := elems[0].(map[string]any)
+	if first["tag"] != "markdown" {
+		t.Errorf("first element tag = %v, want markdown", first["tag"])
+	}
+	if first["content"] != "**bold** text" {
+		t.Errorf("first element content = %v, want **bold** text", first["content"])
 	}
 }
 
