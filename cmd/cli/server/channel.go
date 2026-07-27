@@ -194,20 +194,17 @@ func streamReply(reply channel.ReplyFunc, stream <-chan openagent.StreamEvent) {
 	for evt := range stream {
 		switch evt.Type {
 		case openagent.StreamThought:
+			stage = stageThinking
 			thoughtBuf.WriteString(evt.Text)
 			flushRunCard()
 
 		case openagent.StreamTextDelta:
-			if stage < stageAnswering {
-				stage = stageAnswering
-			}
+			stage = stageAnswering
 			textBuf.WriteString(evt.Text)
 			maybeFlush()
 
 		case openagent.StreamToolCall:
-			if stage < stageToolCalling {
-				stage = stageToolCalling
-			}
+			stage = stageToolCalling
 			for _, tc := range evt.Message.ToolCalls {
 				switch tc.Function.Name {
 				case "plan_create":
