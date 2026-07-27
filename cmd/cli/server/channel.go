@@ -35,8 +35,14 @@ func RunChannels(ctx context.Context, agent *openagent.Agent, cfg config.Channel
 				sessionID := ch.Name() + "_" + msg.ChatID
 
 				go func() {
+					// Carry the resolved Model instance so downstream
+					// consumers (RunHooks via SessionFromContext, e.g. the
+					// artifact hook's context-window threshold) read the
+					// same model the runner uses. channelAgent.Model was
+					// injected in acp.go before RunChannels.
 					session := openagent.Session{
 						ID:        sessionID,
+						Model:     agent.Model,
 						CreatedAt: time.Now(),
 					}
 					stream := agent.RunStream(msgCtx, session, openagent.UserMessage(msg.Text))
