@@ -19,7 +19,7 @@ func main() {
 	flag.Parse()
 
 	client := openacp.NewClient("acp-client", "1.0.0")
-	session, err := client.ConnectStdio(context.Background(), *serverBin)
+	session, err := client.ConnectStdio(context.Background(), nil, *serverBin)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "FATAL: connect to %s: %v\n", *serverBin, err)
 		os.Exit(1)

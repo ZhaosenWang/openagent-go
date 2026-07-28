@@ -8,7 +8,7 @@
 // Usage:
 //
 //	client := acp.NewClient("my-app", "1.0.0")
-//	sess, _ := client.ConnectStdio(ctx, "my-agent", "-v")
+//	sess, _ := client.ConnectStdio(ctx, nil, "my-agent", "-v")
 //	defer sess.Close()
 //
 //	sess.Initialize(ctx, acp.InitializeRequest{...})
@@ -51,13 +51,18 @@ func NewClient(name, version string) *Client {
 // ConnectStdio spawns an ACP agent subprocess and communicates over
 // stdin/stdout with newline-delimited JSON (JSON-RPC 2.0).
 //
+// env adds environment variables (name=value pairs) to the spawned process on
+// top of the parent environment. Pass nil to inherit the parent env unchanged.
 // command is the path to the executable; args are its CLI arguments.
 // The background reader goroutine starts automatically and dispatches
 // session/update notifications to the [EventHandler].
 //
 // Call [Session.Close] to kill the process and release resources.
-func (c *Client) ConnectStdio(ctx context.Context, command string, args ...string) (*Session, error) {
+func (c *Client) ConnectStdio(ctx context.Context, env []string, command string, args ...string) (*Session, error) {
 	cmd := exec.CommandContext(ctx, command, args...)
+	if len(env) > 0 {
+		cmd.Env = append(cmd.Environ(), env...)
+	}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, fmt.Errorf("acp stdin pipe: %w", err)
@@ -73,17 +78,45 @@ func (c *Client) ConnectStdio(ctx context.Context, command string, args ...strin
 		return nil, fmt.Errorf("acp start %q: %w", command, err)
 	}
 
+	return c.connectIO(stdin, stdout, subprocessCloser(cmd), &stderrBuf), nil
+}
+
+// connectIO wires a [Session] to arbitrary io streams and starts the reader
+// goroutine. closer (optional) is invoked by [Session.Close] to tear the
+// transport down; stderr (optional) is surfaced via [Session.Stderr].
+//
+// This is the seam that separates process-spawning ([ConnectStdio]) from the
+// JSON-RPC transport, so a Session can also be driven in-process (e.g. over
+// io.Pipe for tests or an already-spawned process's pipes).
+func (c *Client) connectIO(stdin io.Writer, stdout io.Reader, closer io.Closer, stderr *bytes.Buffer) *Session {
 	sess := &Session{
-		cmd:       cmd,
 		stdin:     stdin,
 		stdout:    bufio.NewScanner(stdout),
-		stderrBuf: &stderrBuf,
+		closer:    closer,
+		stderrBuf: stderr,
 		writeMu:   new(sync.Mutex),
 		pending:   make(map[string]*pendingCall),
 	}
 	go sess.startReader()
-	return sess, nil
+	return sess
 }
+
+// subprocessCloser returns an io.Closer that kills and reaps cmd. Best-effort,
+// mirroring the pre-refactor Close() behaviour.
+func subprocessCloser(cmd *exec.Cmd) io.Closer {
+	return closerFunc(func() error {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
+		return nil
+	})
+}
+
+// closerFunc lets a plain func satisfy io.Closer.
+type closerFunc func() error
+
+func (f closerFunc) Close() error { return f() }
 
 // ── Session ──
 
@@ -96,10 +129,16 @@ func (c *Client) ConnectStdio(ctx context.Context, command string, args ...strin
 // [Session.SetEventHandler]. The handler must be set before [Session.Prompt]
 // to receive streaming output.
 type Session struct {
-	cmd    *exec.Cmd
 	stdin  io.Writer
 	stdout *bufio.Scanner
 
+	// closer optionally tears down the transport on Close. For a spawned
+	// subprocess it kills and reaps the process; for an in-process io
+	// connection it may be nil (caller owns lifecycle) or a pipe closer.
+	closer io.Closer
+
+	// stderrBuf captures the subprocess's stderr for diagnostics. Nil for
+	// in-process connections that have no subprocess.
 	stderrBuf *bytes.Buffer
 
 	writeMu *sync.Mutex
@@ -274,7 +313,9 @@ func (s *Session) Logout(ctx context.Context) (*LogoutResponse, error) {
 	return &resp, nil
 }
 
-// Close kills the agent subprocess and releases resources. Call when the
+// Close tears down the connection. It closes the write side of stdin (to
+// signal EOF to the peer) and, if a closer was provided at connect time,
+// invokes it (e.g. killing and reaping a spawned subprocess). Call when the
 // client is done with the connection.
 func (s *Session) Close() error {
 	if s.stdin != nil {
@@ -282,9 +323,8 @@ func (s *Session) Close() error {
 			_ = wc.Close()
 		}
 	}
-	if s.cmd != nil && s.cmd.Process != nil {
-		_ = s.cmd.Process.Kill()
-		_ = s.cmd.Wait()
+	if s.closer != nil {
+		_ = s.closer.Close()
 	}
 	return nil
 }

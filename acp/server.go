@@ -5,10 +5,10 @@
 package acp
 
 import (
-	"log/slog"
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -86,9 +86,9 @@ type ModelConfig struct {
 
 // agentSession holds per-session runtime state.
 type agentSession struct {
-	id           openacp.SessionId
-	cwd          string
-	createdAt    time.Time
+	id        openacp.SessionId
+	cwd       string
+	createdAt time.Time
 
 	// modeMu guards the session mode state machine and cached plan entries
 	// (mode, previousMode, planEntries, injectedPlanTools). It supersedes
@@ -111,8 +111,8 @@ type agentSession struct {
 	// held across saveMode/savePlan SessionStore I/O (those run after
 	// unlock; the snapshot is captured under the lock).
 	modeMu       sync.RWMutex
-	mode         string      // "auto", "manual", or "plan"
-	previousMode string      // mode saved when plan was entered; used by exit_plan_mode
+	mode         string                          // "auto", "manual", or "plan"
+	previousMode string                          // mode saved when plan was entered; used by exit_plan_mode
 	config       map[openacp.SessionConfigId]any // config option values
 	cancel       context.CancelFunc
 
@@ -1031,8 +1031,8 @@ func (s *AgentServer) persistAndNotifyMode(ctx context.Context, sid openacp.Sess
 		// Also send config_option_update so the client's mode dropdown
 		// (which reads the "mode" config option) stays in sync.
 		s.updateSender.SendSessionUpdate(sid, openacp.SessionUpdate{
-			SessionUpdate:   "config_option_update",
-			ConfigOptions:   s.buildConfigOptions(sid),
+			SessionUpdate: "config_option_update",
+			ConfigOptions: s.buildConfigOptions(sid),
 		})
 	}
 }
@@ -1154,9 +1154,9 @@ func (s *AgentServer) OnPrompt(ctx context.Context, req openacp.PromptRequest, s
 
 	providerID, modelID := s.resolveModelConfig(ss)
 	oaSession := openagent.Session{
-		ID:        string(req.SessionID),
-		ModelID:   modelID,
-		Provider:  providerID,
+		ID:       string(req.SessionID),
+		ModelID:  modelID,
+		Provider: providerID,
 		// Carry the resolved Model instance so downstream consumers
 		// (RunHooks via SessionFromContext, e.g. the artifact hook's
 		// context-window threshold) can read ContextWindow() without

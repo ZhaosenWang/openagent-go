@@ -65,9 +65,9 @@ func (t *ReadFile) Definition() openagent.FunctionDefinition {
 		Parameters: json.RawMessage(`{
 			"type": "object",
 			"properties": {
-				"path":   {"type": "string",  "description": "File path"},
-				"offset": {"type": "integer", "description": "Start line (1-based, default: 1)"},
-				"limit":  {"type": "integer", "description": "Max lines to read (default: all remaining)"}
+				"path":  {"type": "string",  "description": "File path"},
+				"line":  {"type": "integer", "description": "Start line (1-based, default: 1)"},
+				"limit": {"type": "integer", "description": "Max lines to read (default: all remaining)"}
 			},
 			"required": ["path"]
 		}`),
@@ -90,9 +90,9 @@ func (t *ReadFile) CanSelfApprove(args json.RawMessage) bool {
 
 func (t *ReadFile) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var params struct {
-		Path   string `json:"path"`
-		Offset int    `json:"offset"` // 1-based, 0 = default (1)
-		Limit  int    `json:"limit"`  // 0 = default (all)
+		Path  string `json:"path"`
+		Line  int    `json:"line"`  // 1-based, 0 = default (1)
+		Limit int    `json:"limit"` // 0 = default (all)
 	}
 	if err := json.Unmarshal(args, &params); err != nil {
 		return "", fmt.Errorf("read: %w", err)
@@ -100,11 +100,11 @@ func (t *ReadFile) Execute(ctx context.Context, args json.RawMessage) (string, e
 	if params.Path == "" {
 		return "", fmt.Errorf("read: path is required")
 	}
-	if params.Offset < 0 {
-		params.Offset = 0
+	if params.Line < 0 {
+		params.Line = 0
 	}
-	if params.Offset == 0 {
-		params.Offset = 1
+	if params.Line == 0 {
+		params.Line = 1
 	}
 
 	abs, err := validatePath(t.workDir, params.Path)
@@ -146,7 +146,7 @@ func (t *ReadFile) Execute(ctx context.Context, args json.RawMessage) (string, e
 
 	for scanner.Scan() {
 		lineNum++
-		if lineNum < params.Offset {
+		if lineNum < params.Line {
 			continue
 		}
 		hitOffset = true
@@ -162,13 +162,13 @@ func (t *ReadFile) Execute(ctx context.Context, args json.RawMessage) (string, e
 	}
 
 	if !hitOffset {
-		return fmt.Sprintf("[offset %d is beyond end of file (%d lines)]", params.Offset, lineNum), nil
+		return fmt.Sprintf("[line %d is beyond end of file (%d lines)]", params.Line, lineNum), nil
 	}
 
 	result := out.String()
-	if params.Offset > 1 || params.Limit > 0 {
+	if params.Line > 1 || params.Limit > 0 {
 		prefix := fmt.Sprintf("[lines %d-%d, %d total, %d bytes]:\n",
-			params.Offset, params.Offset+lineCount-1, lineNum, info.Size())
+			params.Line, params.Line+lineCount-1, lineNum, info.Size())
 		result = prefix + result
 	}
 	return result, nil

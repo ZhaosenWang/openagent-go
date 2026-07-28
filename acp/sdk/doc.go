@@ -31,7 +31,7 @@
 //	ClientRequester interface    ClientRequestHandler interface
 //	Server struct                Client struct
 //	NewServer(name, ver, h)      NewClient(name, ver)
-//	server.Run(ctx)              client.ConnectStdio(ctx, cmd, args...)
+//	server.Run(ctx)              client.ConnectStdio(ctx, nil, cmd, args...)
 //
 // Server implements the Agent side: it reads JSON-RPC 2.0 messages from
 // stdin, routes them to AgentHandler methods, and writes responses plus
@@ -165,7 +165,7 @@
 // # Usage: Building a Client
 //
 //	client := openacp.NewClient("my-client", "1.0.0")
-//	sess, _ := client.ConnectStdio(ctx, "./my-agent")
+//	sess, _ := client.ConnectStdio(ctx, nil, "./my-agent")
 //	defer sess.Close()
 //
 //	sess.Initialize(ctx, openacp.InitializeRequest{ProtocolVersion: 1})
