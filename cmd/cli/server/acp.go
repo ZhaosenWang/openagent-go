@@ -60,7 +60,7 @@ func RunACP(ctx context.Context, cfg *config.Config, caps Capabilities) error {
 	// Tools and sandbox are created per-turn in agentForTurn so they
 	// use the session's cwd rather than the process working directory.
 	opts := []openagent.AgentOption{
-		openagent.WithSystemPrompts(resolveProfiles(cfg.Profiles)...),
+		openagent.WithSystemPrompts(resolveProfiles(cfg.Profiles, "")...),
 		openagent.WithMaxTurns(100),
 	}
 	if caps.OnMemory() {
@@ -82,6 +82,9 @@ func RunACP(ctx context.Context, cfg *config.Config, caps Capabilities) error {
 	}
 	srv := acp.NewAgentServer(agent, serverMem, sessionStore, modelMap)
 	srv.MCPEnabled = caps.OnMCP()
+	srv.ProfileResolver = func(cwd string) []string {
+		return resolveProfiles(cfg.Profiles, cwd)
+	}
 
 	// Register model configs for runtime_set_model_config.
 	for _, mi := range modelInfos {

@@ -54,7 +54,7 @@ func RunREST(ctx context.Context, cfg *config.Config, caps Capabilities) error {
 
 	opts := []openagent.AgentOption{
 		openagent.WithModel(m),
-		openagent.WithSystemPrompts(resolveProfiles(cfg.Profiles)...),
+		openagent.WithSystemPrompts(resolveProfiles(cfg.Profiles, "")...),
 		openagent.WithMaxTurns(100),
 	}
 	if caps.OnMemory() {

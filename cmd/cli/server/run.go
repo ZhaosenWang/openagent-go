@@ -23,7 +23,7 @@ func RunCLI(ctx context.Context, cfg *config.Config, message string) error {
 	}
 
 	// 2. System prompts (unexported: resolveProfiles)
-	prompts := resolveProfiles(cfg.Profiles)
+	prompts := resolveProfiles(cfg.Profiles, "")
 
 	// 3. Sandbox + standard tools (unexported: sandboxPolicy, buildTools)
 	workDir, _ := os.Getwd()

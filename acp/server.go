@@ -74,6 +74,12 @@ type AgentServer struct {
 	PluginMgr    *wasm.Manager
 	modelConfigs map[string]ModelConfig // "provider/modelID" → original config
 	modelsMu     sync.Mutex
+
+	// ProfileResolver resolves static context prompts (SOUL/SYSTEM/AGENTS)
+	// for a given cwd. If set, agentForTurn calls it per-turn to override
+	// the clone's SystemPrompts with session-cwd-aware profiles. If nil,
+	// the agent template's SystemPrompts are used as-is.
+	ProfileResolver func(cwd string) []string
 }
 
 // ModelConfig stores the original apiKey/baseURL for a registered model,
@@ -1505,6 +1511,14 @@ func (s *AgentServer) agentForTurn(sid openacp.SessionId) *openagent.Agent {
 				}
 			}
 			s.injectExecutionTools(clone, sid, ss)
+		}
+
+		// Override system prompts with session-cwd-aware profiles so each
+		// session picks up SOUL/SYSTEM/AGENTS from its own project directory.
+		if s.ProfileResolver != nil && ss.cwd != "" {
+			if prompts := s.ProfileResolver(ss.cwd); len(prompts) > 0 {
+				clone.SystemPrompts = prompts
+			}
 		}
 	}
 

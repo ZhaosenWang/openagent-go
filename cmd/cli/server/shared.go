@@ -195,27 +195,33 @@ func resolveProfilesDir(profiles string) string {
 // resolveProfiles reads SOUL.md, SYSTEM.md, and AGENTS.md from the profiles
 // directory. Falls back to built-in defaults when the files are missing.
 //
+// cwd is the working directory to search for project-level profiles; if empty,
+// os.Getwd() is used.
+//
 // Resolution order (per file):
-//  1. $(pwd)/$(profiles)/FILE.md
+//  1. $(cwd)/FILE.md, $(cwd)/$(profiles)/FILE.md
 //  2. ~/$(profiles)/FILE.md
 //  3. built-in default
 //
 // The prompts are returned in injection order: SOUL → SYSTEM → AGENTS.
-func resolveProfiles(profiles string) []string {
+func resolveProfiles(profiles, cwd string) []string {
 	return []string{
-		resolveProfileFile(profiles, "SOUL.md", personaAndLimitsPrompt),
-		resolveProfileFile(profiles, "SYSTEM.md", systemContextPrompt),
-		resolveProfileFile(profiles, "AGENTS.md", methodologyAndRulesPrompt),
+		resolveProfileFile(profiles, cwd, "SOUL.md", personaAndLimitsPrompt),
+		resolveProfileFile(profiles, cwd, "SYSTEM.md", systemContextPrompt),
+		resolveProfileFile(profiles, cwd, "AGENTS.md", methodologyAndRulesPrompt),
 	}
 }
 
-func resolveProfileFile(profiles, filename, defaultText string) string {
+func resolveProfileFile(profiles, cwd, filename, defaultText string) string {
 	if profiles == "" {
 		return defaultText
 	}
+	if cwd == "" {
+		cwd, _ = os.Getwd()
+	}
 
-	// 1.  Project-level: $(pwd)/FILE.md, $(pwd)/$(profiles)/FILE.md
-	if cwd, err := os.Getwd(); err == nil {
+	// 1.  Project-level: $(cwd)/FILE.md, $(cwd)/$(profiles)/FILE.md
+	if cwd != "" {
 		p := filepath.Join(cwd, filename)
 		if data, err := os.ReadFile(p); err == nil {
 			return strings.TrimSpace(string(data))
