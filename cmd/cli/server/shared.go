@@ -157,6 +157,23 @@ IMPORTANT: Help the user complete tasks by using available tools when appropriat
 - Use clear, imperative language for actions; use structured formatting for complex output.
 `
 
+// systemContextPrompt is the built-in default for SYSTEM.md.
+// It is a system-level prompt slot for environment-wide instructions that
+// sit between persona (SOUL.md) and methodology (AGENTS.md). Override by
+// placing SYSTEM.md in the profiles directory.
+const systemContextPrompt = `# System Instructions
+CRITICAL: Do not claim completion unless the relevant work has actually been performed or verified.
+IMPORTANT: Be concise, practical, and action-oriented.
+IMPORTANT: Keep user-facing text focused on progress, decisions, results, and next actions.
+
+- Prefer direct answers and concrete next actions.
+- Avoid long hidden-style reasoning in user-facing text.
+- Do not narrate every internal consideration.
+- Summarize tool results only as much as needed to continue the task.
+- If something fails, explain the failure briefly and choose the next best action.
+- Avoid repeating the same status update unless new information was learned.
+`
+
 // resolveProfilesDir resolves the profiles directory to an absolute path.
 // $(pwd)/$(profiles) takes priority, ~/$(profiles) is fallback.
 func resolveProfilesDir(profiles string) string {
@@ -175,17 +192,20 @@ func resolveProfilesDir(profiles string) string {
 	return filepath.Join(os.TempDir(), profiles)
 }
 
-// resolveProfiles reads AGENTS.md and SOUL.md from the profiles directory.
-// Falls back to built-in defaults when the files are missing.
+// resolveProfiles reads SOUL.md, SYSTEM.md, and AGENTS.md from the profiles
+// directory. Falls back to built-in defaults when the files are missing.
 //
 // Resolution order (per file):
 //  1. $(pwd)/$(profiles)/FILE.md
 //  2. ~/$(profiles)/FILE.md
 //  3. built-in default
+//
+// The prompts are returned in injection order: SOUL → SYSTEM → AGENTS.
 func resolveProfiles(profiles string) []string {
 	return []string{
-		resolveProfileFile(profiles, "AGENTS.md", methodologyAndRulesPrompt),
 		resolveProfileFile(profiles, "SOUL.md", personaAndLimitsPrompt),
+		resolveProfileFile(profiles, "SYSTEM.md", systemContextPrompt),
+		resolveProfileFile(profiles, "AGENTS.md", methodologyAndRulesPrompt),
 	}
 }
 
@@ -194,10 +214,15 @@ func resolveProfileFile(profiles, filename, defaultText string) string {
 		return defaultText
 	}
 
-	// 1.  Project-level: $(pwd)/$(profiles)/FILE.md
+	// 1.  Project-level: $(pwd)/FILE.md, $(pwd)/$(profiles)/FILE.md
 	if cwd, err := os.Getwd(); err == nil {
-		p := filepath.Join(cwd, profiles, filename)
+		p := filepath.Join(cwd, filename)
 		if data, err := os.ReadFile(p); err == nil {
+			return strings.TrimSpace(string(data))
+		}
+
+		q := filepath.Join(cwd, profiles, filename)
+		if data, err := os.ReadFile(q); err == nil {
 			return strings.TrimSpace(string(data))
 		}
 	}
