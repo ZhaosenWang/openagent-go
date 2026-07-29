@@ -93,16 +93,11 @@ func (t *Grep) Execute(ctx context.Context, args json.RawMessage) (string, error
 		return "", fmt.Errorf("grep: invalid pattern: %w", err)
 	}
 
-	const (
-		maxMatches  = 200
-		maxFileSize = 1 * 1024 * 1024 // 1MB
-		maxFiles    = 2000
-	)
+	const maxFileSize = 1 * 1024 * 1024 // 1MB
 
 	var (
-		matches    []string
-		totalFiles int
-		truncated  bool
+		fileMatches []fileMatch
+		total       int
 	)
 
 	err = filepath.WalkDir(searchDir, func(path string, d os.DirEntry, walkErr error) error {
@@ -125,12 +120,6 @@ func (t *Grep) Execute(ctx context.Context, args json.RawMessage) (string, error
 			}
 		}
 
-		totalFiles++
-		if totalFiles > maxFiles {
-			truncated = true
-			return filepath.SkipAll
-		}
-
 		info, err := d.Info()
 		if err != nil || info.Size() > maxFileSize {
 			return nil
@@ -140,14 +129,13 @@ func (t *Grep) Execute(ctx context.Context, args json.RawMessage) (string, error
 
 		// grepFile handles open/close so the file is released immediately,
 		// not deferred until WalkDir returns.
-		found, err := t.grepFile(path, re, rel, maxMatches-len(matches))
+		found, err := t.grepFile(path, re)
 		if err != nil {
 			return nil
 		}
-		matches = append(matches, found...)
-		if len(matches) >= maxMatches {
-			truncated = true
-			return filepath.SkipAll
+		if len(found) > 0 {
+			fileMatches = append(fileMatches, fileMatch{file: rel, lines: found})
+			total += len(found)
 		}
 		return nil
 	})
@@ -155,25 +143,33 @@ func (t *Grep) Execute(ctx context.Context, args json.RawMessage) (string, error
 		return "", fmt.Errorf("grep: %w", err)
 	}
 
-	if len(matches) == 0 {
+	if total == 0 {
 		return "No matches found.", nil
 	}
 
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("%d matches:\n", len(matches)))
-	for _, m := range matches {
-		b.WriteString(m)
-		b.WriteString("\n")
-	}
-	if truncated {
-		b.WriteString("[results truncated]")
+	b.WriteString(fmt.Sprintf("%d matches:\n", total))
+	for _, fm := range fileMatches {
+		b.WriteString(fm.file + ":\n")
+		for _, ln := range fm.lines {
+			b.WriteString("  ")
+			b.WriteString(ln)
+			b.WriteString("\n")
+		}
 	}
 	return b.String(), nil
 }
 
-// grepFile scans one file for re and returns formatted matches.
-// The file is opened and closed within this call — no defer accumulation.
-func (t *Grep) grepFile(path string, re *regexp.Regexp, rel string, remaining int) ([]string, error) {
+// fileMatch holds the matches for a single file: the relative path and the
+// matching lines formatted as "lineNum: content".
+type fileMatch struct {
+	file  string
+	lines []string
+}
+
+// grepFile scans one file for re and returns matching lines formatted as
+// "lineNum: content". The file is opened and closed within this call.
+func (t *Grep) grepFile(path string, re *regexp.Regexp) ([]string, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -189,10 +185,7 @@ func (t *Grep) grepFile(path string, re *regexp.Regexp, rel string, remaining in
 		lineNum++
 		line := scanner.Text()
 		if re.MatchString(line) {
-			matches = append(matches, fmt.Sprintf("%s:%d: %s", rel, lineNum, line))
-			if len(matches) >= remaining {
-				break
-			}
+			matches = append(matches, fmt.Sprintf("%d: %s", lineNum, line))
 		}
 	}
 	return matches, nil

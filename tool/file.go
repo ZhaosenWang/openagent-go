@@ -61,13 +61,13 @@ func NewReadFile(workDir string) *ReadFile {
 func (t *ReadFile) Definition() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
 		Name:        "read",
-		Description: "Read a file from the given path.",
+		Description: "Read a file from the given path. Use line+limit to read a specific line range — combine with grep to locate a line number first, then read the surrounding context.",
 		Parameters: json.RawMessage(`{
 			"type": "object",
 			"properties": {
 				"path":  {"type": "string",  "description": "File path"},
-				"line":  {"type": "integer", "description": "Start line (1-based, default: 1)"},
-				"limit": {"type": "integer", "description": "Max lines to read (default: all remaining)"}
+				"line":  {"type": "integer", "description": "Start line (1-based, default: 1). Use with limit to read a specific range."},
+				"limit": {"type": "integer", "description": "Max lines to read (default: all remaining). Use with line to read a window around a grep hit."}
 			},
 			"required": ["path"]
 		}`),
