@@ -124,6 +124,9 @@ func main() {
 	if cfg.Log.Level == "" {
 		cfg.Log.Level = "info"
 	}
+	if cfg.Profiles == "" {
+		cfg.Profiles = ".openagent/profile"
+	}
 
 	logCleanup, err := server.SetupLog(cfg.Log)
 	if err != nil {
