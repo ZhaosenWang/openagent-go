@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -742,7 +743,7 @@ func (s *AgentServer) replayHistory(ctx context.Context, sid openacp.SessionId, 
 			for _, tc := range msg.ToolCalls {
 				sender.SendToolCall(openacp.ToolCallUpdate{
 					ToolCallID: tc.ID,
-					Title:      tc.Function.Name,
+					Title:      toolTitle(tc.Function.Name, tc.Function.Arguments),
 					Kind:       "execute",
 					Status:     "pending",
 					RawInput:   json.RawMessage(tc.Function.Arguments),
@@ -1781,7 +1782,7 @@ func (a *acpApprover) Approve(ctx context.Context, call openagent.ToolCall, def 
 		SessionID: a.sessionID,
 		ToolCall: openacp.ToolCallUpdate{
 			ToolCallID: call.ID,
-			Title:      def.Name,
+			Title:      toolTitle(def.Name, call.Function.Arguments),
 			Kind:       "execute",
 			Status:     "pending",
 			RawInput:   json.RawMessage(call.Function.Arguments),
@@ -1840,32 +1841,88 @@ func firstLine(s string, maxLen int) string {
 // Extracts the most informative field from the tool arguments JSON.
 func toolTitle(name string, args string) string {
 	var params struct {
-		Path    string `json:"path"`
-		Command string `json:"command"`
-		Query   string `json:"query"`
+		Path        string `json:"path"`
+		Line        int    `json:"line"`
+		Limit       int    `json:"limit"`
+		Command     string `json:"command"`
+		Description string `json:"description"`
+		Pattern     string `json:"pattern"`
+		Glob        string `json:"glob"`
+		Query       string `json:"query"`
+		Goal        string `json:"goal"`
+		URL         string `json:"url"`
 	}
 	if err := json.Unmarshal([]byte(args), &params); err != nil {
 		return name
 	}
 	switch name {
-	case "read", "write", "ls":
+	case "read":
+		if params.Path != "" {
+			base := filepath.Base(params.Path)
+			if params.Limit > 0 {
+				start := params.Line
+				if start == 0 {
+					start = 1
+				}
+				return fmt.Sprintf("%s %s (lines %d-%d)", name, base, start, start+params.Limit-1)
+			}
+			return name + " " + base
+		}
+	case "edit", "write", "ls":
 		if params.Path != "" {
 			return name + " " + params.Path
 		}
 	case "shell":
+		// Prefer the LLM-provided description (intent); fall back to the
+		// raw command (truncated) so the title is always actionable.
+		if params.Description != "" {
+			return name + " " + truncateToolArg(params.Description, 60)
+		}
 		if params.Command != "" {
-			return name + ": " + truncateToolArg(params.Command, 60)
+			return name + " " + truncateToolArg(params.Command, 60)
 		}
 	case "grep":
-		if params.Query != "" {
-			return name + " " + params.Query
+		if params.Pattern != "" {
+			title := fmt.Sprintf("%s '%s'", name, params.Pattern)
+			if params.Path != "" {
+				title += " " + filepath.Base(params.Path)
+			}
+			if params.Glob != "" {
+				title += fmt.Sprintf(" '%s'", params.Glob)
+			}
+			return title
 		}
 	case "recall":
 		if params.Query != "" {
 			return name + " " + params.Query
 		}
+	case "plan_create":
+		if params.Goal != "" {
+			return name + " " + truncateToolArg(params.Goal, 60)
+		}
+	case "websearch":
+		if params.Query != "" {
+			return name + " " + truncateToolArg(params.Query, 60)
+		}
+	case "webfetch":
+		if params.URL != "" {
+			return name + " " + stripURLQuery(params.URL)
+		}
 	}
 	return name
+}
+
+// stripURLQuery removes the query string (and fragment) from rawURL so the
+// title shows only scheme://host/path. Falls back to the raw value on parse
+// error.
+func stripURLQuery(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String()
 }
 
 // truncateToolArg truncates s to n characters, adding "..." at the end.
