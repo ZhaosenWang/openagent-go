@@ -917,14 +917,14 @@ func (s *AgentServer) buildConfigOptions(sid openacp.SessionId) []openacp.Sessio
 		{
 			ID:           "mode",
 			Name:         "Session Mode",
-			Description:  "Auto: full access with LLM-judged approval. Manual: full access with per-tool user approval. Plan: read-only planning.",
+			Description:  "Controls the autonomy and safety boundaries of AI",
 			Category:     "mode",
 			Type:         "select",
 			CurrentValue: mode,
 			Options: []openacp.SessionConfigOptValue{
-				{Value: "auto", Name: "Auto", Description: "Full tool access with LLM-judged approval for writes"},
-				{Value: "manual", Name: "Manual", Description: "Full tool access with per-tool user approval"},
-				{Value: "plan", Name: "Plan", Description: "Read-only analysis and planning — no execution tools"},
+				{Value: "auto", Name: "Auto", Description: "Fully automated processing (HIGH RISK), AI will NOT seek your approval"},
+				{Value: "manual", Name: "Manual", Description: "Your approval is required for AI to perform NONE-READ-ONLY operations"},
+				{Value: "plan", Name: "Plan", Description: "Present the plan first, AI will execute it according to the plan"},
 			},
 		},
 		{
@@ -971,9 +971,9 @@ func (s *AgentServer) buildModeState(sid openacp.SessionId) *openacp.SessionMode
 	return &openacp.SessionModeState{
 		CurrentModeID: openacp.SessionModeId(current),
 		AvailableModes: []openacp.SessionMode{
-			{ID: "auto", Name: "Auto", Description: "Full tool access with LLM-judged approval for writes"},
-			{ID: "manual", Name: "Manual", Description: "Full tool access with per-tool user approval"},
-			{ID: "plan", Name: "Plan", Description: "Read-only analysis and planning — no execution tools"},
+			{ID: "auto", Name: "Auto", Description: "Fully automated processing (HIGH RISK), AI will NOT seek your approval"},
+			{ID: "manual", Name: "Manual", Description: "Your approval is required for AI to perform NONE-READ-ONLY operations"},
+			{ID: "plan", Name: "Plan", Description: "Present the plan first, AI will execute it according to the plan"},
 		},
 	}
 }
@@ -1666,7 +1666,7 @@ func (s *AgentServer) buildDynamicContext(ss *agentSession) string {
 
 	// ── Mode instruction ──
 	if mode == "plan" {
-		b.WriteString("## Session Mode\n")
+		b.WriteString("## Plan Mode\n")
 		b.WriteString("You are in **plan mode**. You have NO execution tools — you cannot modify files, run shell commands, or create terminals. ")
 		if s.clientCanReadFile() {
 			b.WriteString("Your only tools are read-only inspection (read_client_file) and planning (plan_create, plan_update, exit_plan_mode).\n\n")

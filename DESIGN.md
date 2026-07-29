@@ -369,7 +369,7 @@ Server-side slash commands intercepted before they reach the agent:
 
 ```
 /help      — list available commands
-/mode      — switch session mode (chat/plan)
+/mode      — switch session mode (auto/manual/plan)
 /model     — list or switch models
 /context   — show token usage
 /cwd       — show working directory
