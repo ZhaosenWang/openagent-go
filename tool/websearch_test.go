@@ -39,7 +39,7 @@ func TestWebSearchBasic(t *testing.T) {
 	// Swap the endpoint to the test server by stubbing tavilyURL via a
 	// package-level override. Since tavilyURL is a const, we instead verify
 	// through a helper that takes the URL — see webSearchAt below.
-	out, err := webSearchAt(context.Background(), srv.URL, newTestClient(), json.RawMessage(`{"query":"golang context","max_results":5}`))
+	out, err := webSearchAt(context.Background(), srv.URL, newTestClient(), json.RawMessage(`{"query":"golang context","max_results":5}`), engineTavily)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +62,7 @@ func TestWebSearchNoResults(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	out, err := webSearchAt(context.Background(), srv.URL, newTestClient(), json.RawMessage(`{"query":"zzz nonexistent"}`))
+	out, err := webSearchAt(context.Background(), srv.URL, newTestClient(), json.RawMessage(`{"query":"zzz nonexistent"}`), engineTavily)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,7 +76,7 @@ func TestWebSearchRequiresQuery(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(tavilyHandler))
 	defer srv.Close()
 
-	_, err := webSearchAt(context.Background(), srv.URL, newTestClient(), json.RawMessage(`{"query":""}`))
+	_, err := webSearchAt(context.Background(), srv.URL, newTestClient(), json.RawMessage(`{"query":""}`), engineTavily)
 	if err == nil {
 		t.Fatal("expected error for empty query")
 	}
@@ -92,7 +92,7 @@ func TestWebSearchNon2xx(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := webSearchAt(context.Background(), srv.URL, newTestClient(), json.RawMessage(`{"query":"golang"}`))
+	_, err := webSearchAt(context.Background(), srv.URL, newTestClient(), json.RawMessage(`{"query":"golang"}`), engineTavily)
 	if err == nil {
 		t.Fatal("expected error for 429")
 	}
@@ -125,7 +125,7 @@ func TestWebSearchMaxResultsClamp(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	out, err := webSearchAt(context.Background(), srv.URL, newTestClient(), json.RawMessage(`{"query":"x","max_results":99}`))
+	out, err := webSearchAt(context.Background(), srv.URL, newTestClient(), json.RawMessage(`{"query":"x","max_results":99}`), engineTavily)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +141,7 @@ func TestWebSearchMalformedArgs(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(tavilyHandler))
 	defer srv.Close()
 
-	_, err := webSearchAt(context.Background(), srv.URL, newTestClient(), json.RawMessage(`{not json`))
+	_, err := webSearchAt(context.Background(), srv.URL, newTestClient(), json.RawMessage(`{not json`), engineTavily)
 	if err == nil || !strings.HasPrefix(err.Error(), "websearch:") {
 		t.Errorf("expected websearch: error prefix, got: %v", err)
 	}
@@ -154,7 +154,7 @@ func TestWebSearchMalformedJSONResponse(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := webSearchAt(context.Background(), srv.URL, newTestClient(), json.RawMessage(`{"query":"x"}`))
+	_, err := webSearchAt(context.Background(), srv.URL, newTestClient(), json.RawMessage(`{"query":"x"}`), engineTavily)
 	if err == nil || !strings.HasPrefix(err.Error(), "websearch:") {
 		t.Errorf("expected websearch: error on malformed response, got: %v", err)
 	}
@@ -168,7 +168,7 @@ func TestWebSearchNoAnswerField(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	out, err := webSearchAt(context.Background(), srv.URL, newTestClient(), json.RawMessage(`{"query":"x"}`))
+	out, err := webSearchAt(context.Background(), srv.URL, newTestClient(), json.RawMessage(`{"query":"x"}`), engineTavily)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +185,7 @@ func TestWebSearchEmptyContentResult(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	out, err := webSearchAt(context.Background(), srv.URL, newTestClient(), json.RawMessage(`{"query":"x"}`))
+	out, err := webSearchAt(context.Background(), srv.URL, newTestClient(), json.RawMessage(`{"query":"x"}`), engineTavily)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,7 +203,7 @@ func TestWebSearchContextCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	_, err := webSearchAt(ctx, srv.URL, newTestClient(), json.RawMessage(`{"query":"x"}`))
+	_, err := webSearchAt(ctx, srv.URL, newTestClient(), json.RawMessage(`{"query":"x"}`), engineTavily)
 	if err == nil {
 		t.Error("expected error on cancelled context")
 	}
@@ -224,7 +224,7 @@ func TestWebSearchMaxResultsDefault(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	out, err := webSearchAt(context.Background(), srv.URL, newTestClient(), json.RawMessage(`{"query":"x"}`))
+	out, err := webSearchAt(context.Background(), srv.URL, newTestClient(), json.RawMessage(`{"query":"x"}`), engineTavily)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -290,7 +290,7 @@ func TestWebSearchTimeoutParamHonored(t *testing.T) {
 	defer srv.Close()
 
 	start := time.Now()
-	_, err := webSearchAt(context.Background(), srv.URL, newTestClient(), json.RawMessage(`{"query":"x","timeout":1}`))
+	_, err := webSearchAt(context.Background(), srv.URL, newTestClient(), json.RawMessage(`{"query":"x","timeout":1}`), engineTavily)
 	elapsed := time.Since(start)
 	if err == nil {
 		t.Fatal("expected timeout error, got success")
@@ -309,7 +309,7 @@ func TestWebSearchUntrustedWrapping(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	out, err := webSearchAt(context.Background(), srv.URL, newTestClient(), json.RawMessage(`{"query":"x"}`))
+	out, err := webSearchAt(context.Background(), srv.URL, newTestClient(), json.RawMessage(`{"query":"x"}`), engineTavily)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -318,5 +318,249 @@ func TestWebSearchUntrustedWrapping(t *testing.T) {
 	}
 	if !strings.HasSuffix(out, "[/Untrusted web content]") {
 		t.Errorf("output must end with untrusted close tag: %q", out[len(out)-min(30, len(out)):])
+	}
+}
+
+// ── Bocha engine ──
+
+// bochaHandler returns a canned Bocha JSON response for testing.
+func bochaHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	resp := map[string]any{
+		"code": 200,
+		"msg":  nil,
+		"data": map[string]any{
+			"webPages": map[string]any{
+				"value": []map[string]any{
+					{"name": "Go Documentation", "url": "https://go.dev/doc/", "snippet": "Official Go docs.", "siteName": "go.dev"},
+					{"name": "context package", "url": "https://pkg.go.dev/context", "snippet": "Defines Context type.", "siteName": "pkg.go.dev"},
+				},
+			},
+		},
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+func TestWebSearchBochaResponseParse(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(bochaHandler))
+	defer srv.Close()
+
+	out, err := webSearchAt(context.Background(), srv.URL, newTestClient(), json.RawMessage(`{"query":"golang context","max_results":5}`), engineBocha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "Go Documentation") || !strings.Contains(out, "https://go.dev/doc/") {
+		t.Errorf("missing bocha result 0: %s", out)
+	}
+	if !strings.Contains(out, "context package") || !strings.Contains(out, "https://pkg.go.dev/context") {
+		t.Errorf("missing bocha result 1: %s", out)
+	}
+	// Bocha has no top-level "answer"; results should still be formatted.
+	if !strings.Contains(out, "1. Go Documentation") {
+		t.Errorf("missing numbered formatting: %s", out)
+	}
+	// Must be wrapped as untrusted, same as Tavily.
+	if !strings.HasPrefix(out, "[Untrusted web content]\n") {
+		t.Errorf("bocha output must be untrusted-wrapped: %q", out[:min(40, len(out))])
+	}
+	t.Logf("✅ bocha parse:\n%s", out)
+}
+
+func TestWebSearchBochaNoResults(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"code":200,"msg":null,"data":{"webPages":{"value":[]}}}`))
+	}))
+	defer srv.Close()
+
+	out, err := webSearchAt(context.Background(), srv.URL, newTestClient(), json.RawMessage(`{"query":"zzz"}`), engineBocha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "No results found." {
+		t.Errorf("expected 'No results found.', got: %s", out)
+	}
+}
+
+func TestWebSearchBochaEmptySnippet(t *testing.T) {
+	// A bocha result with empty snippet should print name+url without a snippet line.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"code":200,"msg":null,"data":{"webPages":{"value":[{"name":"T","url":"https://x","snippet":"","siteName":"s"}]}}}`))
+	}))
+	defer srv.Close()
+
+	out, err := webSearchAt(context.Background(), srv.URL, newTestClient(), json.RawMessage(`{"query":"x"}`), engineBocha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "1. T") || !strings.Contains(out, "https://x") {
+		t.Errorf("missing name/url: %s", out)
+	}
+}
+
+func TestWebSearchBochaAuth(t *testing.T) {
+	// With BOCHA_API_KEY set, the request carries Authorization: Bearer.
+	t.Setenv(bochaKeyEnv, "bocha-test-key")
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer bocha-test-key" {
+			t.Errorf("want Bearer bocha-test-key, got %q", got)
+		}
+		bochaHandler(w, r)
+	}))
+	defer srv.Close()
+
+	_, err := webSearchAt(context.Background(), srv.URL, newTestClient(), json.RawMessage(`{"query":"x"}`), engineBocha)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWebSearchBochaAuthNoKey(t *testing.T) {
+	// Without BOCHA_API_KEY, no Authorization header is sent (the server's 401
+	// is the authoritative signal, not a client-side guess).
+	t.Setenv(bochaKeyEnv, "")
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if auth := r.Header.Get("Authorization"); auth != "" {
+			t.Errorf("no key: Authorization should be unset, got %q", auth)
+		}
+		bochaHandler(w, r) // still return results so the call succeeds
+	}))
+	defer srv.Close()
+
+	_, err := webSearchAt(context.Background(), srv.URL, newTestClient(), json.RawMessage(`{"query":"x"}`), engineBocha)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWebSearchBochaHTTPError(t *testing.T) {
+	// Bocha reports auth/quota failures as non-2xx HTTP (e.g. 401 for a bad
+	// key, 403 for no quota), not as HTTP 200 with an app-layer code. The
+	// resp.StatusCode guard in webSearchAt surfaces the status + body snippet
+	// before parseBochaResponse runs, so a misconfigured key is reported as an
+	// HTTP error, not silently as "No results found."
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"message":"Invalid API KEY","code":"401","log_id":"abc"}`))
+	}))
+	defer srv.Close()
+
+	_, err := webSearchAt(context.Background(), srv.URL, newTestClient(), json.RawMessage(`{"query":"x"}`), engineBocha)
+	if err == nil {
+		t.Fatal("expected HTTP 401 error")
+	}
+	if !strings.Contains(err.Error(), "401") || !strings.Contains(err.Error(), "Invalid API KEY") {
+		t.Errorf("error should surface 401 + body: %v", err)
+	}
+	if strings.Contains(err.Error(), "No results found") {
+		t.Errorf("must not swallow auth error as no-results: %v", err)
+	}
+}
+
+// ── engine selection ──
+
+func TestResolveSearchEngineDefault(t *testing.T) {
+	t.Setenv(searchEngineEnv, "")
+	if got := resolveSearchEngine(); got != engineTavily {
+		t.Errorf("unset → want tavily, got %q", got)
+	}
+}
+
+func TestResolveSearchEngineBocha(t *testing.T) {
+	t.Setenv(searchEngineEnv, "bocha")
+	if got := resolveSearchEngine(); got != engineBocha {
+		t.Errorf("bocha → want bocha, got %q", got)
+	}
+}
+
+func TestResolveSearchEngineCaseInsensitive(t *testing.T) {
+	t.Setenv(searchEngineEnv, "BOCHA")
+	if got := resolveSearchEngine(); got != engineBocha {
+		t.Errorf("BOCHA → want bocha (case-insensitive), got %q", got)
+	}
+}
+
+func TestResolveSearchEngineUnknown(t *testing.T) {
+	// An unknown value is returned as-is; Execute rejects it with a clear error.
+	t.Setenv(searchEngineEnv, "baidu")
+	s := &WebSearch{engine: resolveSearchEngine(), client: newTestClient()}
+	_, err := s.Execute(context.Background(), json.RawMessage(`{"query":"x"}`))
+	if err == nil {
+		t.Fatal("expected error for unknown engine")
+	}
+	if !strings.Contains(err.Error(), "unknown engine") || !strings.Contains(err.Error(), "baidu") {
+		t.Errorf("error should name the unknown engine: %v", err)
+	}
+}
+
+// ── endpoint guard ──
+
+func TestWebSearchEndpointGuardRejectsWrongHost(t *testing.T) {
+	// A bocha endpoint pointed at the tavily host is rejected: the engine and
+	// endpoint must agree. (Protects against a misconfiguration where the
+	// engine is bocha but the URL was left at tavily.)
+	_, err := webSearchAt(context.Background(), tavilyURL, newTestClient(), json.RawMessage(`{"query":"x"}`), engineBocha)
+	if err == nil || !strings.Contains(err.Error(), "not allowed") {
+		t.Errorf("bocha engine against tavily host should be rejected, got %v", err)
+	}
+	// And vice versa.
+	_, err = webSearchAt(context.Background(), bochaURL, newTestClient(), json.RawMessage(`{"query":"x"}`), engineTavily)
+	if err == nil || !strings.Contains(err.Error(), "not allowed") {
+		t.Errorf("tavily engine against bocha host should be rejected, got %v", err)
+	}
+}
+
+// ── Tavily network-error hint ──
+
+func TestWebSearchTavilyNetworkErrorHint(t *testing.T) {
+	// Use a loopback port with no listener: host is allowed (loopback), but
+	// the dial fails — exercising the client.Do network-error path where the
+	// hint is appended. (A non-allowed host would be rejected by the endpoint
+	// guard before dialing, which is a different error.)
+	_, err := webSearchAt(context.Background(), "http://127.0.0.1:1/search", newTestClient(), json.RawMessage(`{"query":"x","timeout":1}`), engineTavily)
+	if err == nil {
+		t.Fatal("expected network error")
+	}
+	if !strings.Contains(err.Error(), "Hint:") {
+		t.Errorf("tavily network error should carry bocha hint: %v", err)
+	}
+	if !strings.Contains(err.Error(), "OPENAGENT_WEB_SEARCH_ENGINE=bocha") {
+		t.Errorf("hint should name the env var: %v", err)
+	}
+}
+
+func TestWebSearchBochaNetworkErrorNoHint(t *testing.T) {
+	// The bocha hint is tavily-only; a bocha network error must NOT carry it
+	// (no third engine to suggest).
+	_, err := webSearchAt(context.Background(), "http://127.0.0.1:1/search", newTestClient(), json.RawMessage(`{"query":"x","timeout":1}`), engineBocha)
+	if err == nil {
+		t.Fatal("expected network error")
+	}
+	if strings.Contains(err.Error(), "Hint:") {
+		t.Errorf("bocha network error should NOT carry tavily hint: %v", err)
+	}
+}
+
+func TestWebSearchTavilyHTTPErrorNoHint(t *testing.T) {
+	// An HTTP-layer error (4xx) is NOT a reachability problem — the hint
+	// must not appear (switching engines won't fix a 401/429).
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	_, err := webSearchAt(context.Background(), srv.URL, newTestClient(), json.RawMessage(`{"query":"x"}`), engineTavily)
+	if err == nil {
+		t.Fatal("expected 429 error")
+	}
+	if strings.Contains(err.Error(), "Hint:") {
+		t.Errorf("HTTP 429 should NOT carry bocha hint: %v", err)
 	}
 }

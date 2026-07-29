@@ -58,6 +58,22 @@ go build -o openagent-cli ./cmd/cli/
 
 连接 ACP 客户端（VSCode/Zed 插件）。
 
+#### Web 搜索后端
+
+`websearch` 工具支持两个后端，通过 `OPENAGENT_WEB_SEARCH_ENGINE` 选择：
+
+| 引擎 | 默认 | 国内可达 | API key | 环境变量 |
+|------|------|---------|---------|---------|
+| `tavily` | 是 | 有时（AWS us-east） | 可选（keyless 可用） | `TAVILY_API_KEY`（提高速率限额） |
+| `bocha` | 否 | 是 | 必需 | `BOCHA_API_KEY` |
+
+默认 `tavily`（keyless，无需账号）。如果 Tavily 在你的网络下不可达，错误信息会附带切换提示。使用博查（推荐国内用户）：
+
+```bash
+export OPENAGENT_WEB_SEARCH_ENGINE=bocha
+export BOCHA_API_KEY=<你的-key>   # 在 https://open.bochaai.com 获取
+```
+
 ### 飞书集成
 
 将 agent 接入飞书（Lark），支持群聊、私聊、Markdown 卡片渲染、流式输出。

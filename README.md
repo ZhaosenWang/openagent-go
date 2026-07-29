@@ -58,6 +58,22 @@ Put `AGENTS.md` and `SOUL.md` in `~/.openagent/profile/` or `$(pwd)/.openagent/p
 
 Connect an ACP client (VSCode/Zed plugin).
 
+#### Web Search backend
+
+The `websearch` tool supports two backends, selected by `OPENAGENT_WEB_SEARCH_ENGINE`:
+
+| Engine | Default | Reachable in mainland China | API key | Env vars |
+|--------|---------|----------------------------|---------|----------|
+| `tavily` | yes | sometimes (AWS us-east) | optional (keyless works) | `TAVILY_API_KEY` (for higher rate limits) |
+| `bocha` | no | yes | required | `BOCHA_API_KEY` |
+
+Default is `tavily` (keyless, no account needed). If Tavily is unreachable from your network, the error message includes a hint to switch. To use Bocha (recommended for mainland-China users):
+
+```bash
+export OPENAGENT_WEB_SEARCH_ENGINE=bocha
+export BOCHA_API_KEY=<your-key>   # get one at https://open.bochaai.com
+```
+
 ### Feishu / Lark Integration
 
 Connect your agent to Feishu (Lark) so users can chat with it in IM — group chats, private chats, cards with markdown rendering, and real-time streaming output.
