@@ -28,6 +28,9 @@ A fully pluggable, multi-agent AI agent framework in Go.
 # Build CLI
 go build -o openagent-cli ./cmd/cli/
 
+# Show version
+./openagent-cli -v
+
 # ACP mode (stdio — for VSCode/Zed ACP plugins)
 ./openagent-cli serve --acp
 
