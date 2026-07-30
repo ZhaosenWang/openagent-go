@@ -198,7 +198,7 @@ func (t *WebSearch) Definition() openagent.FunctionDefinition {
 	}
 }
 
-func (t *WebSearch) CanSelfApprove(_ json.RawMessage) bool { return true }
+func (t *WebSearch) CanSelfApprove(_ json.RawMessage) bool { return false }
 
 func (t *WebSearch) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	switch t.engine {
