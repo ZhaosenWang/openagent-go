@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	openagent "github.com/yusheng-g/openagent-go"
+
+	"github.com/yusheng-g/openagent-go/cmd/cli/config"
 )
 
 // mockModel is a no-op Model used only to satisfy buildGuard's non-nil
@@ -58,7 +60,7 @@ func chdirWithSkills(t *testing.T) func() {
 // applyOpts runs buildOpts over a base option slice and constructs a real
 // Agent, so we can inspect the resulting exported fields.
 func applyOpts(caps Capabilities, model openagent.Model) *openagent.Agent {
-	opts := buildOpts(nil, caps, model)
+	opts := buildOpts(nil, caps, model, config.SensitiveConfig{})
 	return openagent.NewAgent("test", opts...)
 }
 
@@ -181,7 +183,7 @@ func TestBuildOpts_PreservesBaseOpts(t *testing.T) {
 		openagent.WithMaxTurns(42),
 		openagent.WithSystemPrompts("hello"),
 	}
-	opts := buildOpts(base, Capabilities{Hooks: &on}, mockModel{})
+	opts := buildOpts(base, Capabilities{Hooks: &on}, mockModel{}, config.SensitiveConfig{})
 	agent := openagent.NewAgent("t", opts...)
 	if agent.MaxTurns != 42 {
 		t.Errorf("MaxTurns = %d, want 42 (base option must survive)", agent.MaxTurns)

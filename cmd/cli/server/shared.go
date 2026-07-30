@@ -11,6 +11,7 @@ import (
 	openagent "github.com/yusheng-g/openagent-go"
 	"github.com/yusheng-g/openagent-go/guard/llm"
 	artifacthook "github.com/yusheng-g/openagent-go/hooks/artifact"
+	redacthook "github.com/yusheng-g/openagent-go/hooks/redact"
 	sloghooks "github.com/yusheng-g/openagent-go/hooks/slog"
 	"github.com/yusheng-g/openagent-go/memory/sqlite"
 	"github.com/yusheng-g/openagent-go/model/openai"
@@ -306,7 +307,12 @@ func buildSlogObserver() openagent.RunObserver {
 // buildOpts appends capability-gated agent options (skills, guard, hooks,
 // observer) to opts. model is used by the guard; it may be nil if no models
 // are configured, in which case the guard is skipped regardless of caps.
-func buildOpts(opts []openagent.AgentOption, caps Capabilities, model openagent.Model) []openagent.AgentOption {
+//
+// sensitive carries the user-configured sensitive env-var names; it is
+// honored only when caps.OnHooks() is true (redact rides the hooks pipeline).
+// Hook order is redact → slog → artifact: redact must run first so logs and
+// artifact files never see raw secrets.
+func buildOpts(opts []openagent.AgentOption, caps Capabilities, model openagent.Model, sensitive config.SensitiveConfig) []openagent.AgentOption {
 	if caps.OnSkills() {
 		if sl := openSkillLoader(); sl != nil {
 			opts = append(opts, openagent.WithSkillLoader(sl))
@@ -318,7 +324,12 @@ func buildOpts(opts []openagent.AgentOption, caps Capabilities, model openagent.
 		opts = append(opts, openagent.WithOutputGuard(g.Output()))
 	}
 	if caps.OnHooks() {
+		// Order: redact → slog → artifact. redact must run FIRST so every
+		// downstream observer (slog error logging, artifact disk save)
+		// sees already-redacted data. Putting slog before redact would
+		// write the raw secret into the log on tool errors.
 		opts = append(opts, openagent.WithRunHooks(
+			redacthook.NewHook(sensitive.Env),
 			buildSlogHooks(),
 			artifacthook.NewHook(),
 		))

@@ -19,6 +19,25 @@ type Config struct {
 	Plugins    []string                   `json:"plugins,omitempty"`
 	Profiles   string                     `json:"profiles,omitempty"`
 	Env        map[string]string          `json:"env,omitempty"`
+	Sensitive  SensitiveConfig            `json:"sensitive,omitempty"`
+}
+
+// SensitiveConfig controls redaction of sensitive values in tool results.
+//
+// Env is a list of environment-variable *names* (not values) whose values,
+// when present in a tool *result* (output) or error, are replaced with
+// "[REDACTED]" and flagged with a hint telling the model not to reconstruct
+// them. Values are resolved lazily via os.Getenv at redaction time, so
+// secrets never live in this struct and envvars set after agent construction
+// are still honored.
+//
+// Scope limits: this redacts ONLY tool results/errors, NOT tool call
+// arguments (args). Only the exact value of a named env var is matched —
+// no regex, so unregistered secrets, PII, keys, etc. are not detected.
+// See the hooks/redact package doc for the full coverage scope and known
+// limitations (e.g. JSON-escaped secret values are not matched).
+type SensitiveConfig struct {
+	Env []string `json:"env,omitempty"`
 }
 
 type ProviderConfig struct {
