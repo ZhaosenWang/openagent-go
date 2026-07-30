@@ -66,7 +66,7 @@ func RunACP(ctx context.Context, cfg *config.Config, caps Capabilities) error {
 	if caps.OnMemory() {
 		opts = append(opts, openagent.WithMemory(mem))
 	}
-	opts = buildOpts(opts, caps, firstM)
+	opts = buildOpts(opts, caps, firstM, cfg.Sensitive)
 	agent := openagent.NewAgent("openagent", opts...)
 
 	if caps.OnMemory() && caps.OnSummarizer() && firstM != nil {

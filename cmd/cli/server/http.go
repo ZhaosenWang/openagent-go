@@ -63,7 +63,7 @@ func RunREST(ctx context.Context, cfg *config.Config, caps Capabilities) error {
 	if caps.OnTools() {
 		opts = append(opts, openagent.WithTools(tools...))
 	}
-	opts = buildOpts(opts, caps, m)
+	opts = buildOpts(opts, caps, m, cfg.Sensitive)
 	agent := openagent.NewAgent("openagent", opts...)
 
 	if caps.OnSummarizer() && m != nil && caps.OnMemory() {

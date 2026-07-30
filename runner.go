@@ -923,22 +923,22 @@ func (r *runner) executeOneToolInternal(ctx context.Context, session Session, ca
 	case "load_skill":
 		toolStart := r.fireToolHooks(toolCtx, *def, args)
 		msg := r.executeLoadSkill(toolCtx, call)
-		r.fireToolHooksEnd(toolCtx, *def, args, msg.Content, toolStart, nil)
+		r.fireToolHooksEnd(toolCtx, *def, args, &msg.Content, toolStart, nil)
 		return msg
 	case "reload_skills":
 		toolStart := r.fireToolHooks(toolCtx, *def, args)
 		msg := r.executeReloadSkills(toolCtx, call)
-		r.fireToolHooksEnd(toolCtx, *def, args, msg.Content, toolStart, nil)
+		r.fireToolHooksEnd(toolCtx, *def, args, &msg.Content, toolStart, nil)
 		return msg
 	case "recall":
 		toolStart := r.fireToolHooks(toolCtx, *def, args)
 		msg := r.executeRecall(toolCtx, session, call)
-		r.fireToolHooksEnd(toolCtx, *def, args, msg.Content, toolStart, nil)
+		r.fireToolHooksEnd(toolCtx, *def, args, &msg.Content, toolStart, nil)
 		return msg
 	case "subagent":
 		toolStart := r.fireToolHooks(toolCtx, *def, args)
 		msg := r.executeSubAgent(toolCtx, session, call, ch)
-		r.fireToolHooksEnd(toolCtx, *def, args, msg.Content, toolStart, nil)
+		r.fireToolHooksEnd(toolCtx, *def, args, &msg.Content, toolStart, nil)
 		return msg
 	}
 
@@ -956,6 +956,13 @@ func (r *runner) executeOneToolInternal(ctx context.Context, session Session, ca
 
 	// ── Streaming path (optional interface) ──
 	if se, ok := tool.(StreamExecutor); ok {
+		// Streaming chunks are forwarded to the client as
+		// StreamToolProgress for live UX. They do NOT enter the model
+		// context — only the final, post-OnToolEnd result is appended to
+		// the working message history (see the append below). A redaction
+		// hook therefore never needs to buffer: the model sees only the
+		// redacted final result, while the user sees live (possibly
+		// raw) progress, which is the point of streaming.
 		toolCh := se.ExecuteStream(toolCtx, args)
 		var buf strings.Builder
 		// Rate-limit: some tools (shell) produce hundreds of chunks/sec.
@@ -1040,10 +1047,23 @@ func (r *runner) fireToolHooks(ctx context.Context, def FunctionDefinition, args
 }
 
 // fireToolHooksEnd emits observer leave + OnToolEnd for built-in tools.
-func (r *runner) fireToolHooksEnd(ctx context.Context, def FunctionDefinition, args json.RawMessage, output string, tc toolHookCtx, err error) {
-	r.observe(ctx, StageToolExecute, "leave", map[string]any{"tool": def.Name}, tc.start, err)
+// It mutates *output and *err in place: OnToolEnd receives them as pointers
+// and may redact or truncate them, so we pass the caller's pointers straight
+// through rather than copying by value.
+//
+// The observer "leave" event is emitted BEFORE OnToolEnd with the pre-hook
+// err. This means an observer that records err.Error() would see the raw
+// (unredacted) error. Redact does not protect the observer channel; observer
+// implementations must avoid logging err/result content. See hooks/redact
+// package doc.
+func (r *runner) fireToolHooksEnd(ctx context.Context, def FunctionDefinition, args json.RawMessage, output *string, tc toolHookCtx, err *error) {
+	var errVal error
+	if err != nil {
+		errVal = *err
+	}
+	r.observe(ctx, StageToolExecute, "leave", map[string]any{"tool": def.Name}, tc.start, errVal)
 	if r.agent.Hooks != nil {
-		r.agent.Hooks.OnToolEnd(ctx, def, args, &output, &err, tc.hookState)
+		r.agent.Hooks.OnToolEnd(ctx, def, args, output, err, tc.hookState)
 	}
 }
 
