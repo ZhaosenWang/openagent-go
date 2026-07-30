@@ -279,7 +279,7 @@ func (t *WebFetch) Definition() openagent.FunctionDefinition {
 	}
 }
 
-func (t *WebFetch) CanSelfApprove(_ json.RawMessage) bool { return true }
+func (t *WebFetch) CanSelfApprove(_ json.RawMessage) bool { return false }
 
 func (t *WebFetch) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var params struct {
