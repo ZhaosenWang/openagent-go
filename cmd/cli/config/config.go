@@ -34,6 +34,8 @@ type Config struct {
 // Scope limits: this redacts ONLY tool results/errors, NOT tool call
 // arguments (args). Only the exact value of a named env var is matched —
 // no regex, so unregistered secrets, PII, keys, etc. are not detected.
+// Values shorter than 8 characters are skipped (they are rarely real
+// secrets and would mis-mask normal output).
 // See the hooks/redact package doc for the full coverage scope and known
 // limitations (e.g. JSON-escaped secret values are not matched).
 type SensitiveConfig struct {

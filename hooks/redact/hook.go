@@ -20,6 +20,10 @@
 //     value of a named env var is matched (plain substring, no regex).
 //     PII, credit cards, AWS keys, private keys, JWTs, etc. are NOT
 //     detected unless their value happens to be an env var listed here.
+//   - env-var values shorter than 8 characters. Short values are skipped to
+//     avoid mis-masking normal output (e.g. "x", "true", "us-east"). A real
+//     secret shorter than 8 chars will silently pass through — do not rely
+//     on this hook for very short secrets.
 //   - secrets whose value contains JSON special characters (", \, control
 //     chars) when the result is JSON. The env-var holds the raw (unescaped)
 //     value, but inside a JSON string it is escaped (e.g. `"` → `\"`), so
@@ -57,6 +61,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 
 	openagent "github.com/yusheng-g/openagent-go"
@@ -66,10 +71,10 @@ import (
 const redacted = "[REDACTED]"
 
 // hint is appended once to the result when any redaction occurred.
-const hint = "\n\n[hint] 以上结果包含敏感信息，已脱敏。不要试图复原该值。"
+const hint = "\n\n[REDACTED] values were present in this result and have been masked. Do not attempt to reconstruct them."
 
 // Hook masks sensitive env-var values in tool results. Implements
-// openagent.RunHooks and ResultBufferingHook.
+// openagent.RunHooks.
 type Hook struct {
 	envNames []string
 }
@@ -93,12 +98,6 @@ func NewHook(envNames []string) *Hook {
 	}
 	return &Hook{envNames: clean}
 }
-
-// BufferToolResult reports true: this hook mutates tool results in OnToolEnd,
-// so the runner must buffer streaming output and only expose the final,
-// redacted result. Without buffering, raw secret-bearing chunks would reach
-// the client/LLM before OnToolEnd runs. Implements ResultBufferingHook.
-func (h *Hook) BufferToolResult() bool { return len(h.envNames) > 0 }
 
 // OnAgentStart is a no-op.
 func (h *Hook) OnAgentStart(ctx context.Context, req openagent.ChatCompletionRequest) (any, error) {
@@ -150,7 +149,7 @@ func (h *Hook) OnToolEnd(ctx context.Context, tool openagent.FunctionDefinition,
 // orig is the pre-redaction string, used only to avoid double-hinting when
 // the original already carried a hint from a prior redaction.
 func applyHint(s, orig string) string {
-	if strings.Contains(orig, "[hint]") {
+	if strings.Contains(orig, hint) {
 		// Already hinted in a prior pass — don't stack.
 		return s
 	}
@@ -161,15 +160,39 @@ func applyHint(s, orig string) string {
 	return s + hint
 }
 
+// minSecretLen is the minimum length a secret value must have to be
+// redacted. Shorter values are skipped: a 1–7 char env-var value (e.g. a
+// region code, a mode flag) is almost never a real secret, and redacting
+// it would mis-mask large swaths of normal output (every occurrence of "x",
+// "true", "us-east"…). Real secrets (API keys, tokens) are far longer.
+const minSecretLen = 8
+
 // redactString replaces every sensitive value in s with "[REDACTED]" and
 // reports whether any replacement occurred.
+//
+// Values are resolved lazily via os.Getenv. Empty values and values shorter
+// than minSecretLen are skipped. Surviving values are replaced longest-first
+// so a shorter secret that is a substring of a longer one cannot partially
+// consume it and block the longer match — e.g. with TOKEN_A="abcdef" and
+// TOKEN_B="abc", replacing "abc" first would turn "abcdef" into
+// "[REDACTED]def" and leak "def". Longest-first guarantees the longer
+// value matches cleanly before the shorter one gets a chance.
 func redactString(s string, envNames []string) (string, bool) {
-	changed := false
+	// Resolve and filter values up front.
+	values := make([]string, 0, len(envNames))
 	for _, name := range envNames {
 		v := os.Getenv(name)
-		if v == "" {
+		if len(v) < minSecretLen {
 			continue
 		}
+		values = append(values, v)
+	}
+	// Longest-first so substring secrets don't clobber longer matches.
+	sort.SliceStable(values, func(i, j int) bool {
+		return len(values[i]) > len(values[j])
+	})
+	changed := false
+	for _, v := range values {
 		if strings.Contains(s, v) {
 			s = strings.ReplaceAll(s, v, redacted)
 			changed = true

@@ -31,23 +31,6 @@ type RunHooks interface {
 	OnToolEnd(ctx context.Context, tool FunctionDefinition, args json.RawMessage, result *string, err *error, startState any)
 }
 
-// ResultBufferingHook is an optional capability a RunHooks may implement to
-// declare that it mutates tool results in OnToolEnd and therefore must see
-// the complete result before any of it is exposed downstream. When the
-// runner's active hook implements this interface, the streaming-tool path
-// suppresses real-time StreamToolProgress chunks and only emits the final
-// (post-hook) result — otherwise a hook that redacts secrets would run too
-// late: the raw chunks would already have reached the client/LLM.
-//
-// Hooks that only observe (slog, otel) and never mutate result/err should
-// NOT implement this interface, so streaming tools keep their live progress.
-type ResultBufferingHook interface {
-	// BufferToolResult reports whether OnToolEnd may mutate the result.
-	// Returning true makes the runner buffer streaming output until the
-	// tool finishes and OnToolEnd has run, then send one final event.
-	BufferToolResult() bool
-}
-
 // MultiHooks combines multiple RunHooks into one. Each hook is called in
 // order; one hook returning an error does not prevent subsequent hooks
 // from running. Nil hooks are skipped.
@@ -74,18 +57,6 @@ func MultiHooks(hooks ...RunHooks) RunHooks {
 
 type multiHooks struct {
 	list []RunHooks
-}
-
-// BufferToolResult reports whether any constituent hook buffers tool results.
-// If any child implements ResultBufferingHook and returns true, the combined
-// hook does too — one redacting hook is enough to require buffering.
-func (m *multiHooks) BufferToolResult() bool {
-	for _, h := range m.list {
-		if b, ok := h.(ResultBufferingHook); ok && b.BufferToolResult() {
-			return true
-		}
-	}
-	return false
 }
 
 func (m *multiHooks) OnAgentStart(ctx context.Context, req ChatCompletionRequest) (any, error) {

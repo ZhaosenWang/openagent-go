@@ -356,3 +356,83 @@ func TestStreamExecutorCancellation(t *testing.T) {
 		t.Error("should have received at least one progress event before cancel")
 	}
 }
+
+// minRedactHook is a minimal RunHooks that replaces a single secret value in
+// the tool result with "[REDACTED]". It lives in the root package test so we
+// can exercise the runner's streaming path + hook pipeline without importing
+// hooks/redact (which would create an import cycle: hooks/redact imports
+// openagent). This is a test double, not the real hook.
+type minRedactHook struct {
+	secret string
+}
+
+func (h *minRedactHook) OnAgentStart(ctx context.Context, req ChatCompletionRequest) (any, error) {
+	return nil, nil
+}
+func (h *minRedactHook) OnAgentEnd(ctx context.Context, req ChatCompletionRequest, resp *ChatCompletionResponse, runErr error, startState any) {
+}
+func (h *minRedactHook) OnToolStart(ctx context.Context, tool FunctionDefinition, args json.RawMessage) (any, error) {
+	return nil, nil
+}
+func (h *minRedactHook) OnToolEnd(ctx context.Context, tool FunctionDefinition, args json.RawMessage, result *string, err *error, startState any) {
+	if result != nil && *result != "" {
+		*result = strings.ReplaceAll(*result, h.secret, "[REDACTED]")
+	}
+}
+
+func TestStreamingWithRedactHook_FinalResultRedacted(t *testing.T) {
+	// A streaming tool emits chunks containing a secret. The user sees live
+	// StreamToolProgress (possibly raw — that's the point of streaming and
+	// the model never sees those), but the final StreamToolResult that
+	// enters the model's context must be redacted by OnToolEnd.
+	const secret = "supersecret-token-value"
+	streamTool := &streamingTestTool{
+		name: "stream_tool",
+		// Secret split across chunks to mimic realistic streaming.
+		chunks: []string{"prefix-", secret, "-suffix"},
+		delay:  0,
+	}
+	model := &fakeModelWithToolCall{
+		toolName: "stream_tool",
+		toolArgs: `{}`,
+		callID:   "call_redact",
+	}
+	agent := NewAgent("test",
+		WithModel(model),
+		WithTools(streamTool),
+		WithMaxTurns(1),
+		WithRunHooks(&minRedactHook{secret: secret}),
+	)
+
+	ch := agent.RunStream(context.Background(), Session{ID: "test"}, UserMessage("go"))
+
+	var toolResultEvent *StreamEvent
+	var gotDone bool
+	for evt := range ch {
+		switch evt.Type {
+		case StreamToolResult:
+			evtCopy := evt
+			toolResultEvent = &evtCopy
+		case StreamDone:
+			gotDone = true
+		case StreamError:
+			t.Fatalf("unexpected error: %v", evt.Error)
+		case StreamAborted:
+			t.Fatalf("unexpected abort: %v", evt.Error)
+		}
+	}
+
+	if !gotDone {
+		t.Fatal("missing StreamDone")
+	}
+	if toolResultEvent == nil {
+		t.Fatal("missing StreamToolResult")
+	}
+	content := toolResultEvent.Message.Content
+	if strings.Contains(content, secret) {
+		t.Fatalf("secret leaked into final tool result: %q", content)
+	}
+	if !strings.Contains(content, "[REDACTED]") {
+		t.Fatalf("final result not redacted: %q", content)
+	}
+}
