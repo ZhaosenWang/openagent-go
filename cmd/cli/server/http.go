@@ -1,9 +1,9 @@
 package server
 
 import (
-	"log/slog"
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -60,9 +60,7 @@ func RunREST(ctx context.Context, cfg *config.Config, caps Capabilities) error {
 	if caps.OnMemory() {
 		opts = append(opts, openagent.WithMemory(mem))
 	}
-	if caps.OnTools() {
-		opts = append(opts, openagent.WithTools(tools...))
-	}
+	opts = append(opts, openagent.WithTools(tools...))
 	opts = buildOpts(opts, caps, m, cfg.Sensitive)
 	agent := openagent.NewAgent("openagent", opts...)
 

@@ -64,10 +64,11 @@ func applyOpts(caps Capabilities, model openagent.Model) *openagent.Agent {
 	return openagent.NewAgent("test", opts...)
 }
 
-func TestBuildOpts_AllOff(t *testing.T) {
+func TestBuildOpts_Defaults(t *testing.T) {
 	restore := chdirEmpty(t)
 	defer restore()
-	// Capabilities zero value: skills/guard/hooks/observer all default OFF.
+	// Capabilities zero value: skills/guard default off.
+	// Hooks and observer are always on.
 	agent := applyOpts(Capabilities{}, mockModel{})
 	if agent.SkillLoader != nil {
 		t.Error("SkillLoader should be nil when OnSkills=false")
@@ -78,29 +79,11 @@ func TestBuildOpts_AllOff(t *testing.T) {
 	if agent.OutGuard != nil {
 		t.Error("OutGuard should be nil when OnGuard=false")
 	}
-	if agent.Hooks != nil {
-		t.Error("Hooks should be nil when OnHooks=false")
-	}
-	if agent.Observer != nil {
-		t.Error("Observer should be nil when OnObserver=false")
-	}
-}
-
-func TestBuildOpts_HooksAndObserver(t *testing.T) {
-	restore := chdirEmpty(t)
-	defer restore()
-	on := true
-	caps := Capabilities{Hooks: &on, Observer: &on}
-	agent := applyOpts(caps, mockModel{})
 	if agent.Hooks == nil {
-		t.Error("Hooks should be attached when OnHooks=true")
+		t.Error("Hooks should always be attached")
 	}
 	if agent.Observer == nil {
-		t.Error("Observer should be attached when OnObserver=true")
-	}
-	// Guard/skills still off.
-	if agent.InGuard != nil || agent.SkillLoader != nil {
-		t.Error("Guard/Skills should remain nil")
+		t.Error("Observer should always be attached")
 	}
 }
 
@@ -156,7 +139,7 @@ func TestBuildOpts_AllOn(t *testing.T) {
 	restore := chdirWithSkills(t)
 	defer restore()
 	on := true
-	caps := Capabilities{Skills: &on, Guard: &on, Hooks: &on, Observer: &on}
+	caps := Capabilities{Skills: &on, Guard: &on}
 	agent := applyOpts(caps, mockModel{})
 	if agent.SkillLoader == nil {
 		t.Error("SkillLoader should be attached")
@@ -165,10 +148,10 @@ func TestBuildOpts_AllOn(t *testing.T) {
 		t.Error("Guard should be attached")
 	}
 	if agent.Hooks == nil {
-		t.Error("Hooks should be attached")
+		t.Error("Hooks should always be attached")
 	}
 	if agent.Observer == nil {
-		t.Error("Observer should be attached")
+		t.Error("Observer should always be attached")
 	}
 }
 
@@ -178,12 +161,11 @@ func TestBuildOpts_AllOn(t *testing.T) {
 func TestBuildOpts_PreservesBaseOpts(t *testing.T) {
 	restore := chdirEmpty(t)
 	defer restore()
-	on := true
 	base := []openagent.AgentOption{
 		openagent.WithMaxTurns(42),
 		openagent.WithSystemPrompts("hello"),
 	}
-	opts := buildOpts(base, Capabilities{Hooks: &on}, mockModel{}, config.SensitiveConfig{})
+	opts := buildOpts(base, Capabilities{}, mockModel{}, config.SensitiveConfig{})
 	agent := openagent.NewAgent("t", opts...)
 	if agent.MaxTurns != 42 {
 		t.Errorf("MaxTurns = %d, want 42 (base option must survive)", agent.MaxTurns)

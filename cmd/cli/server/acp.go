@@ -113,15 +113,13 @@ func RunACP(ctx context.Context, cfg *config.Config, caps Capabilities) error {
 	}
 
 	policy := sandboxPolicy(cfg.Sandbox)
-	if caps.OnTools() {
-		srv.ToolFactory = func(cwd string) []openagent.Tool {
-			sb, err := native.NewWithPolicy(cwd, policy)
-			if err != nil {
-				slog.Warn("tool factory: sandbox creation failed; execution tools disabled", "cwd", cwd, "error", err)
-				return nil
-			}
-			return buildTools(sb, cwd, []string{"shell", "read", "write", "ls", "grep", "websearch", "webfetch"})
+	srv.ToolFactory = func(cwd string) []openagent.Tool {
+		sb, err := native.NewWithPolicy(cwd, policy)
+		if err != nil {
+			slog.Warn("tool factory: sandbox creation failed; execution tools disabled", "cwd", cwd, "error", err)
+			return nil
 		}
+		return buildTools(sb, cwd, []string{"shell", "read", "write", "ls", "grep", "websearch", "webfetch"})
 	}
 	server := openacpsdk.NewServer("openagent-acp", "1.0.0", srv)
 	server.SetLogger(slog.Default())
@@ -136,11 +134,9 @@ func RunACP(ctx context.Context, cfg *config.Config, caps Capabilities) error {
 			break
 		}
 	}
-	if caps.OnTools() {
-		cwd, _ := os.Getwd()
-		if sb, err := native.NewWithPolicy(cwd, policy); err == nil {
-			channelAgent.Tools = buildTools(sb, cwd, []string{"shell", "read", "write", "ls", "grep", "websearch", "webfetch"})
-		}
+	cwd, _ := os.Getwd()
+	if sb, err := native.NewWithPolicy(cwd, policy); err == nil {
+		channelAgent.Tools = buildTools(sb, cwd, []string{"shell", "read", "write", "ls", "grep", "websearch", "webfetch"})
 	}
 
 	if err := RunChannels(ctx, channelAgent, cfg.Channels); err != nil {

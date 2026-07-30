@@ -13,9 +13,6 @@ func TestCapabilitiesDefaults(t *testing.T) {
 	if !caps.OnSummarizer() {
 		t.Error("Summarizer should default on")
 	}
-	if !caps.OnTools() {
-		t.Error("Tools should default on")
-	}
 	if !caps.OnSkills() {
 		t.Error("Skills should default on")
 	}
@@ -29,12 +26,6 @@ func TestCapabilitiesDefaults(t *testing.T) {
 	if caps.OnApprover() {
 		t.Error("Approver should default off")
 	}
-	if caps.OnHooks() {
-		t.Error("Hooks should default off")
-	}
-	if caps.OnObserver() {
-		t.Error("Observer should default off")
-	}
 }
 
 func TestCapabilitiesExplicit(t *testing.T) {
@@ -43,22 +34,16 @@ func TestCapabilitiesExplicit(t *testing.T) {
 	caps := Capabilities{
 		Memory:     &off,
 		Summarizer: &off,
-		Tools:      &off,
 		Skills:     &off,
 		MCP:        &off,
 		Guard:      &on,
 		Approver:   &on,
-		Hooks:      &on,
-		Observer:   &on,
 	}
 	if caps.OnMemory() {
 		t.Error("Memory explicitly off")
 	}
 	if caps.OnSummarizer() {
 		t.Error("Summarizer explicitly off")
-	}
-	if caps.OnTools() {
-		t.Error("Tools explicitly off")
 	}
 	if caps.OnSkills() {
 		t.Error("Skills explicitly off")
@@ -72,19 +57,13 @@ func TestCapabilitiesExplicit(t *testing.T) {
 	if !caps.OnApprover() {
 		t.Error("Approver explicitly on")
 	}
-	if !caps.OnHooks() {
-		t.Error("Hooks explicitly on")
-	}
-	if !caps.OnObserver() {
-		t.Error("Observer explicitly on")
-	}
 }
 
 func TestCapabilitiesMixed(t *testing.T) {
 	off := false
 	caps := Capabilities{
 		Memory: &off,
-		// Guard, Skills, Hooks nil — use defaults
+		// Guard, Skills nil — use defaults
 	}
 	if caps.OnMemory() {
 		t.Error("Memory overridden to off")
@@ -95,9 +74,6 @@ func TestCapabilitiesMixed(t *testing.T) {
 	if caps.OnGuard() {
 		t.Error("Guard nil → should default off")
 	}
-	if caps.OnHooks() {
-		t.Error("Hooks nil → should default off")
-	}
 	if !caps.OnMCP() {
 		t.Error("MCP nil → should default on")
 	}
@@ -106,13 +82,13 @@ func TestCapabilitiesMixed(t *testing.T) {
 func TestCapabilitiesAllOff(t *testing.T) {
 	off := false
 	caps := Capabilities{
-		Memory: &off, Summarizer: &off, Tools: &off,
+		Memory: &off, Summarizer: &off,
 		Skills: &off, MCP: &off, Guard: &off,
-		Approver: &off, Hooks: &off, Observer: &off,
+		Approver: &off,
 	}
-	if caps.OnMemory() || caps.OnSummarizer() || caps.OnTools() ||
+	if caps.OnMemory() || caps.OnSummarizer() ||
 		caps.OnSkills() || caps.OnMCP() || caps.OnGuard() ||
-		caps.OnApprover() || caps.OnHooks() || caps.OnObserver() {
+		caps.OnApprover() {
 		t.Error("All capabilities should be off")
 	}
 }
@@ -120,13 +96,13 @@ func TestCapabilitiesAllOff(t *testing.T) {
 func TestCapabilitiesAllOn(t *testing.T) {
 	on := true
 	caps := Capabilities{
-		Memory: &on, Summarizer: &on, Tools: &on,
+		Memory: &on, Summarizer: &on,
 		Skills: &on, MCP: &on, Guard: &on,
-		Approver: &on, Hooks: &on, Observer: &on,
+		Approver: &on,
 	}
-	if !caps.OnMemory() || !caps.OnSummarizer() || !caps.OnTools() ||
+	if !caps.OnMemory() || !caps.OnSummarizer() ||
 		!caps.OnSkills() || !caps.OnMCP() || !caps.OnGuard() ||
-		!caps.OnApprover() || !caps.OnHooks() || !caps.OnObserver() {
+		!caps.OnApprover() {
 		t.Error("All capabilities should be on")
 	}
 }
@@ -140,13 +116,10 @@ func TestCapabilities_OnMethod_Table(t *testing.T) {
 	}{
 		{"Memory", Capabilities.OnMemory, nil, true},
 		{"Summarizer", Capabilities.OnSummarizer, nil, true},
-		{"Tools", Capabilities.OnTools, nil, true},
 		{"Skills", Capabilities.OnSkills, nil, true},
 		{"MCP", Capabilities.OnMCP, nil, true},
 		{"Guard", Capabilities.OnGuard, nil, false},
 		{"Approver", Capabilities.OnApprover, nil, false},
-		{"Hooks", Capabilities.OnHooks, nil, false},
-		{"Observer", Capabilities.OnObserver, nil, false},
 	}
 
 	for _, tt := range tests {
@@ -180,8 +153,6 @@ func capsWith(name string, val *bool) Capabilities {
 		c.Memory = val
 	case "Summarizer":
 		c.Summarizer = val
-	case "Tools":
-		c.Tools = val
 	case "Skills":
 		c.Skills = val
 	case "MCP":
@@ -190,10 +161,6 @@ func capsWith(name string, val *bool) Capabilities {
 		c.Guard = val
 	case "Approver":
 		c.Approver = val
-	case "Hooks":
-		c.Hooks = val
-	case "Observer":
-		c.Observer = val
 	}
 	return c
 }

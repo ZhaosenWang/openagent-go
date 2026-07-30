@@ -29,9 +29,6 @@ func TestParseCapabilities_Defaults(t *testing.T) {
 	if !caps.OnSummarizer() {
 		t.Error("summarizer default: want on")
 	}
-	if !caps.OnTools() {
-		t.Error("tools default: want on")
-	}
 	if !caps.OnSkills() {
 		t.Error("skills default: want on")
 	}
@@ -44,28 +41,19 @@ func TestParseCapabilities_Defaults(t *testing.T) {
 	if caps.OnApprover() {
 		t.Error("approver default: want off")
 	}
-	if caps.OnHooks() {
-		t.Error("hooks default: want off")
-	}
-	if caps.OnObserver() {
-		t.Error("observer default: want off")
-	}
 }
 
 func TestParseCapabilities_ExplicitOnOff(t *testing.T) {
 	caps := newCapCmd([]string{
-		"--memory=off", "--summarizer=off", "--tools=off",
+		"--memory=off", "--summarizer=off",
 		"--skills=off", "--mcp=off",
-		"--guard=on", "--approver=on", "--hooks=on", "--observer=on",
+		"--guard=on", "--approver=on",
 	})
 	if caps.OnMemory() {
 		t.Error("memory=off: want off")
 	}
 	if caps.OnSummarizer() {
 		t.Error("summarizer=off: want off")
-	}
-	if caps.OnTools() {
-		t.Error("tools=off: want off")
 	}
 	if caps.OnSkills() {
 		t.Error("skills=off: want off")
@@ -78,12 +66,6 @@ func TestParseCapabilities_ExplicitOnOff(t *testing.T) {
 	}
 	if !caps.OnApprover() {
 		t.Error("approver=on: want on")
-	}
-	if !caps.OnHooks() {
-		t.Error("hooks=on: want on")
-	}
-	if !caps.OnObserver() {
-		t.Error("observer=on: want on")
 	}
 }
 
@@ -119,18 +101,15 @@ func TestParseCapabilities_PartialOverride(t *testing.T) {
 func TestParseCapabilities_CaseInsensitive(t *testing.T) {
 	// "ON"/"OFF", "On"/"Off" should all be accepted (case-insensitive).
 	caps := newCapCmd([]string{
-		"--memory=ON", "--summarizer=On", "--tools=off",
+		"--memory=ON", "--summarizer=On",
 		"--skills=OFF", "--mcp=on",
-		"--guard=ON", "--approver=On", "--hooks=OFF", "--observer=Off",
+		"--guard=ON", "--approver=On",
 	})
 	if !caps.OnMemory() {
 		t.Error("memory=ON → should be on")
 	}
 	if !caps.OnSummarizer() {
 		t.Error("summarizer=On → should be on")
-	}
-	if caps.OnTools() {
-		t.Error("tools=off → should be off")
 	}
 	if caps.OnSkills() {
 		t.Error("skills=OFF → should be off")
@@ -143,11 +122,5 @@ func TestParseCapabilities_CaseInsensitive(t *testing.T) {
 	}
 	if !caps.OnApprover() {
 		t.Error("approver=On → should be on")
-	}
-	if caps.OnHooks() {
-		t.Error("hooks=OFF → should be off")
-	}
-	if caps.OnObserver() {
-		t.Error("observer=Off → should be off")
 	}
 }

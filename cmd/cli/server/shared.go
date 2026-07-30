@@ -332,19 +332,17 @@ func buildOpts(opts []openagent.AgentOption, caps Capabilities, model openagent.
 		opts = append(opts, openagent.WithInputGuard(g))
 		opts = append(opts, openagent.WithOutputGuard(g.Output()))
 	}
-	if caps.OnHooks() {
-		// Order: redact → slog → artifact. redact must run FIRST so every
-		// downstream observer (slog error logging, artifact disk save)
-		// sees already-redacted data. Putting slog before redact would
-		// write the raw secret into the log on tool errors.
-		opts = append(opts, openagent.WithRunHooks(
-			redacthook.NewHook(sensitive.Env),
-			buildSlogHooks(),
-			artifacthook.NewHook(),
-		))
-	}
-	if caps.OnObserver() {
-		opts = append(opts, openagent.WithRunObserver(buildSlogObserver()))
-	}
+
+	// Order: redact → slog → artifact. redact must run FIRST so every
+	// downstream observer (slog error logging, artifact disk save)
+	// sees already-redacted data. Putting slog before redact would
+	// write the raw secret into the log on tool errors.
+	opts = append(opts, openagent.WithRunHooks(
+		redacthook.NewHook(sensitive.Env),
+		buildSlogHooks(),
+		artifacthook.NewHook(),
+	))
+
+	opts = append(opts, openagent.WithRunObserver(buildSlogObserver()))
 	return opts
 }

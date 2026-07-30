@@ -17,8 +17,8 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/yusheng-g/openagent-go/cmd/cli/config"
-	"github.com/yusheng-g/openagent-go/keyring"
 	"github.com/yusheng-g/openagent-go/cmd/cli/server"
+	"github.com/yusheng-g/openagent-go/keyring"
 	plugin "github.com/yusheng-g/openagent-go/plugin/cli"
 	cliwasm "github.com/yusheng-g/openagent-go/plugin/cli/wasm"
 )
@@ -332,13 +332,10 @@ func addCapabilityFlags(cmd *cobra.Command) {
 	for _, f := range []struct{ name, def, desc string }{
 		{"memory", "on", "Memory backend"},
 		{"summarizer", "on", "Conversation summarizer"},
-		{"tools", "on", "Built-in tools (shell, file, grep, etc.)"},
 		{"skills", "on", "Skill loader"},
 		{"mcp", "on", "MCP tool servers"},
 		{"guard", "off", "LLM content guard"},
 		{"approver", "off", "Human-in-the-Loop tool approval"},
-		{"hooks", "off", "Lifecycle hooks (slog)"},
-		{"observer", "off", "Stage observer"},
 	} {
 		cmd.Flags().String(f.name, f.def, f.desc+` ("on" or "off")`)
 	}
@@ -363,13 +360,10 @@ func parseCapabilities(cmd *cobra.Command, caps *server.Capabilities) {
 	}
 	set("memory", &caps.Memory)
 	set("summarizer", &caps.Summarizer)
-	set("tools", &caps.Tools)
 	set("skills", &caps.Skills)
 	set("mcp", &caps.MCP)
 	set("guard", &caps.Guard)
 	set("approver", &caps.Approver)
-	set("hooks", &caps.Hooks)
-	set("observer", &caps.Observer)
 }
 
 // ── run ──
