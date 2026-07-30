@@ -22,7 +22,6 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -251,7 +250,7 @@ func (m *Manager) List() []*Proc {
 	return out
 }
 
-// Cleanup kills every tracked process (SIGKILL), closes files, and removes
+// Cleanup kills every tracked process, closes files, and removes
 // the base directory. Call on session delete.
 func (m *Manager) Cleanup() error {
 	m.mu.Lock()
@@ -264,7 +263,11 @@ func (m *Manager) Cleanup() error {
 
 	for _, p := range procs {
 		if pid := p.PIDNow(); pid > 0 {
-			syscall.Kill(pid, syscall.SIGKILL)
+			// os.FindProcess + Kill is portable across unix and Windows,
+			// unlike syscall.Kill which is not defined on Windows.
+			if proc, err := os.FindProcess(pid); err == nil {
+				proc.Kill()
+			}
 		}
 		p.Close()
 		os.RemoveAll(p.DirNow())
