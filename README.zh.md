@@ -28,6 +28,9 @@
 # 编译 CLI
 go build -o openagent-cli ./cmd/cli/
 
+# 查看版本号
+./openagent-cli -v
+
 # ACP 模式（stdio — 配合 VSCode/Zed ACP 插件使用）
 ./openagent-cli serve --acp
 
