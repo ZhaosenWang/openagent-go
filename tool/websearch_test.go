@@ -102,10 +102,10 @@ func TestWebSearchNon2xx(t *testing.T) {
 	t.Logf("✅ 429 handled: %v", err)
 }
 
-func TestWebSearchSelfApproves(t *testing.T) {
+func TestWebSearchRequiresApproval(t *testing.T) {
 	s := NewWebSearch().withClient(newTestClient())
-	if !s.CanSelfApprove(nil) {
-		t.Error("WebSearch should self-approve")
+	if s.CanSelfApprove(nil) {
+		t.Error("WebSearch should require user approval")
 	}
 }
 

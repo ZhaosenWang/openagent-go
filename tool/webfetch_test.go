@@ -177,10 +177,10 @@ func TestWebFetchNon2xx(t *testing.T) {
 	t.Logf("✅ webfetch 404: %v", err)
 }
 
-func TestWebFetchSelfApproves(t *testing.T) {
+func TestWebFetchRequiresApproval(t *testing.T) {
 	f := NewWebFetch().withClient(newTestClient())
-	if !f.CanSelfApprove(nil) {
-		t.Error("WebFetch should self-approve")
+	if f.CanSelfApprove(nil) {
+		t.Error("WebFetch should require user approval")
 	}
 }
 
