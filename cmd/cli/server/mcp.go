@@ -10,6 +10,7 @@ import (
 
 	openagent "github.com/yusheng-g/openagent-go"
 	"github.com/yusheng-g/openagent-go/mcp"
+	"github.com/yusheng-g/openagent-go/version"
 
 	"github.com/yusheng-g/openagent-go/cmd/cli/config"
 )
@@ -22,7 +23,7 @@ func connectMcpFromConfig(ctx context.Context, servers map[string]config.McpServ
 		return nil, func() {}
 	}
 
-	client := mcp.NewClient("openagent-cli", "1.0.0")
+	client := mcp.NewClient(version.Name, version.Version)
 	var tools []openagent.Tool
 	var sessions []*mcp.Session
 
