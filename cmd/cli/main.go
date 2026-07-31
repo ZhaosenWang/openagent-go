@@ -136,9 +136,6 @@ func main() {
 		defer logCleanup()
 	}
 
-	pretty, _ := json.MarshalIndent(&cfg, "", "  ")
-	log.Printf("Merged settings:\n%s", string(pretty))
-
 	// 6. Build cobra tree.
 	rootCmd.AddCommand(buildServeCmd(cfg))
 	rootCmd.AddCommand(buildRunCmd(cfg))
