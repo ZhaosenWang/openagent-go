@@ -428,7 +428,7 @@ func (p *Planner) EstimateCost(ctx context.Context, deploymentID string) (string
 		}
 	}
 
-	skillBody := p.loadSkillBody(ctx, "huaweicloud-pricing")
+	skillBody := p.loadSkillBody(ctx, "huaweicloud-bss")
 	agent := openagent.NewAgent("iac-pricing",
 		openagent.WithModel(p.model),
 		openagent.WithTools(p.fileTools()...),
@@ -437,7 +437,7 @@ func (p *Planner) EstimateCost(ctx context.Context, deploymentID string) (string
 			serverContext,
 			skillBody,
 			"You are a HuaweiCloud pricing expert. "+
-				"Use read/grep/ls to browse the skills/huaweicloud-pricing/references/ directory "+
+				"Use read/grep/ls to browse the skills/huaweicloud-bss/references/ directory "+
 				"for BSS API definitions, use http_request to call the BSS pricing APIs (signing is automatic), "+
 				"and use WebSearch/WebFetch as a fallback for public pricing pages. "+
 				"You are given the planned resources with exact specs from terraform plan. "+

@@ -1,11 +1,11 @@
 ---
-name: huaweicloud-pricing
-description: HuaweiCloud pricing guide. Queries prices for resources based on exact specs (flavor_id, volume_size, bandwidth, etc.) from the terraform plan. Supports two billing modes — pay-as-you-go (ListOnDemandResourceRatings) and yearly/monthly subscription (ListRateOnPeriodDetail). Covers the 91 BSS APIs (9 pricing-core) with full swagger definitions under references/, the pricing flow (ListServiceTypes → ListResourceTypes → ListResourceSpecs → rating query), and spec-to-price mapping.
+name: huaweicloud-bss
+description: HuaweiCloud BSS (Business Support System) API guide. Covers pricing (pay-as-you-go via ListOnDemandResourceRatings, yearly/monthly via ListRateOnPeriodDetail), billing and costs (ListCosts, ListCustomerBillsMonthlyBreakDown, ShowCustomerMonthlySum, ListCustomerBillsFeeRecords), resource specs (flavor, size, region availability), orders, subscriptions, and enterprise project management. 91 BSS APIs with full swagger definitions under references/, pricing flow (ListServiceTypes → ListResourceTypes → ListResourceSpecs → rating query), and spec-to-price mapping.
 ---
 
-# HuaweiCloud Pricing Guide
+# HuaweiCloud BSS API Guide
 
-You are a HuaweiCloud pricing expert. Query monthly prices for each resource based on exact specs from the terraform plan.
+You are a HuaweiCloud pricing and billing expert. You can query resource prices, check billing/cost data, look up resource specs, and manage orders/subscriptions.
 
 ## BSS API
 
