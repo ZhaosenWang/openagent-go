@@ -1,8 +1,8 @@
-// Package mcp defines the 8 deployment tools exposed by iac-server over MCP.
+// Package mcp defines the deployment tools exposed by iac-server over MCP.
 //
 // Tools are split into two groups:
-//   - LLM tools (plan_deployment, update_deployment, estimate_cost,
-//     troubleshoot_deployment): delegate to agent.Planner
+//   - LLM tools (propose_architecture, specify_resources, generate_plan,
+//     estimate_cost, troubleshoot_deployment, query_cloud): delegate to agent.Planner
 //   - Execution tools (apply, destroy, get_status, list): call iac.Client
 //     directly
 //
@@ -35,11 +35,12 @@ type Config struct {
 	ProviderMirrors []string // provider download mirrors (URLs or local paths)
 }
 
-// NewTools builds the 9 tools exposed by iac-server.
+// NewTools builds the 11 tools exposed by iac-server.
 func NewTools(cfg Config) []openagent.Tool {
 	return []openagent.Tool{
-		&planDeploymentTool{cfg: cfg},
-		&updateDeploymentTool{cfg: cfg},
+		&proposeArchitectureTool{cfg: cfg},
+		&specifyResourcesTool{cfg: cfg},
+		&generatePlanTool{cfg: cfg},
 		&estimateCostTool{cfg: cfg},
 		&troubleshootDeploymentTool{cfg: cfg},
 		&applyDeploymentTool{cfg: cfg},
@@ -47,6 +48,7 @@ func NewTools(cfg Config) []openagent.Tool {
 		&getDeploymentStatusTool{cfg: cfg},
 		&listDeploymentsTool{cfg: cfg},
 		&queryCloudTool{cfg: cfg},
+		&updateDeploymentTool{cfg: cfg},
 	}
 }
 
@@ -83,20 +85,20 @@ func iacConfig(cloud provider.CloudProvider, dryRun bool, binaryMirrors, provide
 	}
 }
 
-// ── plan_deployment ──
+// ── propose_architecture ──
 
-type planDeploymentTool struct{ cfg Config }
+type proposeArchitectureTool struct{ cfg Config }
 
-func (t *planDeploymentTool) Definition() openagent.FunctionDefinition {
+func (t *proposeArchitectureTool) Definition() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
-		Name:        "plan_deployment",
-		Description: "Analyze a deployment request (free-text) and produce a terraform plan. Returns need_input (with questions) if information is incomplete, or ready (with deployment_id and plan) if complete. Does NOT show pricing — call estimate_cost before apply_deployment.",
+		Name:        "propose_architecture",
+		Description: "Step 1 of deployment: Analyze a deployment request and recommend a cloud architecture. Returns architecture name, required services, reasoning, and a deployment_id. Does NOT write .tf files. The user should confirm the architecture before calling specify_resources.",
 		Parameters: json.RawMessage(`{
 			"type": "object",
 			"properties": {
 				"request": {
 					"type": "string",
-					"description": "Free-text deployment request, e.g. \"deploy a WordPress site to cn-east-3, HA, budget 500/month\""
+					"description": "Free-text deployment request, e.g. \"deploy a WordPress site to cn-east-3, single instance, budget 100/month\""
 				}
 			},
 			"required": ["request"]
@@ -104,17 +106,96 @@ func (t *planDeploymentTool) Definition() openagent.FunctionDefinition {
 	}
 }
 
-func (t *planDeploymentTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
+func (t *proposeArchitectureTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var params struct {
 		Request string `json:"request"`
 	}
 	if err := json.Unmarshal(args, &params); err != nil {
-		return "", fmt.Errorf("plan_deployment: %w", err)
+		return "", fmt.Errorf("propose_architecture: %w", err)
 	}
 	if params.Request == "" {
-		return "", fmt.Errorf("plan_deployment: request is required")
+		return "", fmt.Errorf("propose_architecture: request is required")
 	}
-	return t.cfg.Planner.Plan(ctx, params.Request)
+	return t.cfg.Planner.ProposeArchitecture(ctx, params.Request)
+}
+
+// ── specify_resources ──
+
+type specifyResourcesTool struct{ cfg Config }
+
+func (t *specifyResourcesTool) Definition() openagent.FunctionDefinition {
+	return openagent.FunctionDefinition{
+		Name:        "specify_resources",
+		Description: "Step 2 of deployment: Determine concrete resource specs (flavor, image, disk, CIDR, etc.) for a proposed architecture. Reads the architecture from the prior propose_architecture call. Optional adjustments let the user modify specs. The user should confirm the resources before calling generate_plan.",
+		Parameters: json.RawMessage(`{
+			"type": "object",
+			"properties": {
+				"deployment_id": {
+					"type": "string",
+					"description": "Deployment ID from propose_architecture"
+				},
+				"adjustments": {
+					"type": "string",
+					"description": "Optional free-text adjustments, e.g. \"use s6.xlarge.2 instead\" or \"add a 100GB data disk\""
+				}
+			},
+			"required": ["deployment_id"]
+		}`),
+	}
+}
+
+func (t *specifyResourcesTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
+	var params struct {
+		DeploymentID string `json:"deployment_id"`
+		Adjustments  string `json:"adjustments"`
+	}
+	if err := json.Unmarshal(args, &params); err != nil {
+		return "", fmt.Errorf("specify_resources: %w", err)
+	}
+	if params.DeploymentID == "" {
+		return "", fmt.Errorf("specify_resources: deployment_id is required")
+	}
+	if !validDeploymentID(params.DeploymentID) {
+		return "", fmt.Errorf("specify_resources: invalid deployment_id %q", params.DeploymentID)
+	}
+	return t.cfg.Planner.SpecifyResources(ctx, params.DeploymentID, params.Adjustments)
+}
+
+// ── generate_plan ──
+
+type generatePlanTool struct{ cfg Config }
+
+func (t *generatePlanTool) Definition() openagent.FunctionDefinition {
+	return openagent.FunctionDefinition{
+		Name:        "generate_plan",
+		Description: "Step 3 of deployment: Write .tf files based on the confirmed architecture and resource specs, then run terraform init + plan. Returns the .tf files and a plan preview. The user should review the plan before calling estimate_cost.",
+		Parameters: json.RawMessage(`{
+			"type": "object",
+			"properties": {
+				"deployment_id": {
+					"type": "string",
+					"description": "Deployment ID from propose_architecture"
+				}
+			},
+			"required": ["deployment_id"]
+		}`),
+	}
+}
+
+func (t *generatePlanTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
+	var params struct {
+		DeploymentID string `json:"deployment_id"`
+	}
+	if err := json.Unmarshal(args, &params); err != nil {
+		return "", fmt.Errorf("generate_plan: %w", err)
+	}
+	if params.DeploymentID == "" {
+		return "", fmt.Errorf("generate_plan: deployment_id is required")
+	}
+	if !validDeploymentID(params.DeploymentID) {
+		return "", fmt.Errorf("generate_plan: invalid deployment_id %q", params.DeploymentID)
+	}
+	return t.cfg.Planner.GeneratePlan(ctx, params.DeploymentID)
 }
 
 // ── update_deployment ──
@@ -124,7 +205,7 @@ type updateDeploymentTool struct{ cfg Config }
 func (t *updateDeploymentTool) Definition() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
 		Name:        "update_deployment",
-		Description: "Modify an existing planned deployment. Accepts a change request (e.g. \"change ECS flavor to s6.xlarge.2\") and updates the .tf files in-place, then re-runs terraform plan. Use this instead of plan_deployment when the user wants to adjust an existing deployment. Returns the updated plan with the same deployment_id. After updating, call estimate_cost again to see the new pricing before apply_deployment.",
+		Description: "Modify an existing deployment. Re-runs specify_resources (with user adjustments) and generate_plan. Use this when the user wants to adjust an existing deployment (e.g. \"change ECS flavor to s6.xlarge.2\"). Returns the updated plan with the same deployment_id. After updating, call estimate_cost again to see the new pricing before apply_deployment.",
 		Parameters: json.RawMessage(`{
 			"type": "object",
 			"properties": {
@@ -166,7 +247,7 @@ type estimateCostTool struct{ cfg Config }
 func (t *estimateCostTool) Definition() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
 		Name:        "estimate_cost",
-		Description: "Estimate the monthly cost of a PLANNED deployment (resources not yet created). MUST be called after plan_deployment and before apply_deployment. This forecasts future costs based on the terraform plan — it does NOT query past billing. For existing bills/costs, use query_cloud.",
+		Description: "Step 4 of deployment: Estimate the monthly cost of a PLANNED deployment (resources not yet created). MUST be called after generate_plan and before apply_deployment. This forecasts future costs based on the terraform plan — it does NOT query past billing. For existing bills/costs, use query_cloud.",
 		Parameters: json.RawMessage(`{
 			"type": "object",
 			"properties": {
@@ -245,7 +326,7 @@ type applyDeploymentTool struct{ cfg Config }
 func (t *applyDeploymentTool) Definition() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
 		Name:        "apply_deployment",
-		Description: "Apply a saved terraform plan. This creates/modifies real cloud resources. The deployment must have been planned first (plan_deployment returned status=ready). Call estimate_cost first so the user sees pricing.",
+		Description: "Step 5 of deployment: Apply a saved terraform plan. This creates/modifies real cloud resources. The deployment must have been planned first (generate_plan succeeded). Call estimate_cost first so the user sees pricing.",
 		Parameters: json.RawMessage(`{
 			"type": "object",
 			"properties": {

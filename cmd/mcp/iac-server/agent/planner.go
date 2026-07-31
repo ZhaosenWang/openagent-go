@@ -81,127 +81,340 @@ const serverContext = `You are the server-side LLM of an MCP server (iac-server)
 
 ## Your role
 - You run on the SERVER side. You never talk to the end user directly.
-- The MCP CLIENT (e.g. Claude Code, Cursor, openagent) calls one of the 9 MCP tools (plan_deployment, update_deployment, estimate_cost, apply_deployment, destroy_deployment, get_deployment_status, list_deployments, troubleshoot_deployment, query_cloud) and forwards the user's request to you.
+- The MCP CLIENT (e.g. Claude Code, Cursor, openagent) calls one of the 11 MCP tools and forwards the user's request to you.
 - Your output is returned to the client as the tool result. The client then decides what to show the user and whether to proceed.
 - You do NOT need user approval for any action — approval is the client's concern, not yours.
 
-## Workflow
-The typical deployment flow is:
-  1. plan_deployment    — you generate .tf files and run terraform plan
-  2. estimate_cost      — you query cloud pricing for the planned resources
-  3. apply_deployment    — terraform apply (executed by the server, not you)
-  4. (troubleshoot_deployment if anything fails)
+## Deployment workflow (6 steps, user confirms between each)
+  1. propose_architecture  — recommend a cloud architecture (services + reasoning), no .tf files
+  2. specify_resources     — determine concrete resource specs (flavor, image, CIDR, etc.)
+  3. generate_plan         — write .tf files + run terraform plan, return preview
+  4. estimate_cost         — query cloud pricing for the planned resources
+  5. apply_deployment       — terraform apply (executed by the server, not you)
+  6. troubleshoot_deployment — diagnose errors if any step fails
 
-update_deployment modifies an existing planned deployment in-place. destroy_deployment and get_deployment_status do not involve you.
+update_deployment re-runs specify_resources + generate_plan with user adjustments. destroy_deployment, get_deployment_status, and list_deployments do not involve you. query_cloud is for read-only queries about existing resources/bills.
 
 ## Credentials
 Cloud credentials (e.g. HW_ACCESS_KEY, HW_SECRET_KEY, HW_REGION) are injected by the server into the terraform subprocess environment. NEVER hardcode credentials in .tf files, NEVER ask for them, NEVER put them in variables or tfvars.
 
 ## Tools
 - read / grep / ls — browse the workspace: skills/ (references, guides) and deployments/ (.tf files)
-- http_request — send authenticated HTTP requests to cloud APIs (signing is automatic, do NOT pass credentials). Use ONLY for read-only queries (List/Show/Get APIs). NEVER call Create/Update/Delete/Post/Put APIs to create or modify cloud resources directly — resource provisioning is done through terraform (plan_deployment → apply_deployment), not through API calls.
+- http_request — send authenticated HTTP requests to cloud APIs (signing is automatic, do NOT pass credentials). Use ONLY for read-only queries (List/Show/Get APIs). NEVER call Create/Update/Delete/Post/Put APIs to create or modify cloud resources directly — resource provisioning is done through terraform, not through API calls.
 - WebSearch / WebFetch — query official cloud docs and pricing pages
 - load_skill / reload_skills — (query_cloud only) dynamically load cloud-service skills on demand
 
 ## Skills
-For plan/update/estimate/troubleshoot: the relevant skill guide (SKILL.md) is already loaded into your system prompt — you do not need to call any tool to load it. Use read/grep/ls to browse the skill's references/ directory for detailed examples and API definitions.
+For propose/specify/generate/estimate/troubleshoot: the relevant skill guide (SKILL.md) is already loaded into your system prompt — you do not need to call any tool to load it. Use read/grep/ls to browse the skill's references/ directory for detailed examples and API definitions.
 For query_cloud: use the load_skill tool to load the relevant cloud-service skill on demand (the skill catalog is in your system prompt).
 
 ## Output contract
 Return ONLY valid JSON as specified by each tool's instructions. Do not wrap in markdown fences. Do not add conversational text outside the JSON. The server parses your output programmatically — any non-JSON text will cause a parse failure.`
 
-// Plan analyzes a free-text deployment request and produces a terraform plan.
+// ProposeArchitecture analyzes a deployment request and recommends a cloud
+// architecture (step 1 of the 6-step deployment flow). It does NOT write .tf
+// files or browse reference examples — it only looks at the service category
+// list and matches the request to a known architecture pattern.
 //
-// The huaweicloud-deploy skill is statically loaded into the system prompt.
-// The LLM browses references with read/grep/ls and generates .tf files. If
-// information is incomplete, returns need_input with questions. If complete,
-// writes the .tf files, runs terraform init+plan, and retries up to 3 times
-// on failure.
-func (p *Planner) Plan(ctx context.Context, request string) (string, error) {
+// Returns a deployment_id (pre-allocated), the proposed architecture, required
+// services, and reasoning. If information is incomplete, returns questions.
+// The user confirms the architecture before calling specify_resources.
+func (p *Planner) ProposeArchitecture(ctx context.Context, request string) (string, error) {
+	progress := openagent.ProgressFromContext(ctx)
+
+	// Pre-allocate the deployment ID so all subsequent steps share the same
+	// Memory session and deployment directory.
+	depID, dir, err := deploymentID(p.deploymentsDir)
+	if err != nil {
+		return "", fmt.Errorf("propose_architecture: %w", err)
+	}
+
+	progress("Loading deployment skill...", 0, 2)
+	skillBody := p.loadSkillBody(ctx, "huaweicloud-deploy")
+	agent := openagent.NewAgent("iac-architect",
+		openagent.WithModel(p.model),
+		openagent.WithTools(p.fileTools()...),
+		openagent.WithMemory(p.memory),
+		openagent.WithRunHooks(sloghooks.New(slog.Default()), newProgressHook()),
+		openagent.WithSystemPrompts(
+			serverContext,
+			skillBody,
+			`You are a HuaweiCloud architecture expert. Your job is to RECOMMEND an architecture, NOT write .tf files.
+
+## What to do
+1. Parse the user's deployment goal (what to deploy, region, HA, budget, etc.)
+2. Run `+"`ls skills/huaweicloud-deploy/references/`"+` to see available service categories
+3. Match the request to a known architecture pattern (see patterns below)
+4. Return the architecture recommendation
+
+## What NOT to do
+- Do NOT read individual .tf files — that happens in generate_plan
+- Do NOT browse deep into reference directories
+- Do NOT generate .tf configuration
+
+## Common architecture patterns
+- **Single web server**: ECS + VPC + Subnet + Security Group + EIP
+- **Web + database**: ECS + VPC + Subnet + Security Group + EIP + RDS
+- **HA web tier**: ECS×2 + VPC + Subnet + Security Group + ELB + EIP + RDS
+- **Web + cache + db**: ECS + VPC + Subnet + Security Group + EIP + DCS(Redis) + RDS
+- **Container cluster**: CCE + VPC + Subnet + Security Group + EIP
+- **Static site**: OBS + CDN
+
+## Output
+Return JSON:
+`+"```json"+`
+{
+  "architecture": "short name, e.g. \"single ECS + VPC + EIP\"",
+  "services": ["ecs", "vpc", "eip"],
+  "reasoning": "why this architecture was chosen",
+  "questions": ["..."]  // only if information is incomplete
+}
+`+"```"+`
+If information is incomplete, return questions instead of architecture.`),
+		openagent.WithMaxTurns(5),
+	)
+
+	progress("Analyzing deployment request...", 1, 2)
+	session := openagent.Session{ID: sessionID(depID)}
+	result, err := agent.Run(ctx, session, openagent.UserMessage(request))
+	if err != nil {
+		os.RemoveAll(dir)
+		return "", fmt.Errorf("propose_architecture: LLM run: %w", err)
+	}
+
+	raw := extractJSON(result.FinalOutput)
+	if raw == "" {
+		os.RemoveAll(dir)
+		return "", fmt.Errorf("propose_architecture: LLM returned empty output (FinalOutput=%q)", result.FinalOutput)
+	}
+
+	var arch struct {
+		Architecture string   `json:"architecture"`
+		Services     []string `json:"services"`
+		Reasoning    string   `json:"reasoning"`
+		Questions    []string `json:"questions"`
+	}
+	if err := json.Unmarshal([]byte(raw), &arch); err != nil {
+		os.RemoveAll(dir)
+		return marshalResult(planResult{
+			Status: "need_input",
+			Questions: []string{
+				"Could not parse the request. Please provide more details about what you want to deploy, the region, and any requirements.",
+			},
+		})
+	}
+
+	// Information incomplete — ask the client for clarification.
+	if len(arch.Questions) > 0 {
+		os.RemoveAll(dir)
+		return marshalResult(planResult{
+			Status:    "need_input",
+			Questions: arch.Questions,
+		})
+	}
+
+	out := map[string]any{
+		"deployment_id": depID,
+		"architecture":  arch.Architecture,
+		"services":      arch.Services,
+		"reasoning":     arch.Reasoning,
+		"next_step":     "Call specify_resources with this deployment_id to determine resource specs. User should confirm the architecture first.",
+	}
+	data, err := json.Marshal(out)
+	if err != nil {
+		return "", fmt.Errorf("propose_architecture: marshal: %w", err)
+	}
+	return string(data), nil
+}
+
+// SpecifyResources determines concrete resource specs for a proposed architecture
+// (step 2 of the 6-step deployment flow). Reads the architecture from Memory
+// (stored by propose_architecture), queries cloud APIs for available specs
+// (flavors, images, etc.), and returns a detailed resource list.
+//
+// The user confirms the resources before calling generate_plan.
+func (p *Planner) SpecifyResources(ctx context.Context, deploymentID, adjustments string) (string, error) {
+	progress := openagent.ProgressFromContext(ctx)
+
+	dir := filepath.Join(p.deploymentsDir, deploymentID)
+	if _, err := os.Stat(dir); err != nil {
+		return "", fmt.Errorf("specify_resources: deployment %s not found — call propose_architecture first", deploymentID)
+	}
+
+	progress("Loading deployment skill...", 0, 3)
+	skillBody := p.loadSkillBody(ctx, "huaweicloud-deploy")
+	agent := openagent.NewAgent("iac-specifier",
+		openagent.WithModel(p.model),
+		openagent.WithTools(p.fileTools()...),
+		openagent.WithMemory(p.memory),
+		openagent.WithRunHooks(sloghooks.New(slog.Default()), newProgressHook()),
+		openagent.WithSystemPrompts(
+			serverContext,
+			skillBody,
+			`You are a HuaweiCloud resource specification expert. Your job is to determine concrete resource specs for a proposed architecture.
+
+## What to do
+1. Read the architecture recommendation from the conversation history (propose_architecture output)
+2. Use http_request to query available specs if needed (e.g. ListFlavors for ECS, ListImages for OS images)
+3. Determine concrete specs for each resource: flavor, image, disk size, CIDR, etc.
+4. Apply any user adjustments to the specs
+
+## What NOT to do
+- Do NOT write .tf files — that happens in generate_plan
+- Do NOT browse reference directories
+- Do NOT create or modify any cloud resources — only read-only API calls (List/Show/Get)
+
+## Output
+Return JSON:
+`+"```json"+`
+{
+  "resources": [
+    {"type": "huaweicloud_compute_instance", "name": "web", "spec": {"flavor": "s6.large.2", "image": "Ubuntu 22.04", "disk": 40}},
+    {"type": "huaweicloud_vpc", "name": "main", "spec": {"cidr": "192.168.0.0/16"}},
+    {"type": "huaweicloud_vpc_subnet", "name": "subnet", "spec": {"cidr": "192.168.0.0/24"}},
+    {"type": "huaweicloud_vpc_eip", "name": "eip", "spec": {"bandwidth": 5, "type": "5_bgp"}}
+  ],
+  "reasoning": "why these specs were chosen"
+}
+`+"```"+`
+`),
+		openagent.WithMaxTurns(8),
+	)
+
+	progress("Determining resource specs...", 1, 3)
+	session := openagent.Session{ID: sessionID(deploymentID)}
+
+	userMsg := "Determine concrete resource specs for this deployment based on the architecture from the previous step (propose_architecture). Return JSON with the resources array."
+	if adjustments != "" {
+		userMsg += "\n\nUser adjustments: " + adjustments
+	}
+
+	result, err := agent.Run(ctx, session, openagent.UserMessage(userMsg))
+	if err != nil {
+		return "", fmt.Errorf("specify_resources: LLM run: %w", err)
+	}
+
+	raw := extractJSON(result.FinalOutput)
+	if raw == "" {
+		return "", fmt.Errorf("specify_resources: LLM returned empty output (FinalOutput=%q)", result.FinalOutput)
+	}
+
+	var spec struct {
+		Resources []map[string]any `json:"resources"`
+		Reasoning string          `json:"reasoning"`
+	}
+	if err := json.Unmarshal([]byte(raw), &spec); err != nil {
+		return "", fmt.Errorf("specify_resources: parse: %w (raw=%q)", err, raw)
+	}
+
+	out := map[string]any{
+		"deployment_id": deploymentID,
+		"resources":     spec.Resources,
+		"reasoning":     spec.Reasoning,
+		"next_step":     "Call generate_plan with this deployment_id to write .tf files and run terraform plan. User should confirm the resources first.",
+	}
+	data, err := json.Marshal(out)
+	if err != nil {
+		return "", fmt.Errorf("specify_resources: marshal: %w", err)
+	}
+	progress("Done", 3, 3)
+	return string(data), nil
+}
+
+// GeneratePlan writes .tf files and runs terraform plan (step 3 of the 6-step
+// deployment flow). Reads the architecture + resource specs from Memory, browses
+// ONLY the relevant reference examples, generates .tf files, and runs terraform
+// init + plan. Retries up to 3 times on plan failure.
+//
+// The user reviews the plan preview before calling estimate_cost.
+func (p *Planner) GeneratePlan(ctx context.Context, deploymentID string) (string, error) {
+	progress := openagent.ProgressFromContext(ctx)
+
+	dir := filepath.Join(p.deploymentsDir, deploymentID)
+	if _, err := os.Stat(dir); err != nil {
+		return "", fmt.Errorf("generate_plan: deployment %s not found — call propose_architecture first", deploymentID)
+	}
+
+	progress("Loading deployment skill...", 0, 4)
 	skillBody := p.loadSkillBody(ctx, "huaweicloud-deploy")
 	agent := openagent.NewAgent("iac-planner",
 		openagent.WithModel(p.model),
 		openagent.WithTools(p.fileTools()...),
 		openagent.WithMemory(p.memory),
-		openagent.WithRunHooks(sloghooks.New(slog.Default())),
+		openagent.WithRunHooks(sloghooks.New(slog.Default()), newProgressHook()),
 		openagent.WithSystemPrompts(
 			serverContext,
 			skillBody,
-			"You are a HuaweiCloud infrastructure deployment expert. "+
-				"Use read/grep/ls to browse the skills/huaweicloud-deploy/references/ directory "+
-				"and generate .tf configuration files that match the user's request. "+
-				"If information is incomplete, return {\"questions\": [...]} listing what is missing. "+
-				"If complete, return {\"files\": {\"providers.tf\": \"...\", ...}, \"reasoning\": \"...\"}."),
+			`You are a HuaweiCloud terraform configuration expert. Generate .tf files based on the architecture and resource specs from the conversation history.
+
+## What to do
+1. Read the architecture + resource specs from the conversation history (propose_architecture + specify_resources output)
+2. Browse ONLY the relevant reference examples — e.g. if deploying ECS, look at references/ecs/, NOT all directories
+3. Generate .tf files: providers.tf, variables.tf, main.tf, terraform.tfvars
+4. Follow the credential rules, naming conventions, and variable design from the skill guide
+
+## What NOT to do
+- Do NOT browse all reference directories — only the ones relevant to your resources
+- Do NOT hardcode credentials
+- Do NOT ask questions — use the specs from history
+
+## Output
+Return JSON:
+`+"```json"+`
+{
+  "files": {
+    "providers.tf": "...",
+    "variables.tf": "...",
+    "main.tf": "...",
+    "terraform.tfvars": "..."
+  },
+  "reasoning": "why these .tf configs were generated"
+}
+`+"```"+``),
 		openagent.WithMaxTurns(10),
 	)
 
-	// Pre-allocate the deployment ID so all retry attempts share the same
-	// Memory session (session.ID = "dep-<depID>"). If the LLM returns
-	// need_input or no files, the empty directory is cleaned up below.
-	depID, dir, err := deploymentID(p.deploymentsDir)
-	if err != nil {
-		return "", fmt.Errorf("plan: %w", err)
-	}
-	session := openagent.Session{ID: sessionID(depID)}
+	session := openagent.Session{ID: sessionID(deploymentID)}
+	msg := openagent.UserMessage("Generate terraform .tf files based on the architecture and resource specs from the conversation history.")
 
-	msg := openagent.UserMessage(request)
 	var reasoning string
 	for attempt := 0; attempt < 3; attempt++ {
+		progress(fmt.Sprintf("Generating .tf files (attempt %d/3)...", attempt+1), float64(attempt), 3)
 		result, err := agent.Run(ctx, session, msg)
 		if err != nil {
-			return "", fmt.Errorf("plan: LLM run (attempt %d): %w", attempt+1, err)
+			return "", fmt.Errorf("generate_plan: LLM run (attempt %d): %w", attempt+1, err)
 		}
 
-		// Parse LLM output: either {questions: [...]} or {files: {...}, reasoning: "..."}.
 		var llmOutput struct {
-			Questions []string          `json:"questions"`
 			Files     map[string]string `json:"files"`
 			Reasoning string            `json:"reasoning"`
 		}
-		if err := json.Unmarshal([]byte(extractJSON(result.FinalOutput)), &llmOutput); err != nil {
-			return marshalResult(planResult{
-				Status: "need_input",
-				Questions: []string{
-					"Could not parse the request. Please provide more details about what you want to deploy, the region, and any requirements.",
-				},
-			})
+		raw := extractJSON(result.FinalOutput)
+		if raw == "" {
+			return "", fmt.Errorf("generate_plan: LLM returned empty output (attempt %d, FinalOutput=%q)", attempt+1, result.FinalOutput)
+		}
+		if err := json.Unmarshal([]byte(raw), &llmOutput); err != nil {
+			return "", fmt.Errorf("generate_plan: parse (attempt %d): %w (raw=%q)", attempt+1, err, raw)
 		}
 
-		// Information incomplete — ask the client for clarification.
-		if len(llmOutput.Questions) > 0 {
-			os.RemoveAll(dir) // clean up the pre-allocated empty directory
-			return marshalResult(planResult{
-				Status:    "need_input",
-				Questions: llmOutput.Questions,
-			})
-		}
-
-		// No files generated — bail out.
 		if len(llmOutput.Files) == 0 {
-			os.RemoveAll(dir)
-			return marshalResult(planResult{
-				Status: "need_input",
-				Questions: []string{
-					"No terraform files were generated. Please specify what you want to deploy.",
-				},
-			})
+			return "", fmt.Errorf("generate_plan: no files generated (attempt %d)", attempt+1)
 		}
 
 		reasoning = llmOutput.Reasoning
 
 		// Write .tf files to the deployment directory.
 		for name, content := range llmOutput.Files {
-			// Sanitize filename — LLM output is untrusted. Reject path
-			// separators and parent-dir components to prevent escaping dir.
 			if strings.ContainsAny(name, `/\`) || strings.Contains(name, "..") {
-				return "", fmt.Errorf("plan: invalid filename %q", name)
+				return "", fmt.Errorf("generate_plan: invalid filename %q", name)
 			}
 			if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0644); err != nil {
-				return "", fmt.Errorf("plan: write %s: %w", name, err)
+				return "", fmt.Errorf("generate_plan: write %s: %w", name, err)
 			}
 		}
 
 		// terraform init + plan.
+		progress("Running terraform init...", 2, 4)
 		client, err := iac.NewClient(ctx, dir, iac.Config{
 			Env:             p.cloud.Env(),
 			DryRun:          p.dryRun,
@@ -209,159 +422,47 @@ func (p *Planner) Plan(ctx context.Context, request string) (string, error) {
 			ProviderMirrors: p.providerMirrors,
 		})
 		if err != nil {
-			return "", fmt.Errorf("plan: create terraform client: %w", err)
+			return "", fmt.Errorf("generate_plan: create terraform client: %w", err)
 		}
 		if err := client.Init(ctx); err != nil {
-			msg = retryMessage(request, "terraform init", err, p.workDir, dir)
+			msg = retryMessage("generate .tf files", "terraform init", err, p.workDir, dir)
 			continue
 		}
+		progress("Running terraform plan...", 3, 4)
 		plan, err := client.Plan(ctx)
 		if err == nil {
-			return marshalResult(planResult{
-				Status:         "ready",
-				DeploymentID:   depID,
-				Plan:           plan,
-				Recommendation: reasoning,
-			})
+			out := map[string]any{
+				"deployment_id":  deploymentID,
+				"files":          llmOutput.Files,
+				"plan_preview":   plan,
+				"resource_count": len(llmOutput.Files),
+				"reasoning":      reasoning,
+				"next_step":      "Call estimate_cost with this deployment_id to get pricing. User should review the plan first.",
+			}
+			data, err := json.Marshal(out)
+			if err != nil {
+				return "", fmt.Errorf("generate_plan: marshal: %w", err)
+			}
+			return string(data), nil
 		}
-		msg = retryMessage(request, "terraform plan", err, p.workDir, dir)
+		msg = retryMessage("generate .tf files", "terraform plan", err, p.workDir, dir)
 	}
 
-	// Exhausted retries — clean up the partial deployment directory.
-	os.RemoveAll(dir)
-	return "", fmt.Errorf("plan: terraform plan failed after 3 attempts")
+	return "", fmt.Errorf("generate_plan: terraform plan failed after 3 attempts")
 }
 
-// UpdateDeployment modifies an existing deployment's .tf files based on a
-// change request, then re-runs terraform plan. The deployment directory
-// is reused — no new deployment ID is created.
+// UpdateDeployment modifies an existing deployment by re-running specify_resources
+// (with user adjustments) + generate_plan. The deployment directory is reused.
 //
 // Use this when the user wants to adjust an already-planned deployment
 // (e.g. change a flavor, rename a resource, add a tag) without starting
-// from scratch.
+// from scratch. The change_request is passed as adjustments to specify_resources.
 func (p *Planner) UpdateDeployment(ctx context.Context, deploymentID, changeRequest string) (string, error) {
-	dir := filepath.Join(p.deploymentsDir, deploymentID)
-
-	// Check deployment directory exists.
-	if _, err := os.Stat(dir); err != nil {
-		return "", fmt.Errorf("update_deployment: deployment %s not found", deploymentID)
+	// Re-specify resources with the user's adjustments, then regenerate the plan.
+	if _, err := p.SpecifyResources(ctx, deploymentID, changeRequest); err != nil {
+		return "", fmt.Errorf("update_deployment: specify_resources: %w", err)
 	}
-
-	// Read existing .tf files.
-	tfFiles, _ := readTFFiles(dir)
-
-	// Backup existing .tf files so we can restore on failure.
-	backup, err := backupTFFiles(dir)
-	if err != nil {
-		return "", fmt.Errorf("update_deployment: backup: %w", err)
-	}
-
-	skillBody := p.loadSkillBody(ctx, "huaweicloud-deploy")
-	agent := openagent.NewAgent("iac-updater",
-		openagent.WithModel(p.model),
-		openagent.WithTools(p.fileTools()...),
-		openagent.WithMemory(p.memory),
-		openagent.WithRunHooks(sloghooks.New(slog.Default())),
-		openagent.WithSystemPrompts(
-			serverContext,
-			skillBody,
-			"You are a HuaweiCloud infrastructure deployment expert. "+
-				"Modify existing terraform configuration files based on the change request. "+
-				"Return the COMPLETE modified files, not just diffs. "+
-				"Return {\"files\": {\"providers.tf\": \"...\", ...}, \"reasoning\": \"...\"}."),
-		openagent.WithMaxTurns(10),
-	)
-
-	// user message = change request + existing .tf files
-	// Use a path relative to workDir so read/grep/ls resolve correctly
-	// and we don't leak the server's absolute path to the LLM.
-	relDir, _ := filepath.Rel(p.workDir, dir)
-	msg := openagent.UserMessage(fmt.Sprintf(
-		"Change request: %s\n\nCurrent .tf files (directory: %s):\n\n%s\n\n"+
-			"Modify the .tf files according to the change request, return the complete files as JSON:\n"+
-			`{"files": {"providers.tf": "...", "variables.tf": "...", "main.tf": "...", "terraform.tfvars": "..."}, "reasoning": "..."}`,
-		changeRequest, relDir, tfFiles))
-
-	session := openagent.Session{ID: sessionID(deploymentID)}
-	var reasoning string
-	for attempt := 0; attempt < 3; attempt++ {
-		result, err := agent.Run(ctx, session, msg)
-		if err != nil {
-			return "", fmt.Errorf("update_deployment: LLM run (attempt %d): %w", attempt+1, err)
-		}
-
-		var llmOutput struct {
-			Questions []string          `json:"questions"`
-			Files     map[string]string `json:"files"`
-			Reasoning string            `json:"reasoning"`
-		}
-		if err := json.Unmarshal([]byte(extractJSON(result.FinalOutput)), &llmOutput); err != nil {
-			return marshalResult(planResult{
-				Status: "need_input",
-				Questions: []string{
-					"Could not parse the change request. Please describe what you want to change.",
-				},
-			})
-		}
-
-		if len(llmOutput.Questions) > 0 {
-			return marshalResult(planResult{
-				Status:    "need_input",
-				Questions: llmOutput.Questions,
-			})
-		}
-
-		if len(llmOutput.Files) == 0 {
-			return marshalResult(planResult{
-				Status: "need_input",
-				Questions: []string{
-					"No terraform files were generated. Please describe what you want to change.",
-				},
-			})
-		}
-
-		reasoning = llmOutput.Reasoning
-
-		// Write modified .tf files (overwrite existing).
-		for name, content := range llmOutput.Files {
-			if strings.ContainsAny(name, `/\`) || strings.Contains(name, "..") {
-				return "", fmt.Errorf("update_deployment: invalid filename %q", name)
-			}
-			if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0644); err != nil {
-				return "", fmt.Errorf("update_deployment: write %s: %w", name, err)
-			}
-		}
-
-		// terraform init + plan.
-		client, err := iac.NewClient(ctx, dir, iac.Config{
-			Env:             p.cloud.Env(),
-			DryRun:          p.dryRun,
-			BinaryMirrors:   p.binaryMirrors,
-			ProviderMirrors: p.providerMirrors,
-		})
-		if err != nil {
-			return "", fmt.Errorf("update_deployment: create terraform client: %w", err)
-		}
-		if err := client.Init(ctx); err != nil {
-			msg = retryMessage(changeRequest, "terraform init", err, p.workDir, dir)
-			continue
-		}
-		plan, err := client.Plan(ctx)
-		if err == nil {
-			return marshalResult(planResult{
-				Status:         "ready",
-				DeploymentID:   deploymentID,
-				Plan:           plan,
-				Recommendation: reasoning,
-			})
-		}
-		msg = retryMessage(changeRequest, "terraform plan", err, p.workDir, dir)
-	}
-
-	// Exhausted retries — restore original .tf files so the deployment
-	// is not left in a broken state.
-	restoreTFFiles(dir, backup)
-	return "", fmt.Errorf("update_deployment: terraform plan failed after 3 attempts (deployment %s, original .tf files restored)", deploymentID)
+	return p.GeneratePlan(ctx, deploymentID)
 }
 
 // retryMessage builds the user message for a plan retry attempt.
@@ -392,6 +493,8 @@ Fix the .tf files and return the corrected versions as JSON:
 // as a fallback for public pricing pages. This MUST be called before
 // apply_deployment so the user sees the cost.
 func (p *Planner) EstimateCost(ctx context.Context, deploymentID string) (string, error) {
+	progress := openagent.ProgressFromContext(ctx)
+
 	dir := filepath.Join(p.deploymentsDir, deploymentID)
 
 	// Check that a plan exists — ShowPlan needs the tfplan file.
@@ -404,6 +507,7 @@ func (p *Planner) EstimateCost(ctx context.Context, deploymentID string) (string
 	}
 
 	// Read the saved plan to get exact resource specs.
+	progress("Reading terraform plan...", 0, 3)
 	client, err := iac.NewClient(ctx, dir, iac.Config{
 		Env:             p.cloud.Env(),
 		DryRun:          p.dryRun,
@@ -435,11 +539,12 @@ func (p *Planner) EstimateCost(ctx context.Context, deploymentID string) (string
 	}
 
 	skillBody := p.loadSkillBody(ctx, "huaweicloud-bss")
+	progress("Loading pricing skill...", 1, 3)
 	agent := openagent.NewAgent("iac-pricing",
 		openagent.WithModel(p.model),
 		openagent.WithTools(p.fileTools()...),
 		openagent.WithMemory(p.memory),
-		openagent.WithRunHooks(sloghooks.New(slog.Default())),
+		openagent.WithRunHooks(sloghooks.New(slog.Default()), newProgressHook()),
 		openagent.WithSystemPrompts(
 			serverContext,
 			skillBody,
@@ -462,6 +567,7 @@ func (p *Planner) EstimateCost(ctx context.Context, deploymentID string) (string
 	}
 
 	session := openagent.Session{ID: sessionID(deploymentID)}
+	progress("Querying cloud pricing...", 2, 3)
 	result, err := agent.Run(ctx, session, openagent.UserMessage(userMsg))
 	if err != nil {
 		return "", fmt.Errorf("estimate_cost: LLM run: %w", err)
@@ -497,6 +603,8 @@ func (p *Planner) EstimateCost(ctx context.Context, deploymentID string) (string
 // The LLM loads the troubleshoot skill, browses examples for correct
 // patterns, and searches the web for error solutions.
 func (p *Planner) Troubleshoot(ctx context.Context, deploymentID, errorMsg string) (string, error) {
+	progress := openagent.ProgressFromContext(ctx)
+
 	dir := filepath.Join(p.deploymentsDir, deploymentID)
 
 	tfFiles, err := readTFFiles(dir)
@@ -505,11 +613,12 @@ func (p *Planner) Troubleshoot(ctx context.Context, deploymentID, errorMsg strin
 	}
 
 	skillBody := p.loadSkillBody(ctx, "huaweicloud-troubleshoot")
+	progress("Loading troubleshoot skill...", 0, 2)
 	agent := openagent.NewAgent("iac-troubleshooter",
 		openagent.WithModel(p.model),
 		openagent.WithTools(p.fileTools()...),
 		openagent.WithMemory(p.memory),
-		openagent.WithRunHooks(sloghooks.New(slog.Default())),
+		openagent.WithRunHooks(sloghooks.New(slog.Default()), newProgressHook()),
 		openagent.WithSystemPrompts(
 			serverContext,
 			skillBody,
@@ -533,6 +642,7 @@ func (p *Planner) Troubleshoot(ctx context.Context, deploymentID, errorMsg strin
 		p.cloud.Name(), errorMsg, relDir, tfFiles)
 
 	session := openagent.Session{ID: sessionID(deploymentID)}
+	progress("Diagnosing error...", 1, 2)
 	result, err := agent.Run(ctx, session, openagent.UserMessage(userMsg))
 	if err != nil {
 		return "", fmt.Errorf("troubleshoot: LLM run: %w", err)
@@ -560,11 +670,14 @@ func (p *Planner) Troubleshoot(ctx context.Context, deploymentID, errorMsg strin
 // loading (WithSkillLoader) — the LLM sees the skill catalog and calls
 // load_skill to load the relevant cloud-service skill on demand.
 func (p *Planner) QueryCloud(ctx context.Context, query string) (string, error) {
+	progress := openagent.ProgressFromContext(ctx)
+
+	progress("Setting up query agent...", 0, 2)
 	agent := openagent.NewAgent("iac-queryer",
 		openagent.WithModel(p.model),
 		openagent.WithTools(p.fileTools()...),
 		openagent.WithMemory(p.memory),
-		openagent.WithRunHooks(sloghooks.New(slog.Default())),
+		openagent.WithRunHooks(sloghooks.New(slog.Default()), newProgressHook()),
 		openagent.WithSkillLoader(p.loader),
 		openagent.WithSystemPrompts(
 			serverContext,
@@ -581,6 +694,7 @@ func (p *Planner) QueryCloud(ctx context.Context, query string) (string, error) 
 	)
 
 	session := openagent.Session{ID: "query"}
+	progress("Querying cloud resources...", 1, 2)
 	result, err := agent.Run(ctx, session, openagent.UserMessage(query))
 	if err != nil {
 		return "", fmt.Errorf("query_cloud: LLM run: %w", err)

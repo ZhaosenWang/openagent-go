@@ -847,7 +847,7 @@ func (r *runner) executeTools(ctx context.Context, session Session, calls []Tool
 					results[i] = Message{
 						Role:       RoleTool,
 						ToolCallID: call.ID,
-						Content:    fmt.Sprintf("this call user rejected this: %s", call.Function.Name, reason),
+						Content:    fmt.Sprintf("this call rejected by user, reason: %s", reason),
 					}
 					continue
 				}

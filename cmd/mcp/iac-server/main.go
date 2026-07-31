@@ -1,4 +1,4 @@
-// iac-server is a cloud IaC MCP server. It exposes 9 tools over
+// iac-server is a cloud IaC MCP server. It exposes 11 tools over
 // MCP stdio so any MCP client (Claude Code, opencode, Cursor, openagent) can
 // plan, update, estimate cost, apply, troubleshoot, and destroy cloud
 // infrastructure, and query existing cloud resources/bills.
