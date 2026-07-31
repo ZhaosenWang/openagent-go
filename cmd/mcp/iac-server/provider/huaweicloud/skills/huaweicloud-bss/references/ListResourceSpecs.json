@@ -1,13 +1,9 @@
 {
-  "id": "1a3bb337ebfd4888b7668a851b678526",
   "name": "ListResourceSpecs",
   "summary": "查询云服务类型资源规格",
   "tags": "管理产品(公共)",
   "productshort": "BSS",
   "region_id": "cn-north-1",
-  "group_id": "be898350f13d4d7e9f421915a6b56e93",
-  "swagger_id": "ebbc342ea88f414baea7a7cb82efcc0b",
-  "online_cli": true,
   "paths": {
     "/v2/products/resource-specs-query": {
       "post": {
@@ -285,22 +281,11 @@
       }
     }
   },
-  "security_definitions": null,
   "version": "2.0",
-  "components": null,
-  "consumes": "[\"application/json;charset=UTF-8\"]",
   "parameters": {},
-  "schemes": [
-    "HTTPS"
-  ],
   "host": "bss.myhuaweicloud.com",
   "base_path": "/",
-  "roma_info": null,
   "info_version": "v2",
-  "is_multiple_version": false,
-  "description": null,
-  "is_support_debug": true,
   "method": "post",
-  "uri": null,
-  "is_support_sdk": null
+  "uri": null
 }

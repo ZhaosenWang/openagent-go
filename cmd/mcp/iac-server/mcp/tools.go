@@ -35,7 +35,7 @@ type Config struct {
 	ProviderMirrors []string // provider download mirrors (URLs or local paths)
 }
 
-// NewTools builds the 8 deployment tools.
+// NewTools builds the 9 tools exposed by iac-server.
 func NewTools(cfg Config) []openagent.Tool {
 	return []openagent.Tool{
 		&planDeploymentTool{cfg: cfg},
@@ -46,6 +46,7 @@ func NewTools(cfg Config) []openagent.Tool {
 		&destroyDeploymentTool{cfg: cfg},
 		&getDeploymentStatusTool{cfg: cfg},
 		&listDeploymentsTool{cfg: cfg},
+		&queryCloudTool{cfg: cfg},
 	}
 }
 
@@ -165,7 +166,7 @@ type estimateCostTool struct{ cfg Config }
 func (t *estimateCostTool) Definition() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
 		Name:        "estimate_cost",
-		Description: "Estimate the monthly cost of a planned deployment by querying official cloud pricing pages. MUST be called after plan_deployment and before apply_deployment so the user sees pricing. Returns a structured cost breakdown.",
+		Description: "Estimate the monthly cost of a PLANNED deployment (resources not yet created). MUST be called after plan_deployment and before apply_deployment. This forecasts future costs based on the terraform plan — it does NOT query past billing. For existing bills/costs, use query_cloud.",
 		Parameters: json.RawMessage(`{
 			"type": "object",
 			"properties": {
@@ -420,6 +421,40 @@ func (t *getDeploymentStatusTool) Execute(ctx context.Context, args json.RawMess
 		return "", fmt.Errorf("get_deployment_status: marshal: %w", err)
 	}
 	return string(result), nil
+}
+
+// ── query_cloud ──
+
+type queryCloudTool struct{ cfg Config }
+
+func (t *queryCloudTool) Definition() openagent.FunctionDefinition {
+	return openagent.FunctionDefinition{
+		Name:        "query_cloud",
+		Description: "Query EXISTING cloud resources, specs, bills, costs, or quotas. Use this for any read-only query about the current cloud account state — e.g. \"list all ECS instances\", \"what specs does s6.large.2 have\", \"how much did I spend this month\", \"show my bills for 2025-07\". This queries real cloud APIs for already-existing resources and past billing data. Does NOT modify any resources. For estimating FUTURE costs of a planned deployment, use estimate_cost.",
+		Parameters: json.RawMessage(`{
+			"type": "object",
+			"properties": {
+				"query": {
+					"type": "string",
+					"description": "Natural language query, e.g. \"list all ECS instances in cn-east-3\" or \"how much did I spend this month\""
+				}
+			},
+			"required": ["query"]
+		}`),
+	}
+}
+
+func (t *queryCloudTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
+	var params struct {
+		Query string `json:"query"`
+	}
+	if err := json.Unmarshal(args, &params); err != nil {
+		return "", fmt.Errorf("query_cloud: %w", err)
+	}
+	if params.Query == "" {
+		return "", fmt.Errorf("query_cloud: query is required")
+	}
+	return t.cfg.Planner.QueryCloud(ctx, params.Query)
 }
 
 // ── list_deployments ──

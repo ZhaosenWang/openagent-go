@@ -1,13 +1,9 @@
 {
-  "id": "739ac996b2294abab303ce1c66816401",
   "name": "ListRenewRateOnPeriod",
   "summary": "查询待续订包年包月资源的续订金额",
   "tags": "购买云服务(公共)",
   "productshort": "BSS",
   "region_id": "cn-north-1",
-  "group_id": "be898350f13d4d7e9f421915a6b56e93",
-  "swagger_id": "ebbc342ea88f414baea7a7cb82efcc0b",
-  "online_cli": true,
   "paths": {
     "/v2/bills/ratings/period-resources/renew-rate": {
       "post": {
@@ -265,22 +261,11 @@
       }
     }
   },
-  "security_definitions": null,
   "version": "2.0",
-  "components": null,
-  "consumes": "[\"application/json;charset=UTF-8\"]",
   "parameters": {},
-  "schemes": [
-    "HTTPS"
-  ],
   "host": "bss.myhuaweicloud.com",
   "base_path": "/",
-  "roma_info": null,
   "info_version": "v2",
-  "is_multiple_version": false,
-  "description": null,
-  "is_support_debug": true,
   "method": "post",
-  "uri": null,
-  "is_support_sdk": null
+  "uri": null
 }

@@ -14,6 +14,7 @@ import (
 	"io/fs"
 	"os"
 
+	openagent "github.com/yusheng-g/openagent-go"
 	"github.com/yusheng-g/openagent-go/cmd/mcp/iac-server/provider"
 )
 
@@ -55,7 +56,7 @@ func (h *HuaweiCloud) Skills() fs.FS { return Skills() }
 // HTTPRequest returns an http_request tool configured with HuaweiCloud
 // credentials from the environment. The tool handles SDK-HMAC-SHA256
 // signing automatically — the LLM never sees AK/SK.
-func (h *HuaweiCloud) HTTPRequest() *HTTPRequest {
+func (h *HuaweiCloud) HTTPRequest() openagent.Tool {
 	return NewHTTPRequest(
 		os.Getenv("HW_ACCESS_KEY"),
 		os.Getenv("HW_SECRET_KEY"),

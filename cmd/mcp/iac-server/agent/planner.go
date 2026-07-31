@@ -15,12 +15,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 
 	openagent "github.com/yusheng-g/openagent-go"
 	"github.com/yusheng-g/openagent-go/cmd/mcp/iac-server/provider"
+	sloghooks "github.com/yusheng-g/openagent-go/hooks/slog"
 	"github.com/yusheng-g/openagent-go/iac"
 	opentool "github.com/yusheng-g/openagent-go/tool"
 )
@@ -75,11 +77,11 @@ type planResult struct {
 // agent. It explains the MCP server's role, the client, the interaction
 // model, and the output contract — without this the LLM doesn't know who
 // it is serving or how its output is consumed.
-const serverContext = `You are the server-side LLM of an MCP server (iac-server) that provides cloud infrastructure deployment capabilities over the MCP protocol.
+const serverContext = `You are the server-side LLM of an MCP server (iac-server) that provides cloud infrastructure deployment and query capabilities over the MCP protocol.
 
 ## Your role
 - You run on the SERVER side. You never talk to the end user directly.
-- The MCP CLIENT (e.g. Claude Code, Cursor, openagent) calls one of the 8 MCP tools (plan_deployment, update_deployment, estimate_cost, apply_deployment, destroy_deployment, get_deployment_status, list_deployments, troubleshoot_deployment) and forwards the user's request to you.
+- The MCP CLIENT (e.g. Claude Code, Cursor, openagent) calls one of the 9 MCP tools (plan_deployment, update_deployment, estimate_cost, apply_deployment, destroy_deployment, get_deployment_status, list_deployments, troubleshoot_deployment, query_cloud) and forwards the user's request to you.
 - Your output is returned to the client as the tool result. The client then decides what to show the user and whether to proceed.
 - You do NOT need user approval for any action — approval is the client's concern, not yours.
 
@@ -99,9 +101,11 @@ Cloud credentials (e.g. HW_ACCESS_KEY, HW_SECRET_KEY, HW_REGION) are injected by
 - read / grep / ls — browse the workspace: skills/ (references, guides) and deployments/ (.tf files)
 - http_request — send authenticated HTTP requests to cloud APIs (signing is automatic, do NOT pass credentials)
 - WebSearch / WebFetch — query official cloud docs and pricing pages
+- load_skill / reload_skills — (query_cloud only) dynamically load cloud-service skills on demand
 
 ## Skills
-The relevant skill guide (SKILL.md) is already loaded into your system prompt — you do not need to call any tool to load it. Use read/grep/ls to browse the skill's references/ directory for detailed examples and API definitions.
+For plan/update/estimate/troubleshoot: the relevant skill guide (SKILL.md) is already loaded into your system prompt — you do not need to call any tool to load it. Use read/grep/ls to browse the skill's references/ directory for detailed examples and API definitions.
+For query_cloud: use the load_skill tool to load the relevant cloud-service skill on demand (the skill catalog is in your system prompt).
 
 ## Output contract
 Return ONLY valid JSON as specified by each tool's instructions. Do not wrap in markdown fences. Do not add conversational text outside the JSON. The server parses your output programmatically — any non-JSON text will cause a parse failure.`
@@ -119,6 +123,7 @@ func (p *Planner) Plan(ctx context.Context, request string) (string, error) {
 		openagent.WithModel(p.model),
 		openagent.WithTools(p.fileTools()...),
 		openagent.WithMemory(p.memory),
+		openagent.WithRunHooks(sloghooks.New(slog.Default())),
 		openagent.WithSystemPrompts(
 			serverContext,
 			skillBody,
@@ -256,6 +261,7 @@ func (p *Planner) UpdateDeployment(ctx context.Context, deploymentID, changeRequ
 		openagent.WithModel(p.model),
 		openagent.WithTools(p.fileTools()...),
 		openagent.WithMemory(p.memory),
+		openagent.WithRunHooks(sloghooks.New(slog.Default())),
 		openagent.WithSystemPrompts(
 			serverContext,
 			skillBody,
@@ -433,6 +439,7 @@ func (p *Planner) EstimateCost(ctx context.Context, deploymentID string) (string
 		openagent.WithModel(p.model),
 		openagent.WithTools(p.fileTools()...),
 		openagent.WithMemory(p.memory),
+		openagent.WithRunHooks(sloghooks.New(slog.Default())),
 		openagent.WithSystemPrompts(
 			serverContext,
 			skillBody,
@@ -502,6 +509,7 @@ func (p *Planner) Troubleshoot(ctx context.Context, deploymentID, errorMsg strin
 		openagent.WithModel(p.model),
 		openagent.WithTools(p.fileTools()...),
 		openagent.WithMemory(p.memory),
+		openagent.WithRunHooks(sloghooks.New(slog.Default())),
 		openagent.WithSystemPrompts(
 			serverContext,
 			skillBody,
@@ -543,6 +551,55 @@ func (p *Planner) Troubleshoot(ctx context.Context, deploymentID, errorMsg strin
 	data, err := json.Marshal(diag)
 	if err != nil {
 		return "", fmt.Errorf("troubleshoot: marshal: %w", err)
+	}
+	return string(data), nil
+}
+
+// QueryCloud answers read-only queries about existing cloud resources, specs,
+// bills, or quotas. Unlike the other 4 agents, this one uses dynamic skill
+// loading (WithSkillLoader) — the LLM sees the skill catalog and calls
+// load_skill to load the relevant cloud-service skill on demand.
+func (p *Planner) QueryCloud(ctx context.Context, query string) (string, error) {
+	agent := openagent.NewAgent("iac-queryer",
+		openagent.WithModel(p.model),
+		openagent.WithTools(p.fileTools()...),
+		openagent.WithMemory(p.memory),
+		openagent.WithRunHooks(sloghooks.New(slog.Default())),
+		openagent.WithSkillLoader(p.loader),
+		openagent.WithSystemPrompts(
+			serverContext,
+			"You are a HuaweiCloud cloud query expert. "+
+				"Use load_skill to load the relevant skill for the cloud service being queried "+
+				"(e.g. load_skill(\"huaweicloud-ecs\") for ECS instances/flavors, "+
+				"load_skill(\"huaweicloud-vpc\") for VPCs/subnets/security groups, "+
+				"load_skill(\"huaweicloud-bss\") for billing/pricing/orders). "+
+				"Then use http_request to call the API with the correct endpoint and parameters. "+
+				"Return {\"results\": [...], \"note\": \"...\"}."),
+		openagent.WithMaxTurns(10),
+	)
+
+	session := openagent.Session{ID: "query"}
+	result, err := agent.Run(ctx, session, openagent.UserMessage(query))
+	if err != nil {
+		return "", fmt.Errorf("query_cloud: LLM run: %w", err)
+	}
+
+	// Parse the LLM output. If it's already valid JSON, pass through.
+	raw := extractJSON(result.FinalOutput)
+	var qc struct {
+		Results []any  `json:"results"`
+		Note    string `json:"note"`
+	}
+	if json.Unmarshal([]byte(raw), &qc) != nil {
+		qc.Note = result.FinalOutput
+	}
+	out := map[string]any{
+		"results": qc.Results,
+		"note":    qc.Note,
+	}
+	data, err := json.Marshal(out)
+	if err != nil {
+		return "", fmt.Errorf("query_cloud: marshal: %w", err)
 	}
 	return string(data), nil
 }

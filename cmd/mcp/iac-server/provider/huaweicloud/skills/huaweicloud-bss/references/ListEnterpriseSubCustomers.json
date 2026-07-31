@@ -1,13 +1,9 @@
 {
-  "id": "091f773a547e4ff1ae79faf31d33f8b7",
   "name": "ListEnterpriseSubCustomers",
   "summary": "查询企业子账号列表",
   "tags": "管理企业多账号(客户)",
   "productshort": "BSS",
   "region_id": "cn-north-1",
-  "group_id": "be898350f13d4d7e9f421915a6b56e93",
-  "swagger_id": "ebbc342ea88f414baea7a7cb82efcc0b",
-  "online_cli": true,
   "paths": {
     "/v2/enterprises/multi-accounts/sub-customers": {
       "get": {
@@ -202,22 +198,11 @@
       }
     }
   },
-  "security_definitions": null,
   "version": "2.0",
-  "components": null,
-  "consumes": "[\"application/json;charset=UTF-8\"]",
   "parameters": {},
-  "schemes": [
-    "HTTPS"
-  ],
   "host": "bss.myhuaweicloud.com",
   "base_path": "/",
-  "roma_info": null,
   "info_version": "v2",
-  "is_multiple_version": false,
-  "description": null,
-  "is_support_debug": true,
   "method": "get",
-  "uri": null,
-  "is_support_sdk": null
+  "uri": null
 }

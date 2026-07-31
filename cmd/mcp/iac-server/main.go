@@ -1,7 +1,7 @@
-// iac-server is a cloud IaC MCP server. It exposes 8 deployment tools over
+// iac-server is a cloud IaC MCP server. It exposes 9 tools over
 // MCP stdio so any MCP client (Claude Code, opencode, Cursor, openagent) can
 // plan, update, estimate cost, apply, troubleshoot, and destroy cloud
-// infrastructure.
+// infrastructure, and query existing cloud resources/bills.
 //
 // Configuration is via environment variables:
 //
@@ -52,6 +52,22 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	// ── Logging ──
+	// Write logs to a file (stderr is captured by the MCP client and only
+	// surfaced on connection failure, so it's not reliable for debugging).
+	iacHome := os.Getenv("IAC_HOME")
+	if iacHome == "" {
+		home, _ := os.UserHomeDir()
+		iacHome = filepath.Join(home, ".openagent", "mcp", "iac-server")
+	}
+	logPath := filepath.Join(iacHome, "iac-server.log")
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		fatal(fmt.Errorf("open log file: %w", err))
+	}
+	defer logFile.Close()
+	slog.SetDefault(slog.New(slog.NewTextHandler(logFile, &slog.HandlerOptions{Level: slog.LevelDebug})))
+
 	// ── Select cloud provider ──
 	cloud, err := selectProvider(os.Getenv("CLOUD"))
 	if err != nil {
@@ -77,11 +93,6 @@ func main() {
 	// read/grep/ls tools operate on the OS filesystem. Extract on every
 	// startup, overwriting existing files so the disk copy always matches
 	// the embedded version.
-	iacHome := os.Getenv("IAC_HOME")
-	if iacHome == "" {
-		home, _ := os.UserHomeDir()
-		iacHome = filepath.Join(home, ".openagent", "mcp", "iac-server")
-	}
 	cloudHome := filepath.Join(iacHome, cloud.Name())
 	skillsDir := filepath.Join(cloudHome, "skills")
 	if err := provider.ExtractSkills(cloud.Skills(), skillsDir); err != nil {
