@@ -5,6 +5,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/yusheng-g/openagent-go/cmd/cli/server"
+	"github.com/yusheng-g/openagent-go/version"
 )
 
 // newCapCmd creates a cobra.Command with capability flags and calls
@@ -122,5 +123,28 @@ func TestParseCapabilities_CaseInsensitive(t *testing.T) {
 	}
 	if !caps.OnApprover() {
 		t.Error("approver=On → should be on")
+	}
+}
+
+// TestRootCmdVersionWired ensures rootCmd.Version mirrors version.Version
+// so cobra's --version path prints the right string.
+func TestRootCmdVersionWired(t *testing.T) {
+	if rootCmd.Version != version.Version {
+		t.Errorf("rootCmd.Version = %q, want %q", rootCmd.Version, version.Version)
+	}
+}
+
+// TestVersionFlagShorthand ensures the -v shorthand and usage text are
+// registered on the root command.
+func TestVersionFlagShorthand(t *testing.T) {
+	f := rootCmd.Flags().Lookup("version")
+	if f == nil {
+		t.Fatal("version flag not registered")
+	}
+	if f.Shorthand != "v" {
+		t.Errorf("version flag shorthand = %q, want %q", f.Shorthand, "v")
+	}
+	if f.Usage != "show version" {
+		t.Errorf("version flag usage = %q, want %q", f.Usage, "show version")
 	}
 }

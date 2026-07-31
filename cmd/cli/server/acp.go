@@ -12,6 +12,7 @@ import (
 	"github.com/yusheng-g/openagent-go/keyring"
 	"github.com/yusheng-g/openagent-go/sandbox/native"
 	"github.com/yusheng-g/openagent-go/summarizer"
+	"github.com/yusheng-g/openagent-go/version"
 
 	wasm "github.com/yusheng-g/openagent-go/plugin/agent/wasm"
 	"github.com/yusheng-g/openagent-go/plugin/wasmhost"
@@ -81,6 +82,8 @@ func RunACP(ctx context.Context, cfg *config.Config, caps Capabilities) error {
 		serverMem = nil
 	}
 	srv := acp.NewAgentServer(agent, serverMem, sessionStore, modelMap)
+	srv.AgentName = version.Name
+	srv.AgentVersion = version.Version
 	srv.MCPEnabled = caps.OnMCP()
 	srv.ProfileResolver = func(cwd string) []string {
 		return resolveProfiles(cfg.Profiles, cwd)
@@ -121,7 +124,7 @@ func RunACP(ctx context.Context, cfg *config.Config, caps Capabilities) error {
 		}
 		return buildTools(sb, cwd, []string{"shell", "read", "write", "ls", "grep", "websearch", "webfetch"})
 	}
-	server := openacpsdk.NewServer("openagent-acp", "1.0.0", srv)
+	server := openacpsdk.NewServer(version.Name, version.Version, srv)
 	server.SetLogger(slog.Default())
 
 	// Channel agent: clone the template and inject a default Model + Tools

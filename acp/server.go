@@ -65,6 +65,13 @@ type AgentServer struct {
 	// session cwd. If nil, only plan + MCP + client-RPC tools are used.
 	ToolFactory func(cwd string) []openagent.Tool
 
+	// AgentName and AgentVersion are reported to peers in ACP initialize
+	// (agentInfo) and MCP client identity. They are populated by the
+	// assembly layer from the version package; left empty they yield an
+	// empty reported identity (a wiring signal, not a fatal error).
+	AgentName    string
+	AgentVersion string
+
 	// MCPEnabled controls whether client-advertised MCP servers are
 	// connected on session create/load/resume. Default true (enabled in
 	// NewAgentServer); set false to disable MCP tool integration.
@@ -489,7 +496,7 @@ func (s *AgentServer) connectMCP(ctx context.Context, servers []openacp.McpServe
 	if !s.MCPEnabled {
 		return nil, nil
 	}
-	client := mcp.NewClient("openagent-acp", "1.0.0")
+	client := mcp.NewClient(s.AgentName, s.AgentVersion)
 	var sessions []*mcp.Session
 	var tools []openagent.Tool
 	for _, cfg := range servers {
@@ -591,8 +598,8 @@ func (s *AgentServer) OnInitialize(ctx context.Context, req openacp.InitializeRe
 		ProtocolVersion:   1,
 		AgentCapabilities: caps,
 		AgentInfo: &openacp.Implementation{
-			Name:    "openagent-acp",
-			Version: "1.0.0",
+			Name:    s.AgentName,
+			Version: s.AgentVersion,
 		},
 	}, nil
 }
