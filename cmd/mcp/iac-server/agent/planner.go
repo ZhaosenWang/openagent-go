@@ -99,7 +99,7 @@ Cloud credentials (e.g. HW_ACCESS_KEY, HW_SECRET_KEY, HW_REGION) are injected by
 
 ## Tools
 - read / grep / ls — browse the workspace: skills/ (references, guides) and deployments/ (.tf files)
-- http_request — send authenticated HTTP requests to cloud APIs (signing is automatic, do NOT pass credentials)
+- http_request — send authenticated HTTP requests to cloud APIs (signing is automatic, do NOT pass credentials). Use ONLY for read-only queries (List/Show/Get APIs). NEVER call Create/Update/Delete/Post/Put APIs to create or modify cloud resources directly — resource provisioning is done through terraform (plan_deployment → apply_deployment), not through API calls.
 - WebSearch / WebFetch — query official cloud docs and pricing pages
 - load_skill / reload_skills — (query_cloud only) dynamically load cloud-service skills on demand
 
@@ -574,6 +574,8 @@ func (p *Planner) QueryCloud(ctx context.Context, query string) (string, error) 
 				"load_skill(\"huaweicloud-vpc\") for VPCs/subnets/security groups, "+
 				"load_skill(\"huaweicloud-bss\") for billing/pricing/orders). "+
 				"Then use http_request to call the API with the correct endpoint and parameters. "+
+				"CRITICAL: Only call read-only APIs (List/Show/Get). NEVER call Create/Update/Delete APIs — "+
+				"this tool is for querying existing resources only, not for creating or modifying them. "+
 				"Return {\"results\": [...], \"note\": \"...\"}."),
 		openagent.WithMaxTurns(10),
 	)
