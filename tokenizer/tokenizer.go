@@ -10,6 +10,7 @@
 package tokenizer
 
 import (
+	"log/slog"
 	"sync"
 
 	"github.com/pkoukk/tiktoken-go"
@@ -43,12 +44,24 @@ func ForModel(modelID string) *tiktoken.Tiktoken {
 	tke, err := tiktoken.EncodingForModel(modelID)
 	if err != nil {
 		// Unknown model — fall back to cl100k_base (reasonable for most
-		// modern models that use a GPT-4-like tokenizer).
+		// modern models that use a GPT-4-like tokenizer). All unknown
+		// models share ONE cl100k instance (cached under a canonical key)
+		// instead of one duplicate encoding per model name; the original
+		// key still points at the same instance for the fast path.
+		key := modelID
+		modelID = "cl100k_base"
 		tke, err = tiktoken.GetEncoding(tiktoken.MODEL_CL100K_BASE)
 		if err != nil {
 			// Absolute last resort: o200k_base is always available.
-			tke, _ = tiktoken.GetEncoding(tiktoken.MODEL_O200K_BASE)
+			tke, err = tiktoken.GetEncoding(tiktoken.MODEL_O200K_BASE)
+			modelID = "o200k_base"
+			if err != nil {
+				slog.Warn("openagent: tokenizer unavailable", "error", err)
+				cache[key] = nil
+				return nil
+			}
 		}
+		cache[key] = tke
 	}
 
 	cache[modelID] = tke
@@ -66,18 +79,20 @@ func Count(modelID, text string) (n int) {
 		return 0
 	}
 
-	// Panic recovery: tiktoken panics on nil encoder, and encoder loading
-	// fails when the network is unavailable. Fall back to heuristic.
-	defer func() {
-		if r := recover(); r != nil {
-			n = heuristicCount(text)
-		}
-	}()
-
 	tke := ForModel(modelID)
 	if tke == nil {
 		return heuristicCount(text)
 	}
+
+	// Recover around the encode call only: a tiktoken panic (nil encoder,
+	// malformed input) falls back to the heuristic — without swallowing
+	// unrelated panics from other code.
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Warn("openagent: tiktoken encode panicked, using heuristic", "model", modelID, "panic", r)
+			n = heuristicCount(text)
+		}
+	}()
 	return len(tke.EncodeOrdinary(text))
 }
 

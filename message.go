@@ -21,8 +21,9 @@ type Message struct {
 	Name             string        `json:"name,omitempty"`
 	ToolCalls        []ToolCall    `json:"tool_calls,omitempty"`
 	ToolCallID       string        `json:"tool_call_id,omitempty"`
-	Transient        bool          `json:"-"`               // internal-only routing (handoffs)
-	Index            int64         `json:"index,omitempty"` // global insertion order (0 if backend doesn't track)
+	Result           *ToolResult   `json:"result,omitempty"` // structured tool outcome (RoleTool messages); Content stays the display text
+	Transient        bool          `json:"-"`                // internal-only routing (handoffs)
+	Index            int64         `json:"index,omitempty"`  // global insertion order (0 if backend doesn't track)
 }
 
 // IsMultimodal returns true if this message carries multimodal content parts.
@@ -31,7 +32,7 @@ func (m Message) IsMultimodal() bool { return len(m.ContentParts) > 0 }
 // ContentPart represents one part of a multimodal message content.
 // Follows OpenAI content part format.
 type ContentPart struct {
-	Type       string      `json:"type"`                   // "text", "image_url", "input_audio"
+	Type       string      `json:"type"` // "text", "image_url", "input_audio"
 	Text       string      `json:"text,omitempty"`
 	ImageURL   *ImageURL   `json:"image_url,omitempty"`
 	InputAudio *InputAudio `json:"input_audio,omitempty"`

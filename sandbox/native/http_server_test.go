@@ -79,7 +79,7 @@ func TestShellPythonHTTPServer(t *testing.T) {
 	// Go process exit. With *os.File direct assignment, the child's fd
 	// is the same file opened independently, so this doesn't break.
 	t.Log("Simulating Go process exit (close our file handles)...")
-	proc.Close()    // close our fds to simulate Go process exit
+	proc.Close() // close our fds to simulate Go process exit
 	pm.Remove(proc.ID)
 
 	// Now the server is orphaned with stderr going directly to a file.

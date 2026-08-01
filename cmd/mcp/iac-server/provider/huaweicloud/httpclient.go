@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -40,7 +41,17 @@ type HTTPRequest struct {
 // NewHTTPRequest creates an HTTPRequest tool with the given credentials.
 // Credentials are read from the environment at construction time (by the
 // caller, typically HuaweiCloud.HTTPRequest()) and never exposed to the LLM.
+//
+// SSRF defense (the LLM's input originates from user natural language and
+// is prompt-injectable — a crafted URL could reach 169.254.169.254 cloud
+// metadata, localhost, or private networks, and the response would flow
+// back into the model context). Four layers, mirroring utils/webhttp:
+//  1. ValidateRequestURL at Execute entry (scheme/host/userinfo policy)
+//  2. ResolveAndCheck on the parsed host (every resolved IP must be public)
+//  3. DialContext re-validates the dial-time IP (defeats DNS rebinding)
+//  4. Redirects disabled entirely — a signed BSS request must never hop.
 func NewHTTPRequest(ak, sk, securityToken string) *HTTPRequest {
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
 	return &HTTPRequest{
 		ak:            ak,
 		sk:            sk,
@@ -55,6 +66,21 @@ func NewHTTPRequest(ak, sk, securityToken string) *HTTPRequest {
 			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
+			Transport: &http.Transport{
+				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+					// Re-validate the address actually being dialed — the
+					// DNS-rebinding defense (validation-time lookup can see a
+					// public IP while the dial-time lookup returns metadata).
+					host, _, err := net.SplitHostPort(addr)
+					if err != nil {
+						host = addr
+					}
+					if err := utils.ResolveAndCheck(host); err != nil {
+						return nil, err
+					}
+					return dialer.DialContext(ctx, network, addr)
+				},
+			},
 		},
 	}
 }
@@ -67,50 +93,38 @@ func (t *HTTPRequest) Definition() openagent.FunctionDefinition {
 			"SDK-HMAC-SHA256 authentication is handled automatically — do NOT pass credentials. " +
 			"Returns {status, headers, body} as JSON. " +
 			"Use this to call BSS pricing APIs and other HuaweiCloud service APIs.",
-		Parameters: json.RawMessage(`{
-			"type": "object",
-			"properties": {
-				"method":  {"type": "string", "description": "HTTP method: GET, POST, PUT, DELETE, etc."},
-				"url":     {"type": "string", "description": "Full URL, e.g. https://bss.myhuaweicloud.com/v2/bills/ratings/on-demand-resources"},
-				"headers": {"type": "object", "description": "Optional extra headers (e.g. Content-Type). Do NOT pass Authorization or x-sdk-date — they are auto-signed.", "additionalProperties": {"type": "string"}},
-				"body":    {"type": "string", "description": "Optional request body (e.g. JSON string for POST requests)"},
-				"timeout": {"type": "integer", "description": "Request timeout in seconds (default: 30, min: 1, max: 120)", "default": 30, "minimum": 1, "maximum": 120}
-			},
-			"required": ["method", "url"]
-		}`),
+		Parameters: openagent.SchemaOf[HwParams](),
 	}
 }
 
-// CanSelfApprove returns true — server-side execution needs no approval.
-func (t *HTTPRequest) CanSelfApprove(_ json.RawMessage) bool { return true }
-
 // Execute sends the HTTP request with automatic signing and returns the response.
-func (t *HTTPRequest) Execute(ctx context.Context, args json.RawMessage) (string, error) {
-	var params struct {
-		Method  string            `json:"method"`
-		URL     string            `json:"url"`
-		Headers map[string]string `json:"headers"`
-		Body    string            `json:"body"`
-		Timeout int               `json:"timeout"`
-	}
-	if err := json.Unmarshal(args, &params); err != nil {
-		return "", fmt.Errorf("http_request: %w", err)
-	}
-	if params.URL == "" {
-		return "", fmt.Errorf("http_request: url is required")
+func (t *HTTPRequest) Execute(ctx context.Context, args json.RawMessage) *openagent.ToolResult {
+	params, err := openagent.ParseArgs[HwParams](args)
+	if err != nil {
+		return openagent.ErrorResult(fmt.Errorf("http_request: %w", err), false, "")
 	}
 	if t.ak == "" || t.sk == "" {
-		return "", fmt.Errorf("http_request: credentials not configured — set HW_ACCESS_KEY and HW_SECRET_KEY")
+		return openagent.ErrorResult(fmt.Errorf("http_request: credentials not configured — set HW_ACCESS_KEY and HW_SECRET_KEY"), false, "")
 	}
 	method := strings.ToUpper(params.Method)
 	if method == "" {
 		method = "GET"
 	}
 
+	// SSRF entry checks: URL policy (scheme/host/userinfo) + every resolved
+	// IP must be public. The DialContext in NewHTTPRequest re-validates at
+	// dial time (DNS-rebinding defense).
+	if _, err := utils.ValidateRequestURL(params.URL); err != nil {
+		return openagent.ErrorResult(fmt.Errorf("http_request: url rejected: %w", err), false, "")
+	}
+
 	// Parse the URL into endpoint, path, and query for signing.
 	parsed, err := url.Parse(params.URL)
 	if err != nil {
-		return "", fmt.Errorf("http_request: parse url: %w", err)
+		return openagent.ErrorResult(fmt.Errorf("http_request: parse url: %w", err), false, "")
+	}
+	if err := utils.ResolveAndCheck(parsed.Hostname()); err != nil {
+		return openagent.ErrorResult(fmt.Errorf("http_request: %w", err), false, "")
 	}
 
 	// Build query map for signing (first value of each key).
@@ -154,7 +168,7 @@ func (t *HTTPRequest) Execute(ctx context.Context, args json.RawMessage) (string
 	}
 	req, err := http.NewRequestWithContext(ctx, method, params.URL, bodyReader)
 	if err != nil {
-		return "", fmt.Errorf("http_request: create request: %w", err)
+		return openagent.ErrorResult(fmt.Errorf("http_request: create request: %w", err), false, "")
 	}
 
 	// Apply signed headers.
@@ -186,14 +200,14 @@ func (t *HTTPRequest) Execute(ctx context.Context, args json.RawMessage) (string
 	// Send.
 	resp, err := t.client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("http_request: %w", err)
+		return openagent.ErrorResult(fmt.Errorf("http_request: %w", err), false, "")
 	}
 	defer utils.DrainAndClose(resp.Body)
 
 	// Read response body (bounded to a generous limit for safety).
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 5*1024*1024+1))
 	if err != nil {
-		return "", fmt.Errorf("http_request: read response: %w", err)
+		return openagent.ErrorResult(fmt.Errorf("http_request: read response: %w", err), false, "")
 	}
 
 	// Collect response headers.
@@ -231,7 +245,17 @@ func (t *HTTPRequest) Execute(ctx context.Context, args json.RawMessage) (string
 
 	data, err := json.Marshal(result)
 	if err != nil {
-		return "", fmt.Errorf("http_request: marshal result: %w", err)
+		return openagent.ErrorResult(fmt.Errorf("http_request: marshal result: %w", err), false, "")
 	}
-	return string(data), nil
+	return &openagent.ToolResult{Content: string(data)}
+}
+
+// HwParams are the arguments to http_request. URL is required; method
+// defaults to GET.
+type HwParams struct {
+	Method  string            `json:"method,omitempty" jsonschema:"description=HTTP method (default: GET)"`
+	URL     string            `json:"url" jsonschema:"description=Full URL, e.g. https://bss.myhuaweicloud.com/v2/bills/ratings/on-demand-resources"`
+	Headers map[string]string `json:"headers,omitempty" jsonschema:"description=Optional extra headers (e.g. Content-Type). Do NOT pass Authorization or x-sdk-date — they are auto-signed."`
+	Body    string            `json:"body,omitempty" jsonschema:"description=Optional request body (e.g. JSON string for POST requests)"`
+	Timeout int               `json:"timeout,omitempty" jsonschema:"description=Request timeout in seconds (default: 30, min: 1, max: 120)"`
 }

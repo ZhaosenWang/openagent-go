@@ -97,7 +97,7 @@ func BuildCard(c *channel.Card) (string, error) {
 // bar expands the content.
 func panel(title string, elements []map[string]any) map[string]any {
 	return map[string]any{
-		"tag":     "collapsible_panel",
+		"tag":      "collapsible_panel",
 		"expanded": false,
 		"header": map[string]any{
 			"title": map[string]any{
@@ -173,8 +173,8 @@ func panelPreview(body map[string]any) string {
 		if line == "" || line == "```" || strings.HasPrefix(line, "```") {
 			continue
 		}
-		if len(line) > 80 {
-			line = line[:80] + "…"
+		if runes := []rune(line); len(runes) > 80 {
+			line = string(runes[:80]) + "…"
 		}
 		return line
 	}
@@ -227,8 +227,11 @@ func BuildToolCallCard(toolName, params, result string) (string, error) {
 }
 
 func truncateForCard(s string, n int) string {
-	if len(s) <= n {
+	// Truncate by rune: byte-slicing cuts multi-byte UTF-8 in half
+	// (Chinese is 3 bytes per rune), producing invalid UTF-8 in the card.
+	runes := []rune(s)
+	if len(runes) <= n {
 		return s
 	}
-	return s[:n] + "..."
+	return string(runes[:n]) + "..."
 }

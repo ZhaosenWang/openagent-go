@@ -172,9 +172,9 @@ type mux struct {
 
 	// Single-writer transport.
 	queue       *writeQueue
-	writeDone   chan struct{}    // closed when writerLoop exits
-	writeErr    error            // first write error; set once via closeMu
-	closeMu     sync.Mutex       // guards writeErr (set-once)
+	writeDone   chan struct{}      // closed when writerLoop exits
+	writeErr    error              // first write error; set once via closeMu
+	closeMu     sync.Mutex         // guards writeErr (set-once)
 	cancelWrite context.CancelFunc // cancels serve ctx on transport failure
 
 	// Prompt cancellation: client sends $/cancel_request with the

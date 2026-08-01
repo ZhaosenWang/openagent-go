@@ -2,9 +2,12 @@ package rest
 
 import (
 	"context"
+	"log/slog"
 	"sort"
 
 	openagent "github.com/yusheng-g/openagent-go"
+	ctxpkg "github.com/yusheng-g/openagent-go/context"
+	"github.com/yusheng-g/openagent-go/session"
 )
 
 // teamAgentMemory splits persistence across agent-private and team-shared
@@ -14,20 +17,31 @@ import (
 // Private: keyed by sessionID + "::" + agentName
 // Shared:  keyed by sessionID (the team session)
 //
-// All methods are safe for concurrent use — the underlying Memory
-// implementations (SQLite WAL, file RWMutex) handle that.
+// All methods are safe for concurrent use — the underlying stores handle
+// that. P2: implements session.SessionStore + session.Compressor +
+// provider/memory.MemoryProvider (compressor/provider operate on shared).
 type teamAgentMemory struct {
 	agentName string
-	shared    openagent.Memory
-	private   openagent.Memory // same underlying store, different key prefix
+	shared    session.SessionStore
+	private   session.SessionStore // same underlying store, different key prefix
+
+	compressor session.Compressor // optional (asserted from shared)
+	provider   ctxpkg.MemoryProvider
 }
 
-func newTeamAgentMemory(agentName string, shared openagent.Memory) *teamAgentMemory {
-	return &teamAgentMemory{
+func newTeamAgentMemory(agentName string, shared session.SessionStore) *teamAgentMemory {
+	t := &teamAgentMemory{
 		agentName: agentName,
 		shared:    shared,
 		private:   shared, // same store; private ops use prefixed sessionID
 	}
+	if c, ok := shared.(session.Compressor); ok {
+		t.compressor = c
+	}
+	if p, ok := shared.(ctxpkg.MemoryProvider); ok {
+		t.provider = p
+	}
+	return t
 }
 
 // privateKey returns the agent-scoped session key.
@@ -35,7 +49,7 @@ func (m *teamAgentMemory) privateKey(sessionID string) string {
 	return sessionID + "::" + m.agentName
 }
 
-// ── openagent.Memory interface ──
+// ── session.SessionStore ──
 
 func (m *teamAgentMemory) Append(ctx context.Context, sessionID string, msg openagent.Message) error {
 	// Tool results and assistant messages that carry tool_calls are
@@ -52,24 +66,26 @@ func (m *teamAgentMemory) Append(ctx context.Context, sessionID string, msg open
 }
 
 func (m *teamAgentMemory) Recent(ctx context.Context, sessionID string, n int, offset int) ([]openagent.Message, error) {
-	shared, _ := m.shared.Recent(ctx, sessionID, n, offset)
-	priv, _ := m.private.Recent(ctx, m.privateKey(sessionID), n, offset)
+	shared, err := m.shared.Recent(ctx, sessionID, n, offset)
+	if err != nil {
+		slog.Warn("openagent: shared memory read failed", "session", sessionID, "error", err)
+	}
+	priv, err := m.private.Recent(ctx, m.privateKey(sessionID), n, offset)
+	if err != nil {
+		slog.Warn("openagent: private memory read failed", "session", sessionID, "error", err)
+	}
 
 	// Concatenate: shared (narrative) first, then private (own work).
 	// This gives the agent: "here's the conversation so far, and here's
 	// what you did last time." The runner's prefix (tr.runMessages)
-	// provides exact chronological ordering within the current run.
-	result := make([]openagent.Message, 0, len(shared)+len(priv))
-	result = append(result, shared...)
-	result = append(result, priv...)
-	if len(result) > n {
-		result = result[len(result)-n:]
-	}
-	return result, nil
+	// supplies the rest of the conversation.
+	out := make([]openagent.Message, 0, len(shared)+len(priv))
+	out = append(out, shared...)
+	out = append(out, priv...)
+	return out, nil
 }
 
-// PrivateRecent returns only the agent-private messages (tool calls, tool results).
-// Used by the message history endpoint to aggregate across all agents.
+// PrivateRecent returns only the agent-private messages.
 func (m *teamAgentMemory) PrivateRecent(ctx context.Context, sessionID string, n int, offset int) ([]openagent.Message, error) {
 	return m.private.Recent(ctx, m.privateKey(sessionID), n, offset)
 }
@@ -80,42 +96,59 @@ func (m *teamAgentMemory) Count(ctx context.Context, sessionID string) (int, err
 	return sharedN + privN, nil
 }
 
-func (m *teamAgentMemory) Compact(ctx context.Context, sessionID string, throughIndex int, messages []openagent.Message) error {
-	// Compaction targets the shared narrative — private memory is small.
-	return m.shared.Compact(ctx, sessionID, throughIndex, messages)
-}
-
-func (m *teamAgentMemory) Compressed(ctx context.Context, sessionID string) (*openagent.CompressedContext, error) {
-	return m.shared.Compressed(ctx, sessionID)
-}
-
-func (m *teamAgentMemory) Search(ctx context.Context, sessionID, query string, limit int) ([]openagent.SearchResult, error) {
-	sharedResults, _ := m.shared.Search(ctx, sessionID, query, limit)
-	privResults, _ := m.private.Search(ctx, m.privateKey(sessionID), query, limit)
-
-	if len(sharedResults)+len(privResults) == 0 {
-		return nil, nil
-	}
-
-	// Merge and sort by score descending.
-	all := make([]openagent.SearchResult, 0, len(sharedResults)+len(privResults))
-	all = append(all, sharedResults...)
-	all = append(all, privResults...)
-	sort.Slice(all, func(i, j int) bool {
-		return all[i].Score > all[j].Score
-	})
-	if len(all) > limit {
-		all = all[:limit]
-	}
-	return all, nil
-}
-
 func (m *teamAgentMemory) DeleteSession(ctx context.Context, sessionID string) error {
-	// Delete agent-private data. Shared data is deleted by the handler.
 	return m.private.DeleteSession(ctx, m.privateKey(sessionID))
 }
 
-func (m *teamAgentMemory) Close() error {
-	// The shared Memory is owned by the handler — don't close it here.
-	return nil
+// ── session.Compressor (shared only) ──
+
+func (m *teamAgentMemory) Compact(ctx context.Context, sessionID string, throughIndex int, messages []openagent.Message) error {
+	if m.compressor == nil {
+		return nil
+	}
+	return m.compressor.Compact(ctx, sessionID, throughIndex, messages)
+}
+
+func (m *teamAgentMemory) Compressed(ctx context.Context, sessionID string) (*openagent.CompressedContext, error) {
+	if m.compressor == nil {
+		return nil, nil
+	}
+	return m.compressor.Compressed(ctx, sessionID)
+}
+
+// ── provider/memory.MemoryProvider (shared knowledge) ──
+
+func (m *teamAgentMemory) Recall(ctx context.Context, scope ctxpkg.ContextScope, query string, limit int) ([]ctxpkg.MemoryEntry, error) {
+	if m.provider == nil {
+		return nil, nil
+	}
+	// Merge shared + private conversation recall (both keyed scopes).
+	sharedScope := scope
+	sharedScope.SessionID = scope.SessionID
+	entries, err := m.provider.Recall(ctx, sharedScope, query, limit)
+	if err != nil {
+		return nil, err
+	}
+	privScope := scope
+	privScope.SessionID = m.privateKey(scope.SessionID)
+	priv, err := m.provider.Recall(ctx, privScope, query, limit)
+	if err != nil {
+		// Partial results: shared entries only, but the failure must not
+		// stay silent.
+		slog.Warn("openagent: private knowledge recall failed", "session", scope.SessionID, "error", err)
+		return entries, nil
+	}
+	entries = append(entries, priv...)
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Score > entries[j].Score })
+	if len(entries) > limit {
+		entries = entries[:limit]
+	}
+	return entries, nil
+}
+
+func (m *teamAgentMemory) Store(ctx context.Context, scope ctxpkg.ContextScope, item ctxpkg.MemoryItem) error {
+	if m.provider == nil {
+		return nil
+	}
+	return m.provider.Store(ctx, scope, item)
 }

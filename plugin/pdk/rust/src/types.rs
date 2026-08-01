@@ -157,38 +157,6 @@ pub struct CommandInput {
     pub flags: serde_json::Value,
 }
 
-// ── Session lifecycle (agent:sessions plugins) ──
-
-/// Input passed to agent:sessions plugin's session_init/destroy exports.
-/// Matches plugin/agent/wasm/abi.go SessionCtx.
-#[derive(Deserialize, Default)]
-pub struct SessionCtx {
-    #[serde(default)]
-    pub session_id: alloc::string::String,
-    #[serde(default)]
-    pub user_id: alloc::string::String,
-}
-
-/// Output from agent:sessions plugin's session_init export.
-/// Matches plugin/agent/wasm/abi.go SessionConfig.
-#[derive(Serialize, Default)]
-pub struct SessionConfig {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub system_prompts: alloc::vec::Vec<alloc::string::String>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub description: alloc::string::String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tools: alloc::vec::Vec<alloc::string::String>,
-    #[serde(default)]
-    pub max_turns: u32,
-    #[serde(default)]
-    pub max_working_tokens: u32,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub skill_dir: alloc::string::String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub memory_path: alloc::string::String,
-}
-
 // ── Tool input/output (agent:tools plugins) ──
 
 /// Input passed to tool plugin's execute() export.

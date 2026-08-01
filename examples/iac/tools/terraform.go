@@ -46,22 +46,13 @@ func (t *TerraformTool) ensureTF() error {
 
 // ── Self-approval ──
 
-func (t *TerraformTool) CanSelfApprove(name string, _ json.RawMessage) bool {
-	switch name {
-	case "terraform_init", "terraform_plan", "terraform_output":
-		return true
-	default:
-		return false
-	}
-}
-
 // ── Tool: terraform_init ──
 
 func (t *TerraformTool) terraformInitDef() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
 		Name:        "terraform_init",
 		Description: "Initialize a Terraform working directory. Downloads providers and modules. Run this before any other terraform commands.",
-		Parameters:  json.RawMessage(`{"type":"object","properties":{},"required":[]}`),
+		Parameters:  openagent.SchemaOf[struct{}](),
 	}
 }
 
@@ -84,7 +75,7 @@ func (t *TerraformTool) terraformOutputDef() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
 		Name:        "terraform_output",
 		Description: "Get outputs from the applied Terraform state (e.g., public IPs, connection strings).",
-		Parameters:  json.RawMessage(`{"type":"object","properties":{},"required":[]}`),
+		Parameters:  openagent.SchemaOf[struct{}](),
 	}
 }
 
@@ -107,9 +98,9 @@ func (t *TerraformTool) terraformOutput(ctx context.Context) (string, error) {
 
 func (t *TerraformTool) terraformPlanDef() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
-		Name: "terraform_plan",
+		Name:        "terraform_plan",
 		Description: "Generate a Terraform execution plan. Shows what resources will be created, modified, or destroyed. Safe to run — no changes are applied.",
-		Parameters: json.RawMessage(`{"type":"object","properties":{},"required":[]}`),
+		Parameters:  openagent.SchemaOf[Tf1Params](),
 	}
 }
 
@@ -149,9 +140,9 @@ func (t *TerraformTool) terraformPlan(ctx context.Context) (string, error) {
 
 func (t *TerraformTool) terraformApplyDef() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
-		Name: "terraform_apply",
+		Name:        "terraform_apply",
 		Description: "Apply the Terraform execution plan. This CREATES or MODIFIES real cloud resources. Requires approval. Use only after reviewing terraform_plan output.",
-		Parameters: json.RawMessage(`{"type":"object","properties":{},"required":[]}`),
+		Parameters:  openagent.SchemaOf[Tf2Params](),
 	}
 }
 
@@ -174,7 +165,7 @@ func (t *TerraformTool) terraformDestroyDef() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
 		Name:        "terraform_destroy",
 		Description: "Destroy all resources managed by this Terraform configuration. DESTRUCTIVE — requires approval.",
-		Parameters:  json.RawMessage(`{"type":"object","properties":{},"required":[]}`),
+		Parameters:  openagent.SchemaOf[struct{}](),
 	}
 }
 
@@ -205,28 +196,60 @@ func (t *TerraformTool) AsTools() []openagent.Tool {
 
 type tfInitTool struct{ tf *TerraformTool }
 
-func (tt *tfInitTool) Definition() openagent.FunctionDefinition          { return tt.tf.terraformInitDef() }
-func (tt *tfInitTool) Execute(ctx context.Context, _ json.RawMessage) (string, error) { return tt.tf.terraformInit(ctx) }
+func (tt *tfInitTool) Definition() openagent.FunctionDefinition { return tt.tf.terraformInitDef() }
+func (tt *tfInitTool) Execute(ctx context.Context, _ json.RawMessage) *openagent.ToolResult {
+	out, err := tt.tf.terraformInit(ctx)
+	if err != nil {
+		return openagent.ErrorResult(err, false, "")
+	}
+	return &openagent.ToolResult{Content: out}
+}
 
 type tfPlanTool struct{ tf *TerraformTool }
 
-func (tt *tfPlanTool) Definition() openagent.FunctionDefinition          { return tt.tf.terraformPlanDef() }
-func (tt *tfPlanTool) Execute(ctx context.Context, _ json.RawMessage) (string, error) { return tt.tf.terraformPlan(ctx) }
+func (tt *tfPlanTool) Definition() openagent.FunctionDefinition { return tt.tf.terraformPlanDef() }
+func (tt *tfPlanTool) Execute(ctx context.Context, _ json.RawMessage) *openagent.ToolResult {
+	out, err := tt.tf.terraformPlan(ctx)
+	if err != nil {
+		return openagent.ErrorResult(err, false, "")
+	}
+	return &openagent.ToolResult{Content: out}
+}
 
 type tfApplyTool struct{ tf *TerraformTool }
 
-func (tt *tfApplyTool) Definition() openagent.FunctionDefinition          { return tt.tf.terraformApplyDef() }
-func (tt *tfApplyTool) Execute(ctx context.Context, _ json.RawMessage) (string, error) { return tt.tf.terraformApply(ctx) }
+func (tt *tfApplyTool) Definition() openagent.FunctionDefinition { return tt.tf.terraformApplyDef() }
+func (tt *tfApplyTool) Execute(ctx context.Context, _ json.RawMessage) *openagent.ToolResult {
+	out, err := tt.tf.terraformApply(ctx)
+	if err != nil {
+		return openagent.ErrorResult(err, false, "")
+	}
+	return &openagent.ToolResult{Content: out}
+}
 
 type tfOutputTool struct{ tf *TerraformTool }
 
-func (tt *tfOutputTool) Definition() openagent.FunctionDefinition          { return tt.tf.terraformOutputDef() }
-func (tt *tfOutputTool) Execute(ctx context.Context, _ json.RawMessage) (string, error) { return tt.tf.terraformOutput(ctx) }
+func (tt *tfOutputTool) Definition() openagent.FunctionDefinition { return tt.tf.terraformOutputDef() }
+func (tt *tfOutputTool) Execute(ctx context.Context, _ json.RawMessage) *openagent.ToolResult {
+	out, err := tt.tf.terraformOutput(ctx)
+	if err != nil {
+		return openagent.ErrorResult(err, false, "")
+	}
+	return &openagent.ToolResult{Content: out}
+}
 
 type tfDestroyTool struct{ tf *TerraformTool }
 
-func (tt *tfDestroyTool) Definition() openagent.FunctionDefinition          { return tt.tf.terraformDestroyDef() }
-func (tt *tfDestroyTool) Execute(ctx context.Context, _ json.RawMessage) (string, error) { return tt.tf.terraformDestroy(ctx) }
+func (tt *tfDestroyTool) Definition() openagent.FunctionDefinition {
+	return tt.tf.terraformDestroyDef()
+}
+func (tt *tfDestroyTool) Execute(ctx context.Context, _ json.RawMessage) *openagent.ToolResult {
+	out, err := tt.tf.terraformDestroy(ctx)
+	if err != nil {
+		return openagent.ErrorResult(err, false, "")
+	}
+	return &openagent.ToolResult{Content: out}
+}
 
 // ── Structured plan formatting ──
 
@@ -326,3 +349,8 @@ var (
 	OBSTemplate      []byte
 	CDNTemplate      []byte
 )
+
+type Tf1Params struct {
+}
+
+type Tf2Params struct{}

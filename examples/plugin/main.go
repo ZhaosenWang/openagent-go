@@ -18,6 +18,8 @@ import (
 	"time"
 
 	openagent "github.com/yusheng-g/openagent-go"
+	"github.com/yusheng-g/openagent-go/agent"
+	"github.com/yusheng-g/openagent-go/kernel"
 	"github.com/yusheng-g/openagent-go/model/openai"
 	"github.com/yusheng-g/openagent-go/plugin/agent/wasm"
 	"github.com/yusheng-g/openagent-go/plugin/wasmhost"
@@ -61,12 +63,14 @@ func main() {
 		fmt.Println("No stage plugins")
 	}
 
-	agent := openagent.NewAgent("assistant",
-		openagent.WithModel(model),
-		openagent.WithSystemPrompts("You are a precise assistant. Use echo for testing tool calls, calculator for math. Be concise."),
-		openagent.WithTools(tools...),
-		openagent.WithRunObserver(observer),
+	cfg := agent.New("assistant",
+		agent.WithModel(model),
+		agent.WithSystemPrompts("You are a precise assistant. Use echo for testing tool calls, calculator for math. Be concise."),
 	)
+	rt := kernel.New(cfg, kernel.Deps{
+		Tools:    tools,
+		Observer: observer,
+	})
 
 	ctx := context.Background()
 	session := openagent.Session{
@@ -80,9 +84,9 @@ func main() {
 	fmt.Println("\n=== Running agent ===")
 
 	// Inject AgentRuntime so runtime_* host APIs work in observers.
-	rt := wasm.BuildAgentRuntime(agent, &session, nil)
-	ctx = wasmhost.WithAgentRuntime(ctx, rt)
-	result, err := agent.Run(ctx, session, openagent.UserMessage("Use the echo tool to echo 'hello plugin', then calculate 15+27"))
+	wrt := wasm.BuildAgentRuntime(rt, &session, nil)
+	ctx = wasmhost.WithAgentRuntime(ctx, wrt)
+	result, err := rt.Run(ctx, session, openagent.UserMessage("Use the echo tool to echo 'hello plugin', then calculate 15+27"))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 		os.Exit(1)
@@ -100,21 +104,15 @@ func (t *calculatorTool) Definition() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
 		Name:        "calculator",
 		Description: "Evaluate a math expression like '15+27' or '100/3'.",
-		Parameters: json.RawMessage(`{
-			"type": "object",
-			"properties": {
-				"expression": {"type": "string", "description": "The math expression to evaluate"}
-			},
-			"required": ["expression"]
-		}`),
+		Parameters:  openagent.SchemaOf[CalcParams](),
 	}
 }
 
-func (t *calculatorTool) Execute(_ context.Context, args json.RawMessage) (string, error) {
-	var params struct {
-		Expression string `json:"expression"`
+func (t *calculatorTool) Execute(_ context.Context, args json.RawMessage) *openagent.ToolResult {
+	params, err := openagent.ParseArgs[CalcParams](args)
+	if err != nil {
+		return openagent.ErrorResult(err, false, "")
 	}
-	json.Unmarshal(args, &params)
 
 	expr := strings.ReplaceAll(params.Expression, " ", "")
 	var a, b int
@@ -122,17 +120,21 @@ func (t *calculatorTool) Execute(_ context.Context, args json.RawMessage) (strin
 	fmt.Sscanf(expr, "%d%c%d", &a, &op, &b)
 	switch op {
 	case '+':
-		return fmt.Sprintf("%d", a+b), nil
+		return &openagent.ToolResult{Content: fmt.Sprintf("%d", a+b)}
 	case '-':
-		return fmt.Sprintf("%d", a-b), nil
+		return &openagent.ToolResult{Content: fmt.Sprintf("%d", a-b)}
 	case '*':
-		return fmt.Sprintf("%d", a*b), nil
+		return &openagent.ToolResult{Content: fmt.Sprintf("%d", a*b)}
 	case '/':
 		if b == 0 {
-			return "", fmt.Errorf("division by zero")
+			return openagent.ErrorResult(fmt.Errorf("division by zero"), false, "")
 		}
-		return fmt.Sprintf("%d", a/b), nil
+		return &openagent.ToolResult{Content: fmt.Sprintf("%d", a/b)}
 	default:
-		return "", fmt.Errorf("unsupported operator: %c", op)
+		return openagent.ErrorResult(fmt.Errorf("unsupported operator: %c", op), false, "")
 	}
+}
+
+type CalcParams struct {
+	Expression string `json:"expression" jsonschema:"description=The math expression to evaluate"`
 }

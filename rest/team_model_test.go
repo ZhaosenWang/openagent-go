@@ -10,6 +10,8 @@ import (
 	"testing"
 
 	openagent "github.com/yusheng-g/openagent-go"
+	"github.com/yusheng-g/openagent-go/agent"
+	"github.com/yusheng-g/openagent-go/kernel"
 )
 
 // stubModel is a minimal openagent.Model with a configurable ContextWindow
@@ -44,12 +46,12 @@ func (m *stubModel) ContextWindow() int { return m.cw }
 // and registers modelA + modelB in the registry.
 func newTeamTestHandler(t *testing.T, modelA, modelB *stubModel) *TeamHandler {
 	t.Helper()
-	agent := openagent.NewAgent("solo",
-		openagent.WithModel(modelA),
-		openagent.WithSystemPrompts("test"),
-		openagent.WithMaxTurns(1),
+	agentCfg := agent.New("solo",
+		agent.WithModel(modelA),
+		agent.WithSystemPrompts("test"),
+		agent.WithMaxTurns(1),
 	)
-	h := NewTeamHandler(nil, TeamAgentTemplate{Name: "solo", Description: "d", Agent: agent})
+	h := NewTeamHandler(nil, TeamAgentTemplate{Name: "solo", Description: "d", Agent: agentCfg, Deps: kernel.Deps{}})
 	h.RegisterModel("model-a", modelA, "p")
 	h.RegisterModel("model-b", modelB, "p")
 	return h

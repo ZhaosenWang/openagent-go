@@ -8,15 +8,15 @@ import (
 // ChatCompletionRequest is the input to a model call.
 // Follows OpenAI Chat Completions API format.
 type ChatCompletionRequest struct {
-	Model       string               `json:"model"`
-	Messages    []Message            `json:"messages"`
-	Tools       []FunctionDefinition `json:"tools,omitempty"`
-	Temperature *float64             `json:"temperature,omitempty"`  // nil = model default
-	MaxTokens   int                  `json:"max_tokens,omitempty"`   // 0 = model default
-	TopP             *float64             `json:"top_p,omitempty"`        // nil = model default
-	Stop             []string             `json:"stop,omitempty"`
-	ReasoningEffort  string               `json:"reasoning_effort,omitempty"` // "none","minimal","low","medium","high","xhigh"
-	Stream      bool                 `json:"stream,omitempty"`
+	Model           string               `json:"model"`
+	Messages        []Message            `json:"messages"`
+	Tools           []FunctionDefinition `json:"tools,omitempty"`
+	Temperature     *float64             `json:"temperature,omitempty"` // nil = model default
+	MaxTokens       int                  `json:"max_tokens,omitempty"`  // 0 = model default
+	TopP            *float64             `json:"top_p,omitempty"`       // nil = model default
+	Stop            []string             `json:"stop,omitempty"`
+	ReasoningEffort string               `json:"reasoning_effort,omitempty"` // "none","minimal","low","medium","high","xhigh"
+	Stream          bool                 `json:"stream,omitempty"`
 }
 
 // ChatCompletionResponse is the result of a model call.
@@ -89,7 +89,7 @@ type StreamDelta struct {
 
 // ToolCallDelta is an incremental tool call update in a stream chunk.
 type ToolCallDelta struct {
-	Index    int           `json:"index"`    // 0-based, fragments with same index belong together
+	Index    int           `json:"index"` // 0-based, fragments with same index belong together
 	ID       string        `json:"id,omitempty"`
 	Type     string        `json:"type,omitempty"`
 	Function FunctionDelta `json:"function,omitempty"`

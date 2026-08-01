@@ -1,10 +1,9 @@
 package wasm
 
 import (
-	"log/slog"
 	"context"
-	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -21,11 +20,17 @@ type Manager struct {
 	ldr       loader
 	tools     []openagent.Tool
 	observers []*wasmObserver
-	sessions  []*wasmSession
 
 	hostAPI *wasmhost.HostAPI
 
 	onAbort func(reason string)
+
+	// observeCh feeds the single background observer worker. Created by
+	// Observer(); never closed (a close racing a send would panic — the
+	// worker goroutine lives for the manager's lifetime and drains on
+	// process exit; Close only detaches the channel so no new events are
+	// accepted).
+	observeCh chan openagent.StageEvent
 }
 
 // NewManager creates a Manager for the given plugin directory.
@@ -39,105 +44,6 @@ func NewManager(dir string) *Manager {
 func (m *Manager) WithHostAPI(h *wasmhost.HostAPI) *Manager {
 	m.hostAPI = h
 	return m
-}
-
-// wasmSession wraps an agent:sessions WASM plugin. It exports session_init(...)
-// and session_destroy(...) instead of run().
-type wasmSession struct {
-	mod  *module
-	meta PluginMeta
-}
-
-// invokeSessionInit calls the guest's session_init() and returns the parsed
-// SessionConfig, or nil if the export is missing / returns null.
-func (ws *wasmSession) invokeSessionInit(ctx context.Context, sc SessionCtx) (*SessionConfig, error) {
-	fn := ws.mod.mod.ExportedFunction("session_init")
-	if fn == nil {
-		return nil, nil
-	}
-	bs, _ := json.Marshal(sc)
-	out, err := ws.mod.invoke(ctx, "session_init", bs)
-	if err != nil {
-		return nil, err
-	}
-	if out == nil || string(out) == "null" {
-		return nil, nil
-	}
-	var cfg SessionConfig
-	if err := json.Unmarshal(out, &cfg); err != nil {
-		return nil, fmt.Errorf("parse session config: %w", err)
-	}
-	return &cfg, nil
-}
-
-func (ws *wasmSession) invokeSessionDestroy(ctx context.Context, sc SessionCtx) error {
-	fn := ws.mod.mod.ExportedFunction("session_destroy")
-	if fn == nil {
-		return nil
-	}
-	bs, _ := json.Marshal(sc)
-	_, err := ws.mod.invoke(ctx, "session_destroy", bs)
-	return err
-}
-
-// OnSessionInit calls every agent:sessions plugin's session_init export.
-// Returns a merged SessionConfig (last non-nil wins for each field).
-func (m *Manager) OnSessionInit(ctx context.Context, sc SessionCtx) *SessionConfig {
-	m.mu.Lock()
-	sessions := make([]*wasmSession, len(m.sessions))
-	copy(sessions, m.sessions)
-	m.mu.Unlock()
-
-	var merged SessionConfig
-	for _, ws := range sessions {
-		cfg, err := ws.invokeSessionInit(ctx, sc)
-		if err != nil {
-			slog.Error("wasm session_init failed", "plugin", ws.meta.Name, "error", err)
-			continue
-		}
-		if cfg != nil {
-			mergeConfig(&merged, cfg)
-		}
-	}
-	return &merged
-}
-
-// OnSessionDestroy calls every agent:sessions plugin's session_destroy export.
-func (m *Manager) OnSessionDestroy(ctx context.Context, sc SessionCtx) {
-	m.mu.Lock()
-	sessions := make([]*wasmSession, len(m.sessions))
-	copy(sessions, m.sessions)
-	m.mu.Unlock()
-
-	for _, ws := range sessions {
-		if err := ws.invokeSessionDestroy(ctx, sc); err != nil {
-			slog.Error("wasm session_destroy failed", "plugin", ws.meta.Name, "error", err)
-		}
-	}
-}
-
-func mergeConfig(dst, src *SessionConfig) {
-	if len(src.SystemPrompts) > 0 {
-		dst.SystemPrompts = src.SystemPrompts
-	}
-	if src.Description != "" {
-		dst.Description = src.Description
-	}
-	if len(src.Tools) > 0 {
-		dst.Tools = src.Tools
-	}
-	if src.MaxTurns > 0 {
-		dst.MaxTurns = src.MaxTurns
-	}
-	if src.MaxWorkingTokens > 0 {
-		dst.MaxWorkingTokens = src.MaxWorkingTokens
-	}
-	if src.SkillDir != "" {
-		dst.SkillDir = src.SkillDir
-	}
-	if src.MemoryPath != "" {
-		dst.MemoryPath = src.MemoryPath
-	}
 }
 
 // OnAbort registers a callback invoked when a stage plugin returns action=abort.
@@ -187,7 +93,9 @@ func (m *Manager) Discover(ctx context.Context) error {
 		}
 		path := filepath.Join(m.dir, entry.Name())
 		if err := m.loadOne(ctx, path); err != nil {
-			return fmt.Errorf("plugin %s: %w", entry.Name(), err)
+			// One broken plugin must not disable the rest: skip it and
+			// keep discovering.
+			slog.Error("openagent: wasm plugin load failed, skipping", "plugin", entry.Name(), "error", err)
 		}
 	}
 
@@ -215,8 +123,6 @@ func (m *Manager) loadOne(ctx context.Context, path string) error {
 		m.tools = append(m.tools, &wasmTool{mod: mod, meta: meta})
 	case PluginTypeObservers:
 		m.observers = append(m.observers, &wasmObserver{mod: mod, meta: meta, name: meta.Name})
-	case PluginTypeSessions:
-		m.sessions = append(m.sessions, &wasmSession{mod: mod, meta: meta})
 	default:
 		slog.Info("wasm skipping unknown plugin type", "file", filepath.Base(path), "type", meta.Type)
 		return nil
@@ -225,11 +131,14 @@ func (m *Manager) loadOne(ctx context.Context, path string) error {
 	return nil
 }
 
-// Tools returns loaded Tool plugins as openagent.Tool values.
+// Tools returns loaded Tool plugins as openagent.Tool values (a copy —
+// callers must not mutate the manager's internal slice).
 func (m *Manager) Tools() []openagent.Tool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.tools
+	out := make([]openagent.Tool, len(m.tools))
+	copy(out, m.tools)
+	return out
 }
 
 // Observer returns a RunObserver that dispatches to matching Stage plugins.
@@ -239,42 +148,88 @@ func (m *Manager) Observer() openagent.RunObserver {
 	if len(m.observers) == 0 {
 		return nil
 	}
+	if m.observeCh == nil {
+		m.observeCh = make(chan openagent.StageEvent, 64)
+		go m.observeLoop()
+	}
 	return &observerRouter{mgr: m}
 }
 
-// Close releases the wazero runtime.
+// Close releases the wazero runtime and detaches the observer queue (no
+// new events accepted; the worker drains and exits with the process).
 func (m *Manager) Close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.observeCh = nil
 	if m.ldr.runtime == nil {
 		return nil
 	}
 	return m.ldr.Close(context.Background())
 }
 
-// observerRouter dispatches stage events to matching WASM stage plugins.
+// observerRouter dispatches stage events to matching WASM stage plugins on
+// a background worker: a slow or broken plugin must not block the agent
+// main loop. Events stay ordered (single worker); a panic in one plugin is
+// contained and logged. An abort action stops dispatch for that event and
+// fires the registered callback.
 type observerRouter struct {
 	mgr *Manager
 }
 
-func (o *observerRouter) ObserveStage(ctx context.Context, event openagent.StageEvent) {
-	o.mgr.mu.Lock()
-	stages := o.mgr.observers
-	onAbort := o.mgr.onAbort
-	o.mgr.mu.Unlock()
+func (o *observerRouter) ObserveStage(_ context.Context, event openagent.StageEvent) {
+	o.mgr.dispatch(event)
+}
+
+// dispatch enqueues a stage event for the background worker. When the
+// queue is full (a stuck observer), the event is dropped with a warning —
+// observing must never stall the run.
+func (m *Manager) dispatch(event openagent.StageEvent) {
+	m.mu.Lock()
+	ch := m.observeCh
+	m.mu.Unlock()
+	if ch == nil {
+		return // manager closed
+	}
+	select {
+	case ch <- event:
+	default:
+		slog.Warn("openagent: wasm observer queue full, dropping stage event", "stage", event.Name, "phase", event.Phase)
+	}
+}
+
+// observeLoop is the single worker consuming stage events in order.
+func (m *Manager) observeLoop() {
+	for ev := range m.observeCh {
+		m.runObservers(ev)
+	}
+}
+
+func (m *Manager) runObservers(event openagent.StageEvent) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			slog.Error("openagent: wasm observer panicked", "panic", rec)
+		}
+	}()
+	m.mu.Lock()
+	stages := m.observers
+	onAbort := m.onAbort
+	m.mu.Unlock()
 
 	for _, s := range stages {
 		if !s.matches(event) {
 			continue
 		}
-		out, err := s.invoke(ctx, event)
+		out, err := s.invoke(context.Background(), event)
 		if err != nil {
-			if out != nil && out.Action == ActionAbort && onAbort != nil {
-				onAbort(out.Reason)
-				return
-			}
 			slog.Error("wasm observer error", "plugin", s.meta.Name, "stage", event.Name, "phase", event.Phase, "error", err)
 			continue
+		}
+		if out != nil && out.Action == ActionAbort {
+			slog.Info("wasm observer abort", "plugin", s.meta.Name, "stage", event.Name, "reason", out.Reason)
+			if onAbort != nil {
+				onAbort(out.Reason)
+			}
+			return // abort stops dispatch for this event
 		}
 		slog.Info("wasm observer", "plugin", s.meta.Name, "stage", event.Name, "phase", event.Phase, "action", out.Action)
 	}

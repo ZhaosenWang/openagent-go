@@ -78,10 +78,10 @@ func TestValidateRequestURL(t *testing.T) {
 		}
 	}
 	bad := []string{
-		"ftp://example.com/",            // bad scheme
-		"http://evil@169.254.169.254/",  // userinfo
-		"http://",                       // no host
-		"://broken",                     // unparseable
+		"ftp://example.com/",           // bad scheme
+		"http://evil@169.254.169.254/", // userinfo
+		"http://",                      // no host
+		"://broken",                    // unparseable
 	}
 	for _, u := range bad {
 		if _, err := ValidateRequestURL(u); err == nil {

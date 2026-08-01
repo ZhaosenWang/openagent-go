@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -29,53 +30,14 @@ func (t *Grep) Definition() openagent.FunctionDefinition {
 		Description: "Search for a pattern in workspace files. " +
 			"Returns matching file paths, line numbers, and content. " +
 			"Use for finding usages, definitions, or patterns in the codebase.",
-		Parameters: json.RawMessage(`{
-				"type": "object",
-				"properties": {
-					"pattern": {
-						"type": "string",
-						"description": "Text or regex pattern to search for (case-sensitive unless (?i) flag used)"
-					},
-					"path": {
-						"type": "string",
-						"description": "Subdirectory to search"
-					},
-					"glob": {
-						"type": "string",
-						"description": "File pattern filter, e.g., '*.go' or '*.{go,md}' (default: all text files)"
-					}
-				},
-				"required": ["pattern"]
-			}`),
+		Parameters: openagent.SchemaOf[GrepParams](),
 	}
 }
 
-func (t *Grep) CanSelfApprove(args json.RawMessage) bool {
-	var params struct {
-		Path string `json:"path"`
-	}
-	json.Unmarshal(args, &params)
-	if params.Path == "" {
-		return true // default to workspace root is safe
-	}
-	abs, err := validatePath(t.workDir, params.Path)
+func (t *Grep) Execute(ctx context.Context, args json.RawMessage) *openagent.ToolResult {
+	params, err := openagent.ParseArgs[GrepParams](args)
 	if err != nil {
-		return false
-	}
-	return isWithinWorkspace(t.workDir, abs) || isWithinArtifactDir(abs)
-}
-
-func (t *Grep) Execute(ctx context.Context, args json.RawMessage) (string, error) {
-	var params struct {
-		Pattern string `json:"pattern"`
-		Path    string `json:"path"`
-		Glob    string `json:"glob"`
-	}
-	if err := json.Unmarshal(args, &params); err != nil {
-		return "", fmt.Errorf("grep: %w", err)
-	}
-	if params.Pattern == "" {
-		return "", fmt.Errorf("grep: pattern is required")
+		return openagent.ErrorResult(fmt.Errorf("grep: %w", err), false, "")
 	}
 
 	searchDir, err := validatePath(t.workDir, params.Path)
@@ -84,13 +46,13 @@ func (t *Grep) Execute(ctx context.Context, args json.RawMessage) (string, error
 		if params.Path == "" {
 			searchDir = t.workDir
 		} else {
-			return "", err
+			return openagent.ErrorResult(err, false, "")
 		}
 	}
 
 	re, err := regexp.Compile(params.Pattern)
 	if err != nil {
-		return "", fmt.Errorf("grep: invalid pattern: %w", err)
+		return openagent.ErrorResult(fmt.Errorf("grep: invalid pattern: %w", err), false, "")
 	}
 
 	const maxFileSize = 1 * 1024 * 1024 // 1MB
@@ -101,8 +63,15 @@ func (t *Grep) Execute(ctx context.Context, args json.RawMessage) (string, error
 	)
 
 	err = filepath.WalkDir(searchDir, func(path string, d os.DirEntry, walkErr error) error {
-		if walkErr != nil || ctx.Err() != nil {
-			return nil // skip on error
+		if walkErr != nil {
+			// Permission/read failures were silently swallowed, so the
+			// user saw "no matches" for files that were simply unreadable.
+			slog.Warn("openagent: grep walk error", "path", path, "error", walkErr)
+			return nil
+		}
+		if ctx.Err() != nil {
+			// Cancelled — stop scanning instead of walking the whole tree.
+			return filepath.SkipAll
 		}
 		if d.IsDir() {
 			base := d.Name()
@@ -140,11 +109,11 @@ func (t *Grep) Execute(ctx context.Context, args json.RawMessage) (string, error
 		return nil
 	})
 	if err != nil {
-		return "", fmt.Errorf("grep: %w", err)
+		return openagent.ErrorResult(fmt.Errorf("grep: %w", err), false, "")
 	}
 
 	if total == 0 {
-		return "No matches found.", nil
+		return &openagent.ToolResult{Content: "No matches found."}
 	}
 
 	var b strings.Builder
@@ -157,7 +126,7 @@ func (t *Grep) Execute(ctx context.Context, args json.RawMessage) (string, error
 			b.WriteString("\n")
 		}
 	}
-	return b.String(), nil
+	return &openagent.ToolResult{Content: b.String()}
 }
 
 // fileMatch holds the matches for a single file: the relative path and the
@@ -189,4 +158,10 @@ func (t *Grep) grepFile(path string, re *regexp.Regexp) ([]string, error) {
 		}
 	}
 	return matches, nil
+}
+
+type GrepParams struct {
+	Pattern string `json:"pattern" jsonschema:"description=Text or regex pattern to search for (case-sensitive unless (?i) flag used)"`
+	Path    string `json:"path,omitempty" jsonschema:"description=Subdirectory to search"`
+	Glob    string `json:"glob,omitempty" jsonschema:"description=File pattern filter, e.g., '*.go' or '*.{go,md}' (default: all text files)"`
 }

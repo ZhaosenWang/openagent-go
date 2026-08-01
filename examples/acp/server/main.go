@@ -243,11 +243,16 @@ func evaluate(expr string) (string, error) {
 			return "", fmt.Errorf("invalid numbers in: %s", expr)
 		}
 		switch op {
-		case "+": return formatFloat(a + b), nil
-		case "-": return formatFloat(a - b), nil
-		case "*": return formatFloat(a * b), nil
+		case "+":
+			return formatFloat(a + b), nil
+		case "-":
+			return formatFloat(a - b), nil
+		case "*":
+			return formatFloat(a * b), nil
 		case "/":
-			if b == 0 { return "", fmt.Errorf("division by zero") }
+			if b == 0 {
+				return "", fmt.Errorf("division by zero")
+			}
 			return formatFloat(a / b), nil
 		}
 	}
@@ -255,17 +260,25 @@ func evaluate(expr string) (string, error) {
 }
 
 func formatFloat(f float64) string {
-	if f == math.Trunc(f) { return fmt.Sprintf("%.0f", f) }
+	if f == math.Trunc(f) {
+		return fmt.Sprintf("%.0f", f)
+	}
 	return strconv.FormatFloat(f, 'g', -1, 64)
 }
 
 func firstLine(s string, maxLen int) string {
-	if idx := strings.IndexByte(s, '\n'); idx >= 0 { s = s[:idx] }
-	if len(s) > maxLen { return s[:maxLen] + "..." }
+	if idx := strings.IndexByte(s, '\n'); idx >= 0 {
+		s = s[:idx]
+	}
+	if len(s) > maxLen {
+		return s[:maxLen] + "..."
+	}
 	return s
 }
 
 func truncate(s string, n int) string {
-	if len(s) <= n { return s }
+	if len(s) <= n {
+		return s
+	}
 	return s[:n] + "..."
 }

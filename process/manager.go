@@ -57,19 +57,19 @@ type Manager struct {
 // StartedAt) and the file handles are set once at Create time and need
 // no locking.
 type Proc struct {
-	ID          string    // short hex ID, e.g. "a1b2c3d4"
-	PID         int       // host OS PID of the sandbox wrapper (bwrap / bash)
-	Command     string    // original shell command
-	StdoutPath  string    // absolute path to stdout.log
-	StderrPath  string    // absolute path to stderr.log
-	ExitCodePath string   // absolute path to exit.code
-	StartedAt   time.Time
+	ID           string // short hex ID, e.g. "a1b2c3d4"
+	PID          int    // host OS PID of the sandbox wrapper (bwrap / bash)
+	Command      string // original shell command
+	StdoutPath   string // absolute path to stdout.log
+	StderrPath   string // absolute path to stderr.log
+	ExitCodePath string // absolute path to exit.code
+	StartedAt    time.Time
 
-	mu       sync.Mutex // guards PID, dir, StdoutPath, StderrPath, ExitCodePath
-	dir      string    // proc subdirectory
-	stdoutF  *os.File  // open file handle for stdout
-	stderrF  *os.File  // open file handle for stderr
-	exitCodeF *os.File // open file handle for exit code
+	mu        sync.Mutex // guards PID, dir, StdoutPath, StderrPath, ExitCodePath
+	dir       string     // proc subdirectory
+	stdoutF   *os.File   // open file handle for stdout
+	stderrF   *os.File   // open file handle for stderr
+	exitCodeF *os.File   // open file handle for exit code
 }
 
 // StdoutW returns the writer for sandbox stdout output.

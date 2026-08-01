@@ -19,6 +19,8 @@ import (
 	"time"
 
 	openagent "github.com/yusheng-g/openagent-go"
+	"github.com/yusheng-g/openagent-go/agent"
+	"github.com/yusheng-g/openagent-go/kernel"
 	"github.com/yusheng-g/openagent-go/model/openai"
 )
 
@@ -30,15 +32,17 @@ func main() {
 	model := openai.New(apiKey, modelID, baseURL).
 		WithContextWindow(128_000)
 
-	agent := openagent.NewAgent("calculator",
-		openagent.WithModel(model),
-		openagent.WithSystemPrompts("You are a precise calculator. Use the calculator tool for arithmetic. Answer concisely."),
-		openagent.WithTools(&calculatorTool{}),
+	cfg := agent.New("calculator",
+		agent.WithModel(model),
+		agent.WithSystemPrompts("You are a precise calculator. Use the calculator tool for arithmetic. Answer concisely."),
 	)
+	deps := kernel.Deps{
+		Tools: []openagent.Tool{&calculatorTool{}},
+	}
 
 	session := openagent.Session{
-		ID:        "stream-session-1",
-		UserID:    "user-1",
+		ID:     "stream-session-1",
+		UserID: "user-1",
 
 		ModelID:   modelID,
 		CreatedAt: time.Now(),
@@ -47,7 +51,7 @@ func main() {
 	fmt.Printf("Model: %s | Base URL: %s\n\n", modelID, baseURL)
 
 	ctx := context.Background()
-	events := agent.RunStream(ctx, session, openagent.UserMessage("what is 12 + 34?"))
+	events := kernel.New(cfg, deps).RunStream(ctx, session, openagent.UserMessage("what is 12 + 34?"))
 
 	var inThought bool
 	fmt.Print("Assistant: ")
@@ -103,22 +107,14 @@ func (t *calculatorTool) Definition() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
 		Name:        "calculator",
 		Description: "Evaluate a mathematical expression. Input is a valid arithmetic expression like '12+34' or '100/3'.",
-		Parameters: json.RawMessage(`{
-			"type": "object",
-			"properties": {
-				"expression": {"type": "string", "description": "The math expression to evaluate"}
-			},
-			"required": ["expression"]
-		}`),
+		Parameters:  openagent.SchemaOf[CalcParams](),
 	}
 }
 
-func (t *calculatorTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
-	var params struct {
-		Expression string `json:"expression"`
-	}
-	if err := json.Unmarshal(args, &params); err != nil {
-		return "", err
+func (t *calculatorTool) Execute(ctx context.Context, args json.RawMessage) *openagent.ToolResult {
+	params, err := openagent.ParseArgs[CalcParams](args)
+	if err != nil {
+		return openagent.ErrorResult(err, false, "")
 	}
 	// Remove spaces — model may produce "12 + 34" or "12+34"
 	expr := strings.ReplaceAll(params.Expression, " ", "")
@@ -127,18 +123,18 @@ func (t *calculatorTool) Execute(ctx context.Context, args json.RawMessage) (str
 	fmt.Sscanf(expr, "%d%c%d", &a, &op, &b)
 	switch op {
 	case '+':
-		return fmt.Sprintf("%d", a+b), nil
+		return &openagent.ToolResult{Content: fmt.Sprintf("%d", a+b)}
 	case '-':
-		return fmt.Sprintf("%d", a-b), nil
+		return &openagent.ToolResult{Content: fmt.Sprintf("%d", a-b)}
 	case '*':
-		return fmt.Sprintf("%d", a*b), nil
+		return &openagent.ToolResult{Content: fmt.Sprintf("%d", a*b)}
 	case '/':
 		if b == 0 {
-			return "", fmt.Errorf("division by zero")
+			return openagent.ErrorResult(fmt.Errorf("division by zero"), false, "")
 		}
-		return fmt.Sprintf("%d", a/b), nil
+		return &openagent.ToolResult{Content: fmt.Sprintf("%d", a/b)}
 	default:
-		return "", fmt.Errorf("unsupported operator: %c", op)
+		return openagent.ErrorResult(fmt.Errorf("unsupported operator: %c", op), false, "")
 	}
 }
 
@@ -147,4 +143,8 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
+}
+
+type CalcParams struct {
+	Expression string `json:"expression" jsonschema:"description=The math expression to evaluate"`
 }

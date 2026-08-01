@@ -79,7 +79,8 @@ func (s *Store) Delete(ctx context.Context, id string) error {
 	return err
 }
 
-func (s *Store) Close() error { return nil }
+// Close releases the underlying database connection.
+func (s *Store) Close() error { return s.db.Close() }
 
 // ── migration ──
 

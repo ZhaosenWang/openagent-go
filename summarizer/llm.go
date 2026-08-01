@@ -121,10 +121,15 @@ func (c *Compressor) buildSummarizePrompt(messages []openagent.Message, prev *op
 
 func truncateContent(s string, n int) string {
 	s = strings.TrimSpace(s)
-	if len(s) <= n {
+	// Truncate by rune (byte-slicing cuts multi-byte UTF-8 in half).
+	runes := []rune(s)
+	if len(runes) <= n {
 		return s
 	}
-	return s[:n-3] + "..."
+	if n <= 3 {
+		return "..."
+	}
+	return string(runes[:n-3]) + "..."
 }
 
 // ── Parsing ──

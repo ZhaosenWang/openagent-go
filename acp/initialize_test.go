@@ -5,12 +5,15 @@ import (
 	"testing"
 
 	openacp "github.com/yusheng-g/openagent-go/acp/sdk"
+
+	"github.com/yusheng-g/openagent-go/agent"
+	"github.com/yusheng-g/openagent-go/kernel"
 )
 
 // TestOnInitialize_AgentInfoFromFields verifies OnInitialize reports the
 // AgentName/AgentVersion fields rather than hardcoded constants.
 func TestOnInitialize_AgentInfoFromFields(t *testing.T) {
-	srv := NewAgentServer(nil, nil, nil, nil)
+	srv := NewAgentServer(agent.New("test"), kernel.Deps{}, nil, nil)
 	srv.AgentName = "test-agent"
 	srv.AgentVersion = "v9.9.9"
 
@@ -32,7 +35,7 @@ func TestOnInitialize_AgentInfoFromFields(t *testing.T) {
 // TestOnInitialize_AgentInfoEmpty verifies that an unconfigured AgentServer
 // reports empty identity (a wiring signal, not a hidden default).
 func TestOnInitialize_AgentInfoEmpty(t *testing.T) {
-	srv := NewAgentServer(nil, nil, nil, nil)
+	srv := NewAgentServer(agent.New("test"), kernel.Deps{}, nil, nil)
 	// AgentName/AgentVersion left zero — no default in NewAgentServer.
 
 	resp, err := srv.OnInitialize(context.Background(), openacp.InitializeRequest{})
@@ -53,7 +56,7 @@ func TestOnInitialize_AgentInfoEmpty(t *testing.T) {
 // true and the server list is nil, so the client is constructed but no
 // real dial happens.
 func TestConnectMCP_EmptyIdentityDoesNotPanic(t *testing.T) {
-	srv := NewAgentServer(nil, nil, nil, nil)
+	srv := NewAgentServer(agent.New("test"), kernel.Deps{}, nil, nil)
 	// AgentName/AgentVersion left zero.
 	srv.MCPEnabled = true // exercise client construction
 

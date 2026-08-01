@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	openagent "github.com/yusheng-g/openagent-go"
+	"github.com/yusheng-g/openagent-go/agent"
 )
 
 // Planner generates a PlanDef from a goal and available agents.
@@ -14,7 +15,7 @@ type Planner interface {
 	// Plan analyses the goal and returns a DAG of steps.
 	// agents lists the available agents with their descriptions.
 	// history is optional conversation context (may be nil/empty).
-	Plan(ctx context.Context, goal string, agents []openagent.AgentInfo, history []openagent.Message) (*PlanDef, error)
+	Plan(ctx context.Context, goal string, agents []agent.AgentInfo, history []openagent.Message) (*PlanDef, error)
 
 	// Replan generates replacement steps for a failed plan based on the
 	// context in [ReplanInput]. The returned steps replace the affected
@@ -45,14 +46,14 @@ func (p *LLMPlanner) WithMaxRetries(n int) *LLMPlanner {
 }
 
 // Plan implements [Planner].
-func (p *LLMPlanner) Plan(ctx context.Context, goal string, agents []openagent.AgentInfo, history []openagent.Message) (*PlanDef, error) {
+func (p *LLMPlanner) Plan(ctx context.Context, goal string, agents []agent.AgentInfo, history []openagent.Message) (*PlanDef, error) {
 	return p.planWithModel(ctx, goal, agents, history, false, nil)
 }
 
 // PlanStream generates a PlanDef with streaming text chunks emitted via onChunk.
 // Each token/reasoning delta from the LLM is passed to onChunk as it arrives.
 // The final PlanDef is returned after the full response is received and validated.
-func (p *LLMPlanner) PlanStream(ctx context.Context, goal string, agents []openagent.AgentInfo, history []openagent.Message, onChunk func(string)) (*PlanDef, error) {
+func (p *LLMPlanner) PlanStream(ctx context.Context, goal string, agents []agent.AgentInfo, history []openagent.Message, onChunk func(string)) (*PlanDef, error) {
 	return p.planWithModel(ctx, goal, agents, history, true, onChunk)
 }
 
@@ -152,7 +153,7 @@ func parseStepsJSON(raw string) ([]StepDef, error) {
 }
 
 // planWithModel is the shared implementation for Plan and PlanStream.
-func (p *LLMPlanner) planWithModel(ctx context.Context, goal string, agents []openagent.AgentInfo, history []openagent.Message, streaming bool, onChunk func(string)) (*PlanDef, error) {
+func (p *LLMPlanner) planWithModel(ctx context.Context, goal string, agents []agent.AgentInfo, history []openagent.Message, streaming bool, onChunk func(string)) (*PlanDef, error) {
 	agentNames := make(map[string]bool)
 	for _, a := range agents {
 		agentNames[a.Name] = true
@@ -287,7 +288,7 @@ Rules:
 
 Reply with ONLY the JSON object. No markdown fences, no explanation.`
 
-func buildPlannerPrompt(goal string, agents []openagent.AgentInfo, history []openagent.Message) string {
+func buildPlannerPrompt(goal string, agents []agent.AgentInfo, history []openagent.Message) string {
 	var b strings.Builder
 
 	b.WriteString("## Available Agents\n\n")

@@ -2,10 +2,10 @@
 // can inspect them with read/grep instead of consuming context window.
 //
 // Pattern:
-//   1. RunHooks.OnToolEnd intercepts every tool result
-//   2. If result > threshold, write to /tmp/openagent/<sessionID>/<tool>_<ts>.txt
-//   3. Replace *result with a short message pointing to the file
-//   4. Model calls read/grep on that path to inspect the output
+//  1. RunHooks.OnToolEnd intercepts every tool result
+//  2. If result > threshold, write to /tmp/openagent/<sessionID>/<tool>_<ts>.txt
+//  3. Replace *result with a short message pointing to the file
+//  4. Model calls read/grep on that path to inspect the output
 //
 // Run:
 //
@@ -22,6 +22,8 @@ import (
 	"time"
 
 	openagent "github.com/yusheng-g/openagent-go"
+	"github.com/yusheng-g/openagent-go/agent"
+	"github.com/yusheng-g/openagent-go/kernel"
 	"github.com/yusheng-g/openagent-go/model/openai"
 	opentool "github.com/yusheng-g/openagent-go/tool"
 )
@@ -49,16 +51,20 @@ func (h *ArtifactHook) OnToolStart(ctx context.Context, tool openagent.FunctionD
 // OnToolEnd checks result size and saves to disk when it exceeds the threshold.
 // Reads from the artifact directory are excluded to prevent artifact-of-artifact
 // recursion.
-func (h *ArtifactHook) OnToolEnd(ctx context.Context, tool openagent.FunctionDefinition, args json.RawMessage, result *string, err *error, startState any) {
-	if result == nil || *result == "" {
+//
+// Note: the runtime now ships a built-in result policy ([openagent.ResultPolicy],
+// e.g. DefaultResultPolicy) that performs the same truncation automatically.
+// This hook remains as a self-contained example of the hook pattern.
+func (h *ArtifactHook) OnToolEnd(ctx context.Context, tool openagent.FunctionDefinition, args json.RawMessage, result *openagent.ToolResult, startState any) {
+	if result == nil || result.Content == "" {
 		return
 	}
-	if h.Threshold > 0 && len(*result) <= h.Threshold {
+	if h.Threshold > 0 && len(result.Content) <= h.Threshold {
 		return
 	}
 
 	// Don't re-save reads from the artifact directory itself.
-	if h.isReadingArtifact(args) {
+	if reading, err := h.isReadingArtifact(args); err == nil && reading {
 		return
 	}
 
@@ -73,27 +79,35 @@ func (h *ArtifactHook) OnToolEnd(ctx context.Context, tool openagent.FunctionDef
 	name := fmt.Sprintf("%s_%d.txt", tool.Name, time.Now().UnixNano())
 	path := filepath.Join(dir, name)
 
-	raw := *result
+	raw := result.Content
 	_ = os.WriteFile(path, []byte(raw), 0644)
 
 	// Replace the result with a terse pointer. The model is smart enough
 	// to read/grep the file when it needs details. No AI summarisation.
 	sizeKB := (len(raw) + 1023) / 1024
-	*result = fmt.Sprintf("%s: Tool output saved to %s (%d KB, %d lines). Use read or grep to inspect.",
+	result.Content = fmt.Sprintf("%s: Tool output saved to %s (%d KB, %d lines). Use read or grep to inspect.",
 		h.Prefix, path, sizeKB, strings.Count(raw, "\n")+1)
+	result.Truncated = true
+	result.FileRef = path
 }
 
 // ── Helpers ──
 
+// PathParams is the argument shape of the read/grep tools (path is
+// required); used to detect artifact-path reads.
+type PathParams struct {
+	Path string `json:"path"`
+}
+
 // isReadingArtifact checks whether args contain a path inside the artifact
 // root. Used to prevent artifact-of-artifact recursion when read/grep
 // inspect a previously saved artifact.
-func (h *ArtifactHook) isReadingArtifact(args json.RawMessage) bool {
-	var params struct {
-		Path string `json:"path"`
+func (h *ArtifactHook) isReadingArtifact(args json.RawMessage) (bool, error) {
+	params, err := openagent.ParseArgs[PathParams](args)
+	if err != nil {
+		return false, err
 	}
-	json.Unmarshal(args, &params)
-	return params.Path != "" && strings.HasPrefix(params.Path, opentool.ArtifactRoot())
+	return params.Path != "" && strings.HasPrefix(params.Path, opentool.ArtifactRoot()), nil
 }
 
 // RemoveSessionArtifacts deletes the artifact directory for a session.
@@ -113,22 +127,15 @@ func (t *FakeLogGenerator) Definition() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
 		Name:        "generate_logs",
 		Description: "Generate fake application log output for testing. The lines parameter controls volume.",
-		Parameters: json.RawMessage(`{
-				"type": "object",
-				"properties": {
-					"lines":  {"type": "integer", "description": "Number of log lines to generate (default: 5)"},
-					"errors": {"type": "integer", "description": "Number of lines that should be ERROR level (default: 0)"}
-				}
-			}`),
+		Parameters:  openagent.SchemaOf[LogParams](),
 	}
 }
 
-func (t *FakeLogGenerator) Execute(ctx context.Context, args json.RawMessage) (string, error) {
-	var params struct {
-		Lines  int `json:"lines"`
-		Errors int `json:"errors"`
+func (t *FakeLogGenerator) Execute(ctx context.Context, args json.RawMessage) *openagent.ToolResult {
+	params, err := openagent.ParseArgs[LogParams](args)
+	if err != nil {
+		return openagent.ErrorResult(err, false, "")
 	}
-	json.Unmarshal(args, &params)
 	if params.Lines <= 0 {
 		params.Lines = 10
 	}
@@ -156,7 +163,7 @@ func (t *FakeLogGenerator) Execute(ctx context.Context, args json.RawMessage) (s
 			fakeMessage(i, levels[i]),
 		))
 	}
-	return b.String(), nil
+	return &openagent.ToolResult{Content: b.String()}
 }
 
 func fakeMessage(i int, level string) string {
@@ -198,17 +205,19 @@ func main() {
 	// Real usage: 64 * 1024 (64 KB).
 	hook := &ArtifactHook{Threshold: 512, Prefix: ""}
 
-	agent := openagent.NewAgent("log-analyzer",
-		openagent.WithModel(model),
-		openagent.WithSystemPrompts("You are a log analyzer. When tool output is large and saved to disk, use read and grep to inspect it."),
-		openagent.WithTools(
+	cfg := agent.New("log-analyzer",
+		agent.WithModel(model),
+		agent.WithSystemPrompts("You are a log analyzer. When tool output is large and saved to disk, use read and grep to inspect it."),
+		agent.WithMaxTurns(6),
+	)
+	deps := kernel.Deps{
+		Tools: []openagent.Tool{
 			&FakeLogGenerator{},
 			opentool.NewReadFile("."),
 			opentool.NewGrep("."),
-		),
-		openagent.WithRunHooks(hook),
-		openagent.WithMaxTurns(6),
-	)
+		},
+		Hooks: hook,
+	}
 
 	session := openagent.Session{
 		ID:        "artifact-demo",
@@ -224,7 +233,7 @@ func main() {
 	fmt.Println("Sending: 'generate 200 log lines with 5 errors, then tell me what went wrong'")
 	fmt.Println()
 
-	result, err := agent.Run(ctx, session, openagent.UserMessage(
+	result, err := kernel.New(cfg, deps).Run(ctx, session, openagent.UserMessage(
 		"Generate 200 lines of logs with 5 errors using the generate_logs tool. "+
 			"Then tell me what went wrong by reading the saved output file.",
 	))
@@ -248,4 +257,9 @@ func main() {
 		}
 		fmt.Printf("Full path: %s\n", dir)
 	}
+}
+
+type LogParams struct {
+	Lines  int `json:"lines" jsonschema:"description=Number of log lines to generate (default: 5)"`
+	Errors int `json:"errors" jsonschema:"description=Number of lines that should be ERROR level (default: 0)"`
 }

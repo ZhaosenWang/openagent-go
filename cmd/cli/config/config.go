@@ -8,18 +8,58 @@ import (
 )
 
 type Config struct {
-	Model      string                     `json:"model,omitempty"`
-	FastModel  string                     `json:"fast_model,omitempty"`
-	Provider   map[string]ProviderConfig  `json:"provider,omitempty"`
-	Server     ServerConfig               `json:"server,omitempty"`
-	Channels   ChannelsConfig             `json:"channels,omitempty"`
-	Sandbox    SandboxConfig              `json:"sandbox,omitempty"`
-	Log        LogConfig                  `json:"log,omitempty"`
-	McpServers map[string]McpServerConfig `json:"mcp_servers,omitempty"`
-	Plugins    []string                   `json:"plugins,omitempty"`
-	Profiles   string                     `json:"profiles,omitempty"`
-	Env        map[string]string          `json:"env,omitempty"`
-	Sensitive  SensitiveConfig            `json:"sensitive,omitempty"`
+	Model        string                     `json:"model,omitempty"`
+	FastModel    string                     `json:"fast_model,omitempty"`
+	Provider     map[string]ProviderConfig  `json:"provider,omitempty"`
+	Server       ServerConfig               `json:"server,omitempty"`
+	Channels     ChannelsConfig             `json:"channels,omitempty"`
+	Sandbox      SandboxConfig              `json:"sandbox,omitempty"`
+	Log          LogConfig                  `json:"log,omitempty"`
+	McpServers   map[string]McpServerConfig `json:"mcp_servers,omitempty"`
+	Plugins      []string                   `json:"plugins,omitempty"`
+	Profiles     string                     `json:"profiles,omitempty"`
+	Env          map[string]string          `json:"env,omitempty"`
+	Sensitive    SensitiveConfig            `json:"sensitive,omitempty"`
+	Capabilities Capabilities               `json:"capabilities,omitempty"`
+	Embedding    EmbeddingConfig            `json:"embedding,omitempty"`
+	// DefaultMode is the session mode new sessions start in ("auto",
+	// "manual", "plan"). Empty = "manual" (approval-based safe default).
+	DefaultMode string `json:"default_mode,omitempty"`
+	// ContextProviders overrides the backend per capability. A non-empty
+	// OpenViking.Endpoint already switches ALL domains to OpenViking (it
+	// is a whole-context service); set a domain to "builtin" here to keep
+	// the local backend for it. Empty = no override.
+	ContextProviders ContextProviderConfig `json:"context_providers,omitempty"`
+	// OpenViking holds the connection settings for the OpenViking
+	// backend. A configured endpoint enables OpenViking for memory,
+	// skills, and resources (per-domain opt-out via ContextProviders).
+	OpenViking OpenVikingConfig `json:"openviking,omitempty"`
+}
+
+// ContextProviderConfig overrides the backend for each context capability.
+// Empty value = follow the endpoint default ("openviking" when
+// OpenViking.Endpoint is set, "builtin" otherwise).
+type ContextProviderConfig struct {
+	Memory   string `json:"memory,omitempty"` // "" | "builtin" | "openviking"
+	Skill    string `json:"skill,omitempty"`
+	Resource string `json:"resource,omitempty"`
+}
+
+// OpenVikingConfig connects to an OpenViking server (direct HTTP API —
+// search/remember/read, no SDK).
+type OpenVikingConfig struct {
+	Endpoint string `json:"endpoint,omitempty"` // e.g. "http://127.0.0.1:1933"
+}
+
+// EmbeddingConfig selects the semantic-embedding backend for knowledge
+// recall. When empty (or Provider == ""), the built-in BGE embedder
+// (offline, embedded in the binary) is used. Otherwise an OpenAI-
+// compatible embeddings API is called.
+type EmbeddingConfig struct {
+	Provider string `json:"provider,omitempty"` // "openai" (OpenAI-compatible /embeddings)
+	Model    string `json:"model,omitempty"`    // e.g. "text-embedding-3-small"
+	BaseURL  string `json:"base_url,omitempty"` // e.g. "https://api.openai.com/v1"
+	APIKey   string `json:"api_key,omitempty"`
 }
 
 // SensitiveConfig controls redaction of sensitive values in tool results.
@@ -129,27 +169,61 @@ func DefaultPluginsDir() string {
 	return filepath.Join(home, ".openagent", "plugins")
 }
 
+// ApplyDefaults fills zero-value fields with the built-in defaults. It is
+// the single source of defaults, shared by Load and cmd/cli's
+// plugin-merged parse (which cannot call Load directly). settingsPath is
+// the settings file location (used to derive the default log dir); empty
+// resolves via Path().
+func ApplyDefaults(cfg *Config, settingsPath string) {
+	if settingsPath == "" {
+		settingsPath, _ = Path()
+	}
+	if settingsPath == "" {
+		home, _ := os.UserHomeDir()
+		settingsPath = filepath.Join(home, ".openagent", "settings.json")
+	}
+	if cfg.Provider == nil {
+		cfg.Provider = make(map[string]ProviderConfig)
+	}
+	if len(cfg.Plugins) == 0 {
+		cfg.Plugins = []string{DefaultPluginsDir()}
+	}
+	if cfg.Profiles == "" {
+		cfg.Profiles = ".openagent/profile"
+	}
+	if cfg.Server.Port == 0 {
+		cfg.Server.Port = 8080
+	}
+	if cfg.Log.File == "" {
+		cfg.Log.File = filepath.Join(filepath.Dir(settingsPath), "logs", "openagent.log")
+	}
+	if cfg.Log.MaxSize == 0 {
+		cfg.Log.MaxSize = 10
+	}
+	if cfg.Log.MaxBackups == 0 {
+		cfg.Log.MaxBackups = 5
+	}
+	if cfg.Log.MaxAge == 0 {
+		cfg.Log.MaxAge = 30
+	}
+	if cfg.Log.Level == "" {
+		cfg.Log.Level = "info"
+	}
+}
+
 func Load(path string) (*Config, error) {
-	p, _ := Path()
+	p := path
+	if p == "" {
+		p, _ = Path()
+	}
 	if p == "" {
 		home, _ := os.UserHomeDir()
 		p = filepath.Join(home, ".openagent", "settings.json")
 	}
-	cfg := &Config{
-		Provider: make(map[string]ProviderConfig),
-		Plugins:  []string{DefaultPluginsDir()},
-		Profiles: ".openagent/profile",
-		Server:   ServerConfig{Port: 8080},
-		Log: LogConfig{
-			File:       filepath.Join(filepath.Dir(p), "logs", "openagent.log"),
-			MaxSize:    10,
-			MaxBackups: 5,
-			MaxAge:     30,
-			Level:      "info",
-		},
-	}
+	cfg := &Config{}
+	ApplyDefaults(cfg, p)
 
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(p)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return cfg, nil

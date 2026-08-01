@@ -9,6 +9,8 @@ import (
 
 	openagent "github.com/yusheng-g/openagent-go"
 	openacp "github.com/yusheng-g/openagent-go/acp/sdk"
+	"github.com/yusheng-g/openagent-go/agent"
+	"github.com/yusheng-g/openagent-go/kernel"
 	"github.com/yusheng-g/openagent-go/plan"
 	"github.com/yusheng-g/openagent-go/session"
 )
@@ -96,7 +98,7 @@ func toolCallChunk(index int, id, name string, args any) openagent.StreamChunk {
 			ToolCalls: []openagent.ToolCallDelta{{
 				Index:    index,
 				ID:       id,
-				Type:      "function",
+				Type:     "function",
 				Function: openagent.FunctionDelta{Name: name, Arguments: string(argsJSON)},
 			}},
 		}},
@@ -142,7 +144,7 @@ func (s *recordingSender) SendToolCall(tc openacp.ToolCallUpdate) error {
 	return nil
 }
 func (s *recordingSender) SendAvailableCommands(cmds []openacp.AvailableCommand) error { return nil }
-func (s *recordingSender) SendModeUpdate(modeID openacp.SessionModeId) error            { return nil }
+func (s *recordingSender) SendModeUpdate(modeID openacp.SessionModeId) error           { return nil }
 func (s *recordingSender) SendConfigOptionUpdate(opts []openacp.SessionConfigOption) error {
 	return nil
 }
@@ -210,21 +212,21 @@ func newPlanTestServer(t *testing.T, sid string, mode string, turns [][]openagen
 ) {
 	t.Helper()
 	mdl := &planModel{turns: turns}
-	agent := openagent.NewAgent("test",
-		openagent.WithModel(mdl),
-		openagent.WithSystemPrompts("test"),
-		openagent.WithMaxTurns(20),
+	cfg := agent.New("test",
+		agent.WithModel(mdl),
+		agent.WithSystemPrompts("test"),
+		agent.WithMaxTurns(20),
 	)
 	store := newFakeStore()
-	srv := NewAgentServer(agent, nil, store, map[string]openagent.Model{"test/m": mdl})
+	srv := NewAgentServer(cfg, kernel.Deps{}, store, map[string]openagent.Model{"test/m": mdl})
 
 	// Build the session directly (avoids needing the SDK mux/client RPC).
 	ss := &agentSession{
-		id:           openacp.SessionId(sid),
-		cwd:          t.TempDir(),
-		mode:         mode,
-		config:       map[openacp.SessionConfigId]any{"thought_level": "medium", "model": "test/m"},
-		firstPrompt:  false,
+		id:          openacp.SessionId(sid),
+		cwd:         t.TempDir(),
+		mode:        mode,
+		config:      map[openacp.SessionConfigId]any{"thought_level": "medium", "model": "test/m"},
+		firstPrompt: false,
 	}
 	srv.putSession(openacp.SessionId(sid), ss)
 
@@ -372,7 +374,7 @@ func TestExitInjectsExecutionToolsSameTurn(t *testing.T) {
 			}
 		}
 	}}
-	srv.Agent.Model = capturing
+	srv.Cfg.Model = capturing
 	srv.Models["test/m"] = capturing
 	_ = ss // session exists
 
@@ -417,10 +419,10 @@ func TestEnterExitEnterRestoresMode(t *testing.T) {
 type staticTool struct{ name string }
 
 func (t *staticTool) Definition() openagent.FunctionDefinition {
-	return openagent.FunctionDefinition{Name: t.name, Parameters: json.RawMessage(`{"type":"object","properties":{}}`)}
+	return openagent.FunctionDefinition{Name: t.name, Parameters: openagent.SchemaOf[struct{}]()}
 }
-func (t *staticTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
-	return "ok", nil
+func (t *staticTool) Execute(ctx context.Context, args json.RawMessage) *openagent.ToolResult {
+	return &openagent.ToolResult{Content: "ok"}
 }
 
 // capturingModel wraps a planModel and records the tool definitions offered

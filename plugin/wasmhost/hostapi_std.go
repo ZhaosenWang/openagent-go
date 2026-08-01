@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"time"
 )
 
 // NewHostAPI constructs a HostAPI with the given keyring and sensible
@@ -18,12 +19,18 @@ func NewHostAPI(kr Keyring) *HostAPI {
 	}
 }
 
-// NewHTTPClient returns an HTTPClient backed by net/http's default client.
-// Exported so non-HostAPI callers (e.g. the CLI plugin runtime) share one
-// implementation instead of each vendoring its own net/http wrapper.
+// NewHTTPClient returns an HTTPClient with a bounded timeout and response
+// size. Plugins are untrusted code — an unbounded request could hang the
+// host goroutine or exhaust memory. Exported so non-HostAPI callers (e.g.
+// the CLI plugin runtime) share one implementation.
 func NewHTTPClient() HTTPClient {
-	return &defaultHTTPClient{client: http.DefaultClient}
+	return &defaultHTTPClient{
+		client: &http.Client{Timeout: 30 * time.Second},
+	}
 }
+
+// maxPluginResponseBytes caps a plugin's HTTP response body.
+const maxPluginResponseBytes = 10 << 20 // 10 MiB
 
 // defaultHTTPClient implements HTTPClient via net/http.
 type defaultHTTPClient struct{ client *http.Client }
@@ -41,9 +48,12 @@ func (c *defaultHTTPClient) Do(method, url string, headers map[string]string, bo
 		return 0, nil, err
 	}
 	defer resp.Body.Close()
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxPluginResponseBytes+1))
 	if err != nil {
 		return resp.StatusCode, nil, fmt.Errorf("read response body: %w", err)
+	}
+	if len(respBody) > maxPluginResponseBytes {
+		return resp.StatusCode, nil, fmt.Errorf("response exceeds %d bytes", maxPluginResponseBytes)
 	}
 	return resp.StatusCode, respBody, nil
 }

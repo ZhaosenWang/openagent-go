@@ -1,28 +1,30 @@
 package rest
 
 import (
-	"log/slog"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
+	"log/slog"
 	"net/http"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	openagent "github.com/yusheng-g/openagent-go"
+	"github.com/yusheng-g/openagent-go/agent"
+	ctxpkg "github.com/yusheng-g/openagent-go/context"
 	"github.com/yusheng-g/openagent-go/eventbus"
-	"github.com/yusheng-g/openagent-go/memory/sqlite"
+	"github.com/yusheng-g/openagent-go/governance"
+	"github.com/yusheng-g/openagent-go/kernel"
 	"github.com/yusheng-g/openagent-go/model/openai"
 	wasm "github.com/yusheng-g/openagent-go/plugin/agent/wasm"
 	"github.com/yusheng-g/openagent-go/plugin/wasmhost"
 	"github.com/yusheng-g/openagent-go/process"
 	"github.com/yusheng-g/openagent-go/session"
-	"github.com/yusheng-g/openagent-go/skill/fs"
 )
 
 // ── Handler ──
@@ -49,21 +51,13 @@ type Handler struct {
 	modelList    []ModelInfo                // ordered list for /models endpoint
 	modelsMu     sync.RWMutex
 
-	tools         []openagent.Tool
-	systemPrompts []string
-	name          string
-	maxTurns      int
-	pluginMgr     *wasm.Manager // nil = plugins disabled, set by WithPluginManager
+	cfg       *agent.Agent  // template configuration (cloned per session)
+	deps      kernel.Deps   // template runtime deps (copied per session)
+	pluginMgr *wasm.Manager // nil = plugins disabled, set by WithPluginManager
 
-	// Optional capabilities from the template Agent.
-	hooks       openagent.RunHooks
-	observer    openagent.RunObserver
-	inGuard     openagent.InputGuard
-	outGuard    openagent.OutputGuard
-	skillLoader openagent.SkillLoader
-
-	// approverEnabled gates the per-session WithApprover. Default true (enabled)
-	// for backward compatibility; set false via --approver=off.
+	// approverEnabled gates the per-session WithApprover. Default false
+	// (no approval step — tools run unapproved); the CLI enables it via
+	// --approver=on / settings. Set via WithApproverEnabled.
 	approverEnabled bool
 
 	// processBaseDir is the root directory for per-session process output.
@@ -74,27 +68,24 @@ type Handler struct {
 	sm *sessionManager[*sessionState] // session CRUD, store, bus
 }
 
-// NewHandler creates a Handler from a configured Agent.
-func NewHandler(agent *openagent.Agent) *Handler {
+// NewHandler creates a Handler from an agent config and runtime deps.
+func NewHandler(cfg *agent.Agent, deps kernel.Deps) *Handler {
 	h := &Handler{
-		defaultModel:    agent.Model,
+		defaultModel:    cfg.Model,
 		models:          make(map[string]openagent.Model),
 		modelConfigs:    make(map[string]ModelConfig),
 		modelList:       nil,
-		tools:           agent.Tools,
-		systemPrompts:   agent.SystemPrompts,
-		name:            agent.Name,
-		maxTurns:        agent.MaxTurns,
-		hooks:           agent.Hooks,
+		cfg:             cfg.Clone(),
+		deps:            deps,
 		approverEnabled: true,
-		observer:        agent.Observer,
-		inGuard:         agent.InGuard,
-		outGuard:        agent.OutGuard,
-		skillLoader:     agent.SkillLoader,
+	}
+	// One shared background extractor per server (never per run).
+	if h.deps.Extractor == nil && h.deps.MemoryProvider != nil && h.cfg.Model != nil {
+		h.deps.Extractor = ctxpkg.NewAsyncExtractor(ctxpkg.NewLLMExtractor(h.cfg.Model, h.deps.MemoryProvider))
 	}
 
 	bus := eventbus.New[SSEEvent](500)
-	h.sm = newSessionManager[*sessionState](nil, agent.Memory, bus, sessionHooks[*sessionState]{
+	h.sm = newSessionManager[*sessionState](deps.SessionStore, bus, sessionHooks[*sessionState]{
 		kind:       "single",
 		newEntry:   h.newEntry,
 		fillDetail: h.fillDetail,
@@ -111,8 +102,8 @@ func NewHandler(agent *openagent.Agent) *Handler {
 // fillDetail enriches the SessionDetail with per-handler runtime fields
 // (ContextWindow from the agent's model).
 func (h *Handler) fillDetail(e *sessionState, detail *SessionDetail) {
-	if e.agent != nil && e.agent.Model != nil {
-		detail.ContextWindow = e.agent.Model.ContextWindow()
+	if e.cfg != nil && e.cfg.Model != nil {
+		detail.ContextWindow = e.cfg.Model.ContextWindow()
 	}
 }
 
@@ -163,9 +154,9 @@ type ModelConfig struct {
 }
 
 // lookupModel finds a registered model. When provider is non-empty, it uses
-// the exact composite key "provider:modelId". Otherwise it scans all registered
-// models for matching modelId — this handles the common case where the frontend
-// sends only modelId without provider.
+// the exact composite key "provider/modelId". Otherwise it scans all
+// registered models for a suffix match on "/modelId" — this handles the
+// common case where the frontend sends only modelId without provider.
 func (h *Handler) lookupModel(provider, modelID string) openagent.Model {
 	h.modelsMu.RLock()
 	defer h.modelsMu.RUnlock()
@@ -183,26 +174,20 @@ func (h *Handler) lookupModel(provider, modelID string) openagent.Model {
 	return nil
 }
 
-// WithPluginManager attaches a WASM plugin manager for session lifecycle
-// hooks (agent:sessions) and runtime APIs (agent:observers).
-// Must be called before any session is created.
+// WithPluginManager attaches a WASM plugin manager (agent:observers for
+// stage observation, agent:tools for custom tools). Must be called before
+// any session is created.
 func (h *Handler) WithPluginManager(mgr *wasm.Manager) *Handler {
 	h.pluginMgr = mgr
 	if obs := mgr.Observer(); obs != nil {
-		if h.observer != nil {
-			h.observer = openagent.MultiObserver(h.observer, obs)
+		if h.deps.Observer != nil {
+			h.deps.Observer = openagent.MultiObserver(h.deps.Observer, obs)
 		} else {
-			h.observer = obs
+			h.deps.Observer = obs
 		}
 		slog.Info("plugin observer wired", "source", "wasm")
 	}
 	h.sm.hooks.onDelete = func(e *sessionState) {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		mgr.OnSessionDestroy(ctx, wasm.SessionCtx{SessionID: e.info.ID})
-		if e.ownedCloser != nil {
-			e.ownedCloser.Close()
-		}
 		if e.processMgr != nil {
 			e.processMgr.Cleanup()
 		}
@@ -267,12 +252,12 @@ func (h *Handler) WithProcessDir(dir string) *Handler {
 // Events are published to the Handler-level bus via sm so that multiple
 // SSE connections (e.g. browser tabs) all receive the full stream.
 type sessionState struct {
-	info  session.SessionInfo // ModelID is the session's model preference; empty → handler default
-	agent *openagent.Agent
+	info session.SessionInfo // ModelID is the session's model preference; empty → handler default
+	cfg  *agent.Agent        // per-session config clone
+	deps kernel.Deps         // per-session runtime deps
 
-	// ownedCloser is a per-session resource (e.g. memory db created by
-	// an agent:sessions plugin) that is closed on session deletion.
-	ownedCloser io.Closer
+	// approvalMemory persists session-scoped "allow always" decisions.
+	approvalMemory governance.ApprovalMemory
 
 	// processMgr tracks background processes started by the shell tool.
 	// Created on session start, cleaned up on deletion.
@@ -282,6 +267,7 @@ type sessionState struct {
 	running         bool // true while agent goroutine is active
 	pendingApproval *pendingApproval
 }
+
 
 func (s *sessionState) sessionInfo() *session.SessionInfo { return &s.info }
 
@@ -293,13 +279,30 @@ func (s *sessionState) isActive() bool {
 	return s.running || s.pendingApproval != nil
 }
 
+// takePending returns and clears the pending approval (nil if none).
+func (s *sessionState) takePending() *pendingApproval {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p := s.pendingApproval
+	s.pendingApproval = nil
+	return p
+}
+
+// setPending parks the approval responder on the session.
+func (s *sessionState) setPending(p *pendingApproval) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pendingApproval = p
+}
+
 type pendingApproval struct {
 	respond chan approveResponse
 }
 
 type approveResponse struct {
-	allowed bool
-	reason  string
+	action       string          // allow|deny|always|edit
+	modifiedArgs json.RawMessage // action=edit
+	reason       string
 }
 
 // ── Session CRUD handlers ──
@@ -342,10 +345,20 @@ func (h *Handler) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s := h.sm.getOrCreate(id)
+	s := h.sm.getOrCreate(r.Context(), id)
 
-	// Reset pending approval for the new chat message.
+	// Reject concurrent chats on the same session — two parallel agent
+	// runs would interleave their messages in the shared conversation.
 	s.mu.Lock()
+	if s.running {
+		s.mu.Unlock()
+		http.Error(w, `{"error":"session busy — a run is in progress"}`, http.StatusConflict)
+		return
+	}
+	// Reset pending approval for the new chat message.
+	if s.pendingApproval != nil {
+		slog.Info("openagent: discarding pending approval for new chat", "session", id)
+	}
 	s.running = true
 	s.pendingApproval = nil
 	s.mu.Unlock()
@@ -380,6 +393,7 @@ func (h *Handler) handleChat(w http.ResponseWriter, r *http.Request) {
 	// When provider is empty, find the first registered model for the given ID.
 	model := h.lookupModel(provider, modelID)
 	if model == nil {
+		slog.Warn("openagent: unknown model, falling back to default", "session", id, "provider", provider, "model_id", modelID)
 		model = h.defaultModel
 	}
 
@@ -391,11 +405,20 @@ func (h *Handler) handleChat(w http.ResponseWriter, r *http.Request) {
 		h.sm.syncMeta(inf)
 	}
 
-	// Start the agent run in a background goroutine.
+	// Start the agent run in a background goroutine. The run context is
+	// derived from the request context: when the client disconnects, the
+	// run is cancelled (cancel compensation persists in-flight tool
+	// results) instead of leaking until the timeout.
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 		defer cancel()
 		defer func() {
+			// A panic in the run must not kill the server: log it and let
+			// the subscriber see an error event instead.
+			if rec := recover(); rec != nil {
+				slog.Error("openagent: agent run panicked", "session", id, "panic", rec)
+				h.sm.Bus().Publish(id, SSEEvent{Type: "error", Error: "agent run panicked"})
+			}
 			s.mu.Lock()
 			s.running = false
 			s.pendingApproval = nil
@@ -410,11 +433,13 @@ func (h *Handler) handleChat(w http.ResponseWriter, r *http.Request) {
 			CreatedAt: s.info.CreatedAt,
 		}
 
+		rt := kernel.New(s.cfg, s.deps)
+
 		// Inject AgentRuntime into context so runtime_* host exports work
 		// in agent:observers / agent:tools plugins during this run.
 		if h.pluginMgr != nil {
-			rt := wasm.BuildAgentRuntime(s.agent, &oaSession, h.SetModel)
-			ctx = wasmhost.WithAgentRuntime(ctx, rt)
+			wrt := wasm.BuildAgentRuntime(rt, &oaSession, h.SetModel)
+			ctx = wasmhost.WithAgentRuntime(ctx, wrt)
 		}
 
 		// Inject ProcessManager so the shell tool can persist
@@ -423,18 +448,22 @@ func (h *Handler) handleChat(w http.ResponseWriter, r *http.Request) {
 			ctx = process.WithManager(ctx, s.processMgr)
 		}
 
-		ch := s.agent.RunStream(ctx, oaSession, openagent.UserMessage(body.Message))
+		ch := rt.RunStream(ctx, oaSession, openagent.UserMessage(body.Message))
 		for evt := range ch {
 			se := streamToSSE(evt)
 			select {
 			case <-r.Context().Done():
-				// Client disconnected — stop publishing.
-				// Agent continues with its own ctx; timeout cleans up.
+				// Client disconnected — the run context derives from the
+				// request, so the run is cancelled here too (cancel
+				// compensation persists in-flight tool results).
 				return
 			default:
 			}
 			h.sm.Bus().Publish(id, se)
 		}
+		// Checkpoint: recoverable restore point after a completed run
+		// (metadata + message count).
+		h.sm.Checkpoint(ctx, id)
 	}()
 
 	// Stream events to the SSE response until done/error/disconnect.
@@ -451,37 +480,48 @@ func (h *Handler) handleChat(w http.ResponseWriter, r *http.Request) {
 // ── Approve handler ──
 
 func (h *Handler) handleApprove(w http.ResponseWriter, r *http.Request) {
+	handleApproveShared(h.sm, w, r)
+}
+
+// handleApproveShared is the approval endpoint — shared by the chat and
+// orchestrate handlers (they previously carried identical copies).
+func handleApproveShared[E sessionEntry](sm *sessionManager[E], w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
 	var body ApproveRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, `{"error":"allowed is required"}`, http.StatusBadRequest)
+		http.Error(w, `{"error":"invalid approve request"}`, http.StatusBadRequest)
+		return
+	}
+	switch body.Action {
+	case "allow", "deny", "always", "edit":
+	default:
+		http.Error(w, `{"error":"action must be allow|deny|always|edit"}`, http.StatusBadRequest)
 		return
 	}
 
-	s := h.sm.getOrCreate(id)
-
-	s.mu.Lock()
-	p := s.pendingApproval
-	s.pendingApproval = nil
-	s.mu.Unlock()
+	s := sm.getOrCreate(r.Context(), id)
+	p := s.takePending()
 
 	if p == nil {
 		http.Error(w, `{"error":"no pending approval"}`, http.StatusBadRequest)
 		return
 	}
 
-	reason := "denied"
-	if body.Feedback != "" {
-		reason = "denied: " + body.Feedback
+	resp := approveResponse{action: body.Action, modifiedArgs: body.Args}
+	switch body.Action {
+	case "deny":
+		resp.reason = "denied"
+		if body.Feedback != "" {
+			resp.reason = "denied: " + body.Feedback
+		}
+	default:
+		resp.reason = "approved"
 	}
-	if body.Allowed {
-		reason = "approved"
-	}
-	p.respond <- approveResponse{allowed: body.Allowed, reason: reason}
+	p.respond <- resp
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": reason})
+	json.NewEncoder(w).Encode(map[string]string{"status": resp.reason})
 }
 
 // ── Models ──
@@ -500,7 +540,7 @@ func (h *Handler) handleListModels(w http.ResponseWriter, r *http.Request) {
 
 // newEntry creates a fresh sessionState from session.SessionInfo.
 // Used by sessionManager when creating or restoring sessions.
-func (h *Handler) newEntry(info session.SessionInfo) *sessionState {
+func (h *Handler) newEntry(ctx context.Context, info session.SessionInfo) *sessionState {
 	s := &sessionState{info: info}
 
 	// Create per-session process manager for tracking long-running shell commands.
@@ -511,73 +551,28 @@ func (h *Handler) newEntry(info session.SessionInfo) *sessionState {
 		}
 	}
 
-	opts := []openagent.AgentOption{
-		openagent.WithModel(h.defaultModel),
-		openagent.WithMemory(h.sm.Memory()),
-		openagent.WithTools(h.tools...),
-		openagent.WithSystemPrompts(h.systemPrompts...),
-		openagent.WithMaxTurns(h.maxTurns),
-	}
+	s.cfg = h.cfg.Clone()
+	s.deps = h.deps
+	s.approvalMemory = governance.NewPersistentApprovalMemory(h.sm.Runtime())
+	s.deps.SessionStore = h.sm.Memory()
+	s.deps.Observer = nil
 
-	// agent:sessions plugins — let them override agent config before NewAgent.
-	if h.pluginMgr != nil {
-		cfg := h.pluginMgr.OnSessionInit(context.Background(), wasm.SessionCtx{
-			SessionID: info.ID,
-		})
-		if cfg != nil {
-			if len(cfg.SystemPrompts) > 0 {
-				opts = append(opts, openagent.WithSystemPrompts(cfg.SystemPrompts...))
-			}
-			if cfg.Description != "" {
-				opts = append(opts, openagent.WithDescription(cfg.Description))
-			}
-			if cfg.MaxTurns > 0 {
-				opts = append(opts, openagent.WithMaxTurns(cfg.MaxTurns))
-			}
-			if cfg.SkillDir != "" {
-				if sl := fs.New(cfg.SkillDir); sl != nil {
-					opts = append(opts, openagent.WithSkillLoader(sl))
-				}
-			}
-			if cfg.MemoryPath != "" {
-				mem, err := sqlite.New(cfg.MemoryPath)
-				if err == nil {
-					opts = append(opts, openagent.WithMemory(mem))
-					s.ownedCloser = mem
-				}
-			}
-		}
-	}
 	if h.approverEnabled {
-		opts = append(opts, openagent.WithApprover(&restApprover{
+		s.deps.HumanApprover = &restApprover{
 			submit: func(call openagent.ToolCall, resp chan approveResponse) {
 				h.submitApproval(s, call, resp)
 			},
-		}))
+			memory: s.approvalMemory,
+		}
 	}
-	// Combine user observer with the stage observer (for SSE events).
-	if h.observer != nil {
-		opts = append(opts, openagent.WithRunObservers(
-			&stageObserver{bus: h.sm.Bus(), sid: info.ID},
-			h.observer,
-		))
+	// Stage observer feeds the SSE bus; combine with the user observer.
+	stageObs := &stageObserver{bus: h.sm.Bus(), sid: info.ID}
+	if h.deps.Observer != nil {
+		s.deps.Observer = openagent.MultiObserver(stageObs, h.deps.Observer)
 	} else {
-		opts = append(opts, openagent.WithRunObserver(&stageObserver{bus: h.sm.Bus(), sid: info.ID}))
+		s.deps.Observer = stageObs
 	}
-	if h.hooks != nil {
-		opts = append(opts, openagent.WithRunHooks(h.hooks))
-	}
-	if h.inGuard != nil {
-		opts = append(opts, openagent.WithInputGuard(h.inGuard))
-	}
-	if h.outGuard != nil {
-		opts = append(opts, openagent.WithOutputGuard(h.outGuard))
-	}
-	if h.skillLoader != nil {
-		opts = append(opts, openagent.WithSkillLoader(h.skillLoader))
-	}
-
-	s.agent = openagent.NewAgent(h.name, opts...)
+	s.deps.Hooks = h.deps.Hooks
 
 	return s
 }
@@ -586,21 +581,46 @@ func (h *Handler) newEntry(info session.SessionInfo) *sessionState {
 
 type restApprover struct {
 	submit func(call openagent.ToolCall, resp chan approveResponse)
+	memory governance.ApprovalMemory // session-scoped "always" persistence
 }
 
-func (a *restApprover) Approve(ctx context.Context, call openagent.ToolCall, def openagent.FunctionDefinition, session openagent.Session) (bool, string) {
+// Ask implements governance.HumanApprover — the single approval entry
+// point. The four UI actions map onto Decisions: always persists to the
+// session approval memory, edit carries the modified args forward.
+func (a *restApprover) Ask(ctx context.Context, call openagent.ToolCall, def openagent.FunctionDefinition, session openagent.Session) (governance.Decision, error) {
 	resp := make(chan approveResponse, 1)
 	a.submit(call, resp)
 
+	var r approveResponse
 	select {
 	case <-ctx.Done():
-		return false, "cancelled"
-	case r := <-resp:
-		return r.allowed, r.reason
+		return governance.Decision{Action: governance.Deny, Reason: "cancelled"}, nil
+	case r = <-resp:
+	}
+
+	switch r.action {
+	case "always":
+		d := governance.Decision{Action: governance.Allow, Reason: r.reason}
+		if a.memory != nil {
+			_ = a.memory.Remember(ctx, session.ID, call.Function.Name, d)
+		}
+		return d, nil
+	case "edit":
+		return governance.Decision{Action: governance.Allow, Reason: r.reason, ModifiedArgs: r.modifiedArgs}, nil
+	case "deny":
+		return governance.Decision{Action: governance.Deny, Reason: r.reason}, nil
+	default: // allow
+		return governance.Decision{Action: governance.Allow, Reason: r.reason}, nil
 	}
 }
 
 func (h *Handler) submitApproval(s *sessionState, call openagent.ToolCall, resp chan approveResponse) {
+	submitApprovalShared(h.sm, s, call, resp)
+}
+
+// submitApprovalShared publishes an approval request and parks the
+// responder on the session — shared by the chat and orchestrate handlers.
+func submitApprovalShared[E sessionEntry](sm *sessionManager[E], s E, call openagent.ToolCall, resp chan approveResponse) {
 	tcj := &SSEToolCall{
 		ID: call.ID,
 		Function: SSEToolCallFunction{
@@ -614,11 +634,8 @@ func (h *Handler) submitApproval(s *sessionState, call openagent.ToolCall, resp 
 		ToolCall: tcj,
 	}
 
-	s.mu.Lock()
-	s.pendingApproval = &pendingApproval{respond: resp}
-	s.mu.Unlock()
-
-	h.sm.Bus().Publish(s.info.ID, evt)
+	s.setPending(&pendingApproval{respond: resp})
+	sm.Bus().Publish(s.sessionInfo().ID, evt)
 }
 
 // ── SSE conversion ──
@@ -632,6 +649,12 @@ func streamToSSE(evt openagent.StreamEvent) SSEEvent {
 		return SSEEvent{Type: "text_delta", Text: evt.Text}
 
 	case openagent.StreamToolCall:
+		// The kernel emits one event per call, but a custom context/execution
+		// layer could emit an empty ToolCalls — guard instead of panicking
+		// the run goroutine.
+		if len(evt.Message.ToolCalls) == 0 {
+			return SSEEvent{Type: "tool_call"}
+		}
 		tc := evt.Message.ToolCalls[0]
 		return SSEEvent{
 			Type: "tool_call",
@@ -692,9 +715,15 @@ func streamToSSE(evt openagent.StreamEvent) SSEEvent {
 
 // ── Helpers ──
 
+// idSeq disambiguates session ids when crypto/rand fails (all-zero hex
+// would collide across sessions).
+var idSeq atomic.Uint64
+
 func generateID() string {
 	b := make([]byte, 16)
-	rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("%d-%d", time.Now().UnixNano(), idSeq.Add(1))
+	}
 	return hex.EncodeToString(b)
 }
 

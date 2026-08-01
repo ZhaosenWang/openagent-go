@@ -9,12 +9,15 @@ import (
 	"time"
 
 	openacp "github.com/yusheng-g/openagent-go/acp/sdk"
+
+	"github.com/yusheng-g/openagent-go/agent"
+	"github.com/yusheng-g/openagent-go/kernel"
 )
 
 // TestNewAgentServer_MCPEnabledDefault verifies the MCP gate defaults to
 // enabled so existing callers (who don't set it) keep MCP behavior.
 func TestNewAgentServer_MCPEnabledDefault(t *testing.T) {
-	srv := NewAgentServer(nil, nil, nil, nil)
+	srv := NewAgentServer(agent.New("test"), kernel.Deps{}, nil, nil)
 	if !srv.MCPEnabled {
 		t.Error("NewAgentServer should default MCPEnabled to true")
 	}
@@ -30,7 +33,7 @@ func TestConnectMCP_Gate(t *testing.T) {
 		t.Skip("touch not available; skipping MCP gate side-effect test")
 	}
 
-	srv := NewAgentServer(nil, nil, nil, nil)
+	srv := NewAgentServer(agent.New("test"), kernel.Deps{}, nil, nil)
 	// A stdio MCP server whose "server" is just `touch <file>`. connectMCP
 	// will spawn it (creating the file) then fail the MCP handshake — the
 	// failure is logged and non-fatal, but the file proves the spawn.

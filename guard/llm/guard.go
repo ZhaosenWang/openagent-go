@@ -1,4 +1,4 @@
-// Package llm implements openagent.InputGuard and openagent.OutputGuard via
+// Package llm implements governance.InputGuard and governance.OutputGuard via
 // an LLM judge model. Follows OpenAI Moderations API / Llama Guard pattern.
 //
 // Usage:
@@ -18,10 +18,11 @@ import (
 	"strings"
 
 	openagent "github.com/yusheng-g/openagent-go"
+	"github.com/yusheng-g/openagent-go/governance"
 )
 
-// Guard implements openagent.InputGuard by calling a judge Model.
-// Call Output() to obtain the openagent.OutputGuard facet.
+// Guard implements governance.InputGuard by calling a judge Model.
+// Call Output() to obtain the governance.OutputGuard facet.
 // The judge model can be a smaller, faster model (e.g., gpt-4o-mini) — it
 // does not need to be the same model used for the main conversation.
 type Guard struct {
@@ -57,15 +58,15 @@ func New(model openagent.Model, opts ...Option) *Guard {
 	return g
 }
 
-// Output returns the openagent.OutputGuard facet of this guard.
-func (g *Guard) Output() openagent.OutputGuard { return &outputGuard{g: g} }
+// Output returns the governance.OutputGuard facet of this guard.
+func (g *Guard) Output() governance.OutputGuard { return &outputGuard{g: g} }
 
 // ── InputGuard ──
 
-// Check implements openagent.InputGuard.
-func (g *Guard) Check(ctx context.Context, input openagent.GuardInput) openagent.GuardResult {
+// Check implements governance.InputGuard.
+func (g *Guard) Check(ctx context.Context, input governance.GuardInput) governance.GuardResult {
 	if input.Input.Content == "" {
-		return openagent.GuardResult{Allowed: true}
+		return governance.GuardResult{Allowed: true}
 	}
 	return g.judge(ctx, g.inputPrompt, input.Input.Content)
 }
@@ -74,21 +75,21 @@ func (g *Guard) Check(ctx context.Context, input openagent.GuardInput) openagent
 
 type outputGuard struct{ g *Guard }
 
-// Check implements openagent.OutputGuard.
-func (og *outputGuard) Check(ctx context.Context, output openagent.GuardOutput) openagent.GuardResult {
+// Check implements governance.OutputGuard.
+func (og *outputGuard) Check(ctx context.Context, output governance.GuardOutput) governance.GuardResult {
 	content := output.Output.Content
 	for _, tc := range output.Output.ToolCalls {
 		content += "\ntool_call: " + tc.Function.Name + "(" + tc.Function.Arguments + ")"
 	}
 	if content == "" {
-		return openagent.GuardResult{Allowed: true}
+		return governance.GuardResult{Allowed: true}
 	}
 	return og.g.judge(ctx, og.g.outputPrompt, content)
 }
 
 // ── Judge ──
 
-func (g *Guard) judge(ctx context.Context, systemPrompt, content string) openagent.GuardResult {
+func (g *Guard) judge(ctx context.Context, systemPrompt, content string) governance.GuardResult {
 	resp, err := g.model.ChatCompletion(ctx, openagent.ChatCompletionRequest{
 		Messages: []openagent.Message{
 			{Role: openagent.RoleSystem, Content: systemPrompt},
@@ -98,9 +99,9 @@ func (g *Guard) judge(ctx context.Context, systemPrompt, content string) openage
 	})
 	if err != nil {
 		if g.failOpen {
-			return openagent.GuardResult{Allowed: true}
+			return governance.GuardResult{Allowed: true}
 		}
-		return openagent.GuardResult{
+		return governance.GuardResult{
 			Allowed: false,
 			Reason:  fmt.Sprintf("guard judge failed: %v", err),
 		}
@@ -108,37 +109,80 @@ func (g *Guard) judge(ctx context.Context, systemPrompt, content string) openage
 
 	if len(resp.Choices) == 0 {
 		if g.failOpen {
-			return openagent.GuardResult{Allowed: true}
+			return governance.GuardResult{Allowed: true}
 		}
-		return openagent.GuardResult{Allowed: false, Reason: "guard judge returned no choices"}
+		return governance.GuardResult{Allowed: false, Reason: "guard judge returned no choices"}
 	}
-	return parseResult(resp.Choices[0].Message.Content, g.failOpen)
+	msg := resp.Choices[0].Message
+	content = msg.Content
+	if strings.TrimSpace(content) == "" {
+		// Reasoning-only models put the verdict in ReasoningContent.
+		content = msg.ReasoningContent
+	}
+	if r, ok := parseResult(content); ok {
+		return r
+	}
+
+	// The judge did not follow the JSON contract (common with prose-
+	// answering chat models). One corrective retry — fail-closed on a
+	// plain-text verdict would block EVERYTHING, which is an availability
+	// collapse, not a safety decision.
+	retry := g.retryJudge(ctx, systemPrompt, content)
+	if r, ok := parseResult(retry); ok {
+		return r
+	}
+	reason := "unparseable guard response: " + truncate(content, 100)
+	if g.failOpen {
+		return governance.GuardResult{Allowed: true, Reason: reason}
+	}
+	return governance.GuardResult{Allowed: false, Reason: reason}
 }
 
-func parseResult(content string, failOpen bool) openagent.GuardResult {
+// retryJudge asks the judge again with an explicit corrective instruction
+// after a non-JSON response. Returns the raw second response ("" on call
+// failure — parseResult on "" fails, so the fail-open/closed decision
+// stays in judge()).
+func (g *Guard) retryJudge(ctx context.Context, systemPrompt, prev string) string {
+	resp, err := g.model.ChatCompletion(ctx, openagent.ChatCompletionRequest{
+		Messages: []openagent.Message{
+			{Role: openagent.RoleSystem, Content: systemPrompt},
+			{Role: openagent.RoleUser, Content: prev},
+			{Role: openagent.RoleUser, Content: `Your previous response was not valid JSON. Respond with ONLY the JSON object, exactly this shape, no markdown, no commentary: {"allowed": true or false, "reason": "brief explanation or empty", "tripwire": true or false}`},
+		},
+		MaxTokens: 256,
+	})
+	if err != nil || len(resp.Choices) == 0 {
+		return ""
+	}
+	msg := resp.Choices[0].Message
+	if strings.TrimSpace(msg.Content) != "" {
+		return msg.Content
+	}
+	return msg.ReasoningContent
+}
+
+// parseResult parses the judge's JSON verdict (markdown fences tolerated,
+// plus a lenient "allowed": true/false substring fallback for commentary-
+// wrapped JSON). Returns ok=false when nothing parseable is found.
+func parseResult(content string) (governance.GuardResult, bool) {
 	content = strings.TrimSpace(content)
 	content = strings.TrimPrefix(content, "```json")
 	content = strings.TrimPrefix(content, "```")
 	content = strings.TrimSuffix(content, "```")
 	content = strings.TrimSpace(content)
 
-	var r openagent.GuardResult
-	if err := json.Unmarshal([]byte(content), &r); err != nil {
-		lower := strings.ToLower(content)
-		if strings.Contains(lower, "\"allowed\": false") || strings.Contains(lower, "\"allowed\":false") {
-			return openagent.GuardResult{Allowed: false, Reason: content}
-		}
-		if strings.Contains(lower, "\"allowed\": true") || strings.Contains(lower, "\"allowed\":true") {
-			return openagent.GuardResult{Allowed: true}
-		}
-		// Parse failed entirely — failOpen means allow, default blocks.
-		reason := "unparseable guard response: " + truncate(content, 100)
-		if failOpen {
-			return openagent.GuardResult{Allowed: true, Reason: reason}
-		}
-		return openagent.GuardResult{Allowed: false, Reason: reason}
+	var r governance.GuardResult
+	if err := json.Unmarshal([]byte(content), &r); err == nil {
+		return r, true
 	}
-	return r
+	lower := strings.ToLower(content)
+	if strings.Contains(lower, "\"allowed\": false") || strings.Contains(lower, "\"allowed\":false") {
+		return governance.GuardResult{Allowed: false, Reason: content}, true
+	}
+	if strings.Contains(lower, "\"allowed\": true") || strings.Contains(lower, "\"allowed\":true") {
+		return governance.GuardResult{Allowed: true}, true
+	}
+	return governance.GuardResult{}, false
 }
 
 func truncate(s string, n int) string {
@@ -186,5 +230,5 @@ Rules:
 - tripwire=true ONLY for severe violations that should terminate the entire run (PII leak, security credentials, illegal content).
 - Model refusing to answer a harmful request IS safe (allowed=true).`
 
-var _ openagent.InputGuard = (*Guard)(nil)
-var _ openagent.OutputGuard = (*outputGuard)(nil)
+var _ governance.InputGuard = (*Guard)(nil)
+var _ governance.OutputGuard = (*outputGuard)(nil)

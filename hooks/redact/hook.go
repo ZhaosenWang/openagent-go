@@ -59,7 +59,6 @@ package redact
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"os"
 	"sort"
 	"strings"
@@ -126,20 +125,18 @@ func (h *Hook) OnToolStart(ctx context.Context, tool openagent.FunctionDefinitio
 // If the result is valid JSON, the hint is NOT appended as a trailing string
 // (that would break JSON validity); the redaction still happens in-place
 // and the result stays parseable.
-func (h *Hook) OnToolEnd(ctx context.Context, tool openagent.FunctionDefinition, args json.RawMessage, result *string, err *error, startState any) {
+func (h *Hook) OnToolEnd(ctx context.Context, tool openagent.FunctionDefinition, args json.RawMessage, result *openagent.ToolResult, startState any) {
 	if len(h.envNames) == 0 {
 		return
 	}
-	if result != nil && *result != "" {
-		if r, ok := redactString(*result, h.envNames); ok {
-			*result = applyHint(r, *result)
+	if result != nil && result.Content != "" {
+		if r, ok := redactString(result.Content, h.envNames); ok {
+			result.Content = applyHint(r, result.Content)
 		}
 	}
-	if err != nil && *err != nil {
-		if s, ok := redactString((*err).Error(), h.envNames); ok {
-			// err is free-form text, never JSON-parsed downstream, so a
-			// trailing hint is always safe.
-			*err = fmt.Errorf("%s%s", s, hint)
+	if result != nil && result.Error != nil {
+		if s, ok := redactString(result.Error.Message, h.envNames); ok {
+			result.Error.Message = applyHint(s, result.Error.Message)
 		}
 	}
 }

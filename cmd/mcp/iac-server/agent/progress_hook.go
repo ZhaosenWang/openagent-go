@@ -54,7 +54,7 @@ func (h *progressHook) OnToolStart(ctx context.Context, tool openagent.FunctionD
 	return nil, nil
 }
 
-func (h *progressHook) OnToolEnd(ctx context.Context, tool openagent.FunctionDefinition, args json.RawMessage, result *string, err *error, startState any) {
+func (h *progressHook) OnToolEnd(ctx context.Context, tool openagent.FunctionDefinition, args json.RawMessage, result *openagent.ToolResult, startState any) {
 }
 
 var _ openagent.RunHooks = (*progressHook)(nil)

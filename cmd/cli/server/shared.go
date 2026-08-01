@@ -9,12 +9,18 @@ import (
 	"strings"
 
 	openagent "github.com/yusheng-g/openagent-go"
+	"github.com/yusheng-g/openagent-go/agent"
+	ctxpkg "github.com/yusheng-g/openagent-go/context"
+	"github.com/yusheng-g/openagent-go/embedder/bge"
+	openaiembed "github.com/yusheng-g/openagent-go/embedder/openai"
 	"github.com/yusheng-g/openagent-go/guard/llm"
-	artifacthook "github.com/yusheng-g/openagent-go/hooks/artifact"
 	redacthook "github.com/yusheng-g/openagent-go/hooks/redact"
 	sloghooks "github.com/yusheng-g/openagent-go/hooks/slog"
-	"github.com/yusheng-g/openagent-go/memory/sqlite"
+	"github.com/yusheng-g/openagent-go/kernel"
 	"github.com/yusheng-g/openagent-go/model/openai"
+	memorysqlite "github.com/yusheng-g/openagent-go/provider/memory/sqlite"
+	openviking "github.com/yusheng-g/openagent-go/provider/openviking"
+	"github.com/yusheng-g/openagent-go/provider/skill"
 	"github.com/yusheng-g/openagent-go/sandbox/native"
 	"github.com/yusheng-g/openagent-go/session"
 	sessionsqlite "github.com/yusheng-g/openagent-go/session/sqlite"
@@ -26,21 +32,49 @@ import (
 
 // ── Shared agent setup ──
 
-// buildMemory opens the SQLite memory and session store under profilesDir/memory/.
-func buildMemory(profilesDir string) (*sqlite.Memory, session.Store, func(), error) {
+// buildMemory opens the SQLite session store and knowledge provider under
+// profilesDir/memory/. The conversation (SessionStore/Compressor) and the
+// knowledge provider (MemoryProvider) share one database file via separate
+// connections (WAL); the metadata Store shares the conversation connection.
+func buildMemory(profilesDir string, emb config.EmbeddingConfig, embedder bool) (*sessionsqlite.MessageStore, ctxpkg.MemoryProvider, session.Store, func(), error) {
 	memDir := filepath.Join(profilesDir, "memory")
 	_ = os.MkdirAll(memDir, 0755)
-	mem, err := sqlite.New(filepath.Join(memDir, "memory.db"))
+	path := filepath.Join(memDir, "memory.db")
+	ms, err := sessionsqlite.NewMessageStore(path)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("memory: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("message store: %w", err)
 	}
-	mem.WithSemanticMD(filepath.Join(memDir, "semantic.md"))
-	store, err := sessionsqlite.New(mem.DB())
+	var knowledge ctxpkg.MemoryProvider
+	if embedder {
+		kmem, err := memorysqlite.New(path)
+		if err != nil {
+			ms.Close()
+			return nil, nil, nil, nil, fmt.Errorf("knowledge store: %w", err)
+		}
+		if emb.Provider != "" {
+			// External embedding backend (OpenAI-compatible /embeddings:
+			// OpenAI, Ollama, Jina, Cohere, local proxies).
+			kmem.WithEmbedder(openaiembed.New(emb.BaseURL, emb.APIKey, emb.Model))
+		} else {
+			// Built-in BGE embedder: semantic knowledge recall
+			// (vector-first, keyword fallback). Zero external deps — the
+			// model ships in the binary.
+			kmem.WithEmbedder(bge.New())
+		}
+		knowledge = kmem
+	}
+	store, err := sessionsqlite.New(ms.DB())
 	if err != nil {
-		mem.Close()
-		return nil, nil, nil, fmt.Errorf("session store: %w", err)
+		ms.Close()
+		return nil, nil, nil, nil, fmt.Errorf("session store: %w", err)
 	}
-	return mem, store, func() { store.Close(); mem.Close() }, nil
+	return ms, knowledge, store, func() {
+		store.Close()
+		if c, ok := knowledge.(interface{ Close() error }); ok {
+			c.Close()
+		}
+		ms.Close()
+	}, nil
 }
 
 // buildModels creates OpenAI model instances from config providers.
@@ -74,6 +108,33 @@ func firstModel(models []openagent.Model) openagent.Model {
 		if m != nil {
 			return m
 		}
+	}
+	return nil
+}
+
+// applyContextProviders selects the provider backend per capability.
+// OpenViking is a whole-context service (one endpoint, server-managed
+// memory/resource/skill indexes): a configured endpoint switches ALL
+// three domains to it by default — one address is enough. context_providers
+// remains as an opt-out escape hatch: an explicit "builtin" for a domain
+// keeps the local backend. No endpoint = fully local, no server required.
+func applyContextProviders(cfg *config.Config, deps *kernel.Deps) error {
+	cp := cfg.ContextProviders
+	if cfg.OpenViking.Endpoint == "" {
+		return nil
+	}
+	client, err := openviking.NewClient(cfg.OpenViking.Endpoint)
+	if err != nil {
+		return fmt.Errorf("openviking: %w", err)
+	}
+	if cp.Memory != "builtin" {
+		deps.MemoryProvider = openviking.NewMemory(client)
+	}
+	if cp.Skill != "builtin" {
+		deps.SkillProvider = openviking.NewSkill(client, nil)
+	}
+	if cp.Resource != "builtin" {
+		deps.ResourceProvider = openviking.NewResource(client)
 	}
 	return nil
 }
@@ -248,16 +309,16 @@ func resolveProfileFile(profiles, cwd, filename, defaultText string) string {
 
 // ── Optional capability builders ──
 
-// openSkillLoader creates a file-system skill loader. Directories are tried
-// in priority order:
+// openSkillProvider creates a file-system skill provider. Directories are
+// tried in priority order:
 //  1. <workspace>/.openagent/skills  (project-level)
 //  2. ~/.openagent/skills            (user-level)
 //
 // Returns nil if no directory exists.
-func openSkillLoader() openagent.SkillLoader {
+func openSkillProvider() skill.Provider {
 	for _, dir := range skillDirs() {
 		if info, err := os.Stat(dir); err == nil && info.IsDir() {
-			return fs.New(dir)
+			return skill.NewFSBridge(fs.New(dir))
 		}
 	}
 	return nil
@@ -304,36 +365,37 @@ func buildSlogObserver() openagent.RunObserver {
 	}
 }
 
-// buildOpts appends capability-gated agent options (skills, guard, hooks,
-// observer) to opts. model is used by the guard; it may be nil if no models
-// are configured, in which case the guard is skipped regardless of caps.
-//
-// sensitive carries the user-configured sensitive env-var names; it is
-// honored only when caps.OnHooks() is true (redact rides the hooks pipeline).
-// Hook order is redact → slog → artifact: redact must run first so logs and
-// artifact files never see raw secrets.
-func buildOpts(opts []openagent.AgentOption, caps Capabilities, model openagent.Model, sensitive config.SensitiveConfig) []openagent.AgentOption {
+// buildOpts appends capability-gated agent options (skills, guard) to opts
+// and returns the skill provider for the runtime deps. model is used by the
+// guard; it may be nil if no models are configured, in which case the guard
+// is skipped regardless of caps.
+func buildOpts(opts []agent.Option, caps config.Capabilities, model openagent.Model) ([]agent.Option, skill.Provider) {
+	var sp skill.Provider
 	if caps.OnSkills() {
-		if sl := openSkillLoader(); sl != nil {
-			opts = append(opts, openagent.WithSkillLoader(sl))
-		}
+		sp = openSkillProvider()
 	}
 	if caps.OnGuard() && model != nil {
 		g := buildGuard(model)
-		opts = append(opts, openagent.WithInputGuard(g))
-		opts = append(opts, openagent.WithOutputGuard(g.Output()))
+		opts = append(opts, agent.WithInputGuard(g))
+		opts = append(opts, agent.WithOutputGuard(g.Output()))
 	}
+	return opts, sp
+}
 
-	// Order: redact → slog → artifact. redact must run FIRST so every
-	// downstream observer (slog error logging, artifact disk save)
-	// sees already-redacted data. Putting slog before redact would
-	// write the raw secret into the log on tool errors.
-	opts = append(opts, openagent.WithRunHooks(
-		redacthook.NewHook(sensitive.Env),
-		buildSlogHooks(),
-		artifacthook.NewHook(),
-	))
-
-	opts = append(opts, openagent.WithRunObserver(buildSlogObserver()))
-	return opts
+// buildRuntimeDeps returns the always-on runtime dependencies shared by all
+// modes: the RunHooks pipeline and the stage observer. Mode-specific
+// capabilities (Tools, Memory, Approver) are added by the caller.
+//
+// sensitive carries the user-configured sensitive env-var names; it is
+// honored only when caps.OnHooks() is true (redact rides the hooks pipeline).
+// Hook order is redact → slog: redact must run first so logs never see
+// raw secrets.
+func buildRuntimeDeps(caps config.Capabilities, sensitive config.SensitiveConfig) kernel.Deps {
+	return kernel.Deps{
+		Hooks: openagent.MultiHooks(
+			redacthook.NewHook(sensitive.Env),
+			buildSlogHooks(),
+		),
+		Observer: buildSlogObserver(),
+	}
 }

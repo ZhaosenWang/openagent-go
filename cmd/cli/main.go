@@ -9,7 +9,6 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -40,7 +39,9 @@ func main() {
 		log.Fatalf("read settings: %v", err)
 	}
 	var preCfg config.Config
-	json.Unmarshal(raw, &preCfg)
+	if err := json.Unmarshal(raw, &preCfg); err != nil {
+		log.Fatalf("parse settings: %v", err)
+	}
 	if len(preCfg.Plugins) > 0 {
 		pluginPaths = preCfg.Plugins
 	}
@@ -110,24 +111,9 @@ func main() {
 	for k, v := range cfg.Env {
 		os.Setenv(k, v)
 	}
-	// Apply log defaults — main.go uses json.Unmarshal directly
-	// so defaults from config.Load() are never run. Fill in
-	// missing values before SetupLog.
-	if cfg.Log.File == "" {
-		cfg.Log.File = filepath.Join(filepath.Dir(cfgPath), "logs", "openagent.log")
-	}
-	if cfg.Log.MaxSize == 0 {
-		cfg.Log.MaxSize = 10
-	}
-	if cfg.Log.MaxBackups == 0 {
-		cfg.Log.MaxBackups = 5
-	}
-	if cfg.Log.Level == "" {
-		cfg.Log.Level = "info"
-	}
-	if cfg.Profiles == "" {
-		cfg.Profiles = ".openagent/profile"
-	}
+	// Defaults come from the single source (config.ApplyDefaults) — the
+	// plugin-merged settings parse cannot use config.Load directly.
+	config.ApplyDefaults(&cfg, cfgPath)
 
 	logCleanup, err := server.SetupLog(cfg.Log)
 	if err != nil {
@@ -227,7 +213,7 @@ func registerCommands(parent *cobra.Command, cmds []cliwasm.CommandDef) {
 				}
 			}
 			input, _ := json.Marshal(cliwasm.CommandInput{Args: args, Flags: flags})
-			out, err := cliwasm.RunCommand(context.Background(), name, string(input))
+			out, err := cliwasm.RunCommand(cmd.Context(), name, string(input))
 			if err != nil {
 				return err
 			}
@@ -272,7 +258,8 @@ var rootCmd = &cobra.Command{
 // ── serve ──
 
 func buildServeCmd(cfg config.Config) *cobra.Command {
-	var caps server.Capabilities
+	// Capabilities come from settings.json; flags override per capability.
+	caps := cfg.Capabilities
 	cmd := &cobra.Command{
 		Use:          "serve",
 		Short:        "Start the server (REST by default, or --acp for ACP)",
@@ -334,12 +321,13 @@ func addCapabilityFlags(cmd *cobra.Command) {
 		{"mcp", "on", "MCP tool servers"},
 		{"guard", "off", "LLM content guard"},
 		{"approver", "off", "Human-in-the-Loop tool approval"},
+		{"embedder", "on", "Built-in BGE embedding (semantic recall)"},
 	} {
 		cmd.Flags().String(f.name, f.def, f.desc+` ("on" or "off")`)
 	}
 }
 
-func parseCapabilities(cmd *cobra.Command, caps *server.Capabilities) {
+func parseCapabilities(cmd *cobra.Command, caps *config.Capabilities) {
 	set := func(name string, field **bool) {
 		if !cmd.Flags().Changed(name) {
 			return // not explicitly set — Capabilities.on() uses the default
@@ -362,6 +350,7 @@ func parseCapabilities(cmd *cobra.Command, caps *server.Capabilities) {
 	set("mcp", &caps.MCP)
 	set("guard", &caps.Guard)
 	set("approver", &caps.Approver)
+	set("embedder", &caps.Embedder)
 }
 
 // ── run ──
@@ -410,8 +399,9 @@ var keyringSetCmd = &cobra.Command{
 var keyringGetCmd = &cobra.Command{
 	Use: "get <key>", Short: "Read a credential", Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		kr := keyring.NewKeyring()
-		v, err := kr.Get("openagent", args[0])
+		// Same backend as set/delete — reading from a silent in-memory
+		// store would always miss what set wrote to the real keyring.
+		v, err := keyringOrFail().Get("openagent", args[0])
 		if err != nil {
 			return fmt.Errorf("keyring get: %w", err)
 		}

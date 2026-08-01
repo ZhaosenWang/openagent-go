@@ -18,6 +18,10 @@ import (
 
 	openagent "github.com/yusheng-g/openagent-go"
 	openacp "github.com/yusheng-g/openagent-go/acp/sdk"
+	"github.com/yusheng-g/openagent-go/agent"
+	ctxpkg "github.com/yusheng-g/openagent-go/context"
+	"github.com/yusheng-g/openagent-go/governance"
+	"github.com/yusheng-g/openagent-go/kernel"
 	"github.com/yusheng-g/openagent-go/mcp"
 	"github.com/yusheng-g/openagent-go/model/openai"
 	"github.com/yusheng-g/openagent-go/plan"
@@ -38,10 +42,11 @@ import (
 //	server := openacpsdk.NewServer("my-agent", "1.0.0", srv)
 //	server.Run(ctx)
 type AgentServer struct {
-	Agent        *openagent.Agent
-	Mem          openagent.Memory
-	SessionStore session.Store
-	Models       map[string]openagent.Model // model id → Model
+	Cfg     *agent.Agent // template configuration (cloned per turn)
+	Deps    kernel.Deps  // template runtime deps (derived per turn)
+	Mem     session.SessionStore
+	Runtime session.Runtime            // session lifecycle (meta + messages), nil-safe halves
+	Models  map[string]openagent.Model // model id → Model
 
 	mu       sync.Mutex
 	sessions map[openacp.SessionId]*agentSession
@@ -61,7 +66,7 @@ type AgentServer struct {
 	// defaultModelID is used when the session config hasn't selected one.
 	defaultModelID string
 
-	// ToolFactory is called per-turn to create tools scoped to the
+	// ToolFactory creates tools scoped to the
 	// session cwd. If nil, only plan + MCP + client-RPC tools are used.
 	ToolFactory func(cwd string) []openagent.Tool
 
@@ -80,13 +85,30 @@ type AgentServer struct {
 	// Plugin manager and model config backup for runtime_set_model_config.
 	PluginMgr    *wasm.Manager
 	modelConfigs map[string]ModelConfig // "provider/modelID" → original config
-	modelsMu     sync.Mutex
+
+	// approvalMemory persists session-scoped "allow always" decisions.
+	approvalMemory governance.ApprovalMemory
+	modelsMu       sync.Mutex
 
 	// ProfileResolver resolves static context prompts (SOUL/SYSTEM/AGENTS)
-	// for a given cwd. If set, agentForTurn calls it per-turn to override
+	// for a given cwd. If set, buildRuntimeForSession calls it at session
+	// creation to override
 	// the clone's SystemPrompts with session-cwd-aware profiles. If nil,
 	// the agent template's SystemPrompts are used as-is.
 	ProfileResolver func(cwd string) []string
+
+	// DefaultMode is the mode new sessions start in; "" = "manual"
+	// (approval-based safe default). Configured via settings
+	// "default_mode": "auto" | "manual" | "plan".
+	DefaultMode string
+}
+
+// defaultMode resolves the configured default mode.
+func (s *AgentServer) defaultMode() string {
+	if s.DefaultMode == "auto" || s.DefaultMode == "plan" {
+		return s.DefaultMode
+	}
+	return "manual"
 }
 
 // ModelConfig stores the original apiKey/baseURL for a registered model,
@@ -148,7 +170,7 @@ type agentSession struct {
 	mcpSessions []*mcp.Session
 
 	// MCP tools imported from all connected servers. Populated once at
-	// connect time; injected into every agentForTurn clone.
+	// connect time; injected into the session runtime.
 	mcpTools []openagent.Tool
 
 	// Cached plan entries (mirrors SessionStore._meta["plan"]). Guarded
@@ -164,12 +186,33 @@ type agentSession struct {
 	// processMgr tracks background processes started by the shell tool.
 	// Created on session start, cleaned up on deletion.
 	processMgr *process.Manager
+
+	// rt is the session-scoped Runtime, built once at session creation
+	// (or load) and reused across turns. Per-turn changes are incremental:
+	// plan tools (sender-bound closures) are rebound each prompt via
+	// RemoveTools/AppendTools; mode transitions swap the tool set and the
+	// approver via SetHumanApprover. Tools, skills cache, and sandbox
+	// state survive across turns — the legacy per-turn Runtime rebuild is
+	// gone.
+	rt *kernel.Runtime
+
+	// subAgentTools caches the delegation tools registered at runtime
+	// build (kernel.New registers cfg.SubAgents as tools). Plan mode
+	// removes them (no delegation); exiting plan re-appends them.
+	subAgentTools []openagent.Tool
+
+	// modeTools is the tool set injected for the CURRENT mode (read-only
+	// for plan, execution set for auto/manual). applyModeTools removes
+	// these by name (tracking the actual injected instances, not a
+	// hard-coded whitelist) and re-injects for the new mode. Guarded by
+	// the caller (mode transitions are serialized on the session).
+	modeTools []openagent.Tool
 }
 
 // ── agentSession plan/mode state accessors (modeMu-guarded) ──
 
 // Mode returns the current session mode. Safe for concurrent hot-path
-// readers (agentForTurn, buildDynamicContext, buildConfigOptions, ...).
+// readers (buildRuntimeForSession, buildDynamicContext, buildConfigOptions, ...).
 func (ss *agentSession) Mode() string {
 	ss.modeMu.RLock()
 	defer ss.modeMu.RUnlock()
@@ -277,15 +320,21 @@ func (ss *agentSession) transitionModeLocked(newMode string) {
 // NewAgentServer creates an AgentServer wrapping the given agent.
 // models maps model IDs to Model implementations; it is the single source
 // of truth for model selection. The agent template's Model field is ignored.
-func NewAgentServer(agent *openagent.Agent, mem openagent.Memory, store session.Store, models map[string]openagent.Model) *AgentServer {
+func NewAgentServer(cfg *agent.Agent, deps kernel.Deps, store session.Store, models map[string]openagent.Model) *AgentServer {
 	s := &AgentServer{
-		Agent:        agent,
-		Mem:          mem,
-		SessionStore: store,
+		Cfg:          cfg,
+		Deps:         deps,
+		Mem:          deps.SessionStore,
+		Runtime:      session.NewRuntime(store, deps.SessionStore),
 		Models:       models,
 		modelConfigs: make(map[string]ModelConfig),
 		sessions:     make(map[openacp.SessionId]*agentSession),
 		MCPEnabled:   true,
+	}
+	s.approvalMemory = governance.NewPersistentApprovalMemory(s.Runtime)
+	// One shared background extractor per server (never per run).
+	if deps.Extractor == nil && deps.MemoryProvider != nil && cfg.Model != nil {
+		s.Deps.Extractor = ctxpkg.NewAsyncExtractor(ctxpkg.NewLLMExtractor(cfg.Model, deps.MemoryProvider))
 	}
 	s.cmdRegistry = s.buildCommandRegistry()
 	if s.Models == nil {
@@ -364,7 +413,7 @@ func (s *AgentServer) resolveModelConfig(ss *agentSession) (provider, modelID st
 //
 // These read the capabilities advertised by the client during OnInitialize.
 // Each helper acquires s.mu internally — safe to call from any goroutine
-// (agentForTurn, injectExecutionTools, buildDynamicContext, etc.).
+// (buildRuntimeForSession, applyModeTools, buildDynamicContext, etc.).
 
 // clientCanReadFile reports whether the client advertised fs.readTextFile.
 func (s *AgentServer) clientCanReadFile() bool {
@@ -397,10 +446,7 @@ func (s *AgentServer) newSessionID() openacp.SessionId {
 	return openacp.SessionId(fmt.Sprintf("acp_%d_%d", time.Now().UnixNano(), id))
 }
 
-func (s *AgentServer) saveMeta(id string, cwd string, kind string, meta map[string]any) {
-	if s.SessionStore == nil {
-		return
-	}
+func (s *AgentServer) saveMeta(ctx context.Context, id string, cwd string, kind string, meta map[string]any) {
 	now := time.Now()
 	info := session.SessionInfo{
 		ID:        id,
@@ -410,32 +456,29 @@ func (s *AgentServer) saveMeta(id string, cwd string, kind string, meta map[stri
 		Meta:      meta,
 	}
 	info.SetMeta("kind", kind)
-	_ = s.SessionStore.Save(context.Background(), info)
+	if err := s.Runtime.Save(ctx, info); err != nil {
+		slog.Warn("openagent: session meta save failed", "error", err)
+	}
 }
 
 // savePlan persists plan entries to SessionStore._meta["plan"].
 // This is called after plan_create tool execution.
 func (s *AgentServer) savePlan(ctx context.Context, sessionID string, entries []plan.Entry) {
-	if s.SessionStore == nil {
-		return
-	}
-	info, err := s.SessionStore.Get(ctx, sessionID)
+	info, err := s.Runtime.Get(ctx, sessionID)
 	if err != nil || info == nil {
 		return
 	}
 	info.SetMeta("plan", entries)
-	info.UpdatedAt = time.Now()
-	_ = s.SessionStore.Save(ctx, *info)
+	if err := s.Runtime.Save(ctx, *info); err != nil {
+		slog.Warn("openagent: session meta save failed", "error", err)
+	}
 }
 
 // loadPlan reads persisted plan entries from SessionStore._meta["plan"].
 // JSON unmarshaling turns []plan.Entry into []interface{}, so we
 // cannot use GetMeta[[]plan.Entry] — instead, re-marshal+unmarshal.
 func (s *AgentServer) loadPlan(ctx context.Context, sessionID string) []plan.Entry {
-	if s.SessionStore == nil {
-		return nil
-	}
-	info, err := s.SessionStore.Get(ctx, sessionID)
+	info, err := s.Runtime.Get(ctx, sessionID)
 	if err != nil || info == nil || info.Meta == nil {
 		return nil
 	}
@@ -457,35 +500,59 @@ func (s *AgentServer) loadPlan(ctx context.Context, sessionID string) []plan.Ent
 
 // saveMode persists the session mode to SessionStore._meta["mode"].
 func (s *AgentServer) saveMode(ctx context.Context, sessionID string, mode string) {
-	if s.SessionStore == nil {
-		return
-	}
-	info, err := s.SessionStore.Get(ctx, sessionID)
+	info, err := s.Runtime.Get(ctx, sessionID)
 	if err != nil || info == nil {
 		return
 	}
 	info.SetMeta("mode", mode)
-	info.UpdatedAt = time.Now()
-	_ = s.SessionStore.Save(ctx, *info)
+	// Persist the plan-exit target too, so a plan-mode session restored
+	// after restart exits back to the pre-plan mode (not the default).
+	if ss := s.getSession(openacp.SessionId(sessionID)); ss != nil {
+		ss.modeMu.RLock()
+		info.SetMeta("previous_mode", ss.previousMode)
+		ss.modeMu.RUnlock()
+	}
+	if err := s.Runtime.Save(ctx, *info); err != nil {
+		slog.Warn("openagent: session meta save failed", "error", err)
+	}
 }
 
-// loadMode reads persisted session mode from SessionStore._meta["mode"].
-func (s *AgentServer) loadMode(ctx context.Context, sessionID string) string {
-	if s.SessionStore == nil {
-		return ""
-	}
-	info, err := s.SessionStore.Get(ctx, sessionID)
+// loadSessionState reads persisted mode + previousMode + createdAt +
+// config options from the session metadata. Returns zero values when the
+// session has no persisted state.
+func (s *AgentServer) loadSessionState(ctx context.Context, sessionID string) (mode, prevMode string, createdAt time.Time, config map[openacp.SessionConfigId]any) {
+	info, err := s.Runtime.Get(ctx, sessionID)
 	if err != nil || info == nil || info.Meta == nil {
-		return ""
+		return "", "", time.Time{}, nil
 	}
-	raw, ok := info.Meta["mode"]
-	if !ok {
-		return ""
+	mode, _ = info.Meta["mode"].(string)
+	prevMode, _ = info.Meta["previous_mode"].(string)
+	createdAt = info.CreatedAt
+	if raw, ok := info.Meta["config"].(map[string]any); ok {
+		config = make(map[openacp.SessionConfigId]any, len(raw))
+		for k, v := range raw {
+			config[k] = v
+		}
 	}
-	// Meta values come back as string (unlike complex types like []plan.Entry
-	// which become []interface{}).
-	mode, _ := raw.(string)
-	return mode
+	return mode, prevMode, createdAt, config
+}
+
+// saveConfig persists the session's config options to _meta["config"].
+func (s *AgentServer) saveConfig(ctx context.Context, sessionID string) {
+	ss := s.getSession(openacp.SessionId(sessionID))
+	if ss == nil {
+		return
+	}
+	info, err := s.Runtime.Get(ctx, sessionID)
+	if err != nil || info == nil {
+		return
+	}
+	ss.modeMu.RLock()
+	info.SetMeta("config", ss.config)
+	ss.modeMu.RUnlock()
+	if err := s.Runtime.Save(ctx, *info); err != nil {
+		slog.Warn("openagent: session config save failed", "error", err)
+	}
 }
 
 // connectMCP connects to all configured MCP servers and returns the sessions.
@@ -564,7 +631,7 @@ func (s *AgentServer) removeSession(id openacp.SessionId) {
 // ── openacp.AgentHandler ──
 
 func (s *AgentServer) OnInitialize(ctx context.Context, req openacp.InitializeRequest) (*openacp.InitializeResponse, error) {
-	// Persist the client's advertised capabilities so that agentForTurn
+	// Persist the client's advertised capabilities so that buildRuntimeForSession
 	// can gate Agent→Client RPC tool registration (fs/read_text_file,
 	// fs/write_text_file, terminal/*) on what the client actually
 	// supports. Without this, the LLM may be offered a tool whose RPC
@@ -611,8 +678,8 @@ func (s *AgentServer) OnInitialize(ctx context.Context, req openacp.InitializeRe
 // from the store, then normalizes (tilde expansion + empty-cwd fallback).
 func (s *AgentServer) resolveSessionCwd(ctx context.Context, sessionID, reqCwd string) string {
 	cwd := reqCwd
-	if cwd == "" && s.SessionStore != nil {
-		if info, err := s.SessionStore.Get(ctx, sessionID); err == nil && info != nil && info.Cwd != "" {
+	if cwd == "" {
+		if info, err := s.Runtime.Get(ctx, sessionID); err == nil && info != nil && info.Cwd != "" {
 			cwd = info.Cwd
 		}
 	}
@@ -627,7 +694,7 @@ func (s *AgentServer) OnNewSession(ctx context.Context, req openacp.NewSessionRe
 		id:                    id,
 		cwd:                   cwd,
 		createdAt:             time.Now(),
-		mode:                  "auto",
+		mode:                  s.defaultMode(),
 		config:                map[openacp.SessionConfigId]any{"thought_level": "medium", "model": s.defaultModelID},
 		firstPrompt:           true,
 		additionalDirectories: req.AdditionalDirectories,
@@ -643,11 +710,10 @@ func (s *AgentServer) OnNewSession(ctx context.Context, req openacp.NewSessionRe
 			ss.processMgr = pm
 		}
 	}
+	// Build the session-scoped Runtime once; reused for every prompt.
+	ss.rt = s.buildRuntimeForSession(id, ss)
 	s.putSession(id, ss)
-	s.saveMeta(string(id), cwd, "acp", req.Meta)
-	if s.PluginMgr != nil {
-		s.PluginMgr.OnSessionInit(ctx, wasm.SessionCtx{SessionID: string(id)})
-	}
+	s.saveMeta(ctx, string(id), cwd, "acp", req.Meta)
 
 	// Send available commands so the client can show them immediately.
 	if s.updateSender != nil {
@@ -667,17 +733,21 @@ func (s *AgentServer) OnNewSession(ctx context.Context, req openacp.NewSessionRe
 func (s *AgentServer) OnLoadSession(ctx context.Context, req openacp.LoadSessionRequest, sender openacp.SessionEventSender) (*openacp.LoadSessionResponse, error) {
 	ss := s.getSession(req.SessionID)
 	if ss == nil {
-		mode := s.loadMode(ctx, string(req.SessionID))
+		mode, prevMode, createdAt, config := s.loadSessionState(ctx, string(req.SessionID))
 		if mode == "" {
-			mode = "auto"
+			mode = s.defaultMode()
+		}
+		if config == nil {
+			config = map[openacp.SessionConfigId]any{"thought_level": "medium", "model": s.defaultModelID}
 		}
 		cwd := s.resolveSessionCwd(ctx, string(req.SessionID), req.Cwd)
 		ss = &agentSession{
 			id:                    req.SessionID,
 			cwd:                   cwd,
-			createdAt:             time.Now(),
+			createdAt:             createdAt,
 			mode:                  mode,
-			config:                map[openacp.SessionConfigId]any{"thought_level": "medium", "model": s.defaultModelID},
+			previousMode:          prevMode,
+			config:                config,
 			firstPrompt:           false,
 			additionalDirectories: req.AdditionalDirectories,
 			mcpServers:            req.McpServers,
@@ -692,6 +762,8 @@ func (s *AgentServer) OnLoadSession(ctx context.Context, req openacp.LoadSession
 				ss.processMgr = pm
 			}
 		}
+		// Build the session-scoped Runtime once; reused for every prompt.
+		ss.rt = s.buildRuntimeForSession(req.SessionID, ss)
 		s.putSession(req.SessionID, ss)
 	}
 
@@ -805,17 +877,21 @@ func copyPlanEntries(src []plan.Entry) []plan.Entry {
 func (s *AgentServer) OnResumeSession(ctx context.Context, req openacp.ResumeSessionRequest) (*openacp.ResumeSessionResponse, error) {
 	ss := s.getSession(req.SessionID)
 	if ss == nil {
-		mode := s.loadMode(ctx, string(req.SessionID))
+		mode, prevMode, createdAt, config := s.loadSessionState(ctx, string(req.SessionID))
 		if mode == "" {
-			mode = "auto"
+			mode = s.defaultMode()
+		}
+		if config == nil {
+			config = map[openacp.SessionConfigId]any{"thought_level": "medium", "model": s.defaultModelID}
 		}
 		cwd := s.resolveSessionCwd(ctx, string(req.SessionID), req.Cwd)
 		ss = &agentSession{
 			id:                    req.SessionID,
 			cwd:                   cwd,
-			createdAt:             time.Now(),
+			createdAt:             createdAt,
 			mode:                  mode,
-			config:                map[openacp.SessionConfigId]any{"thought_level": "medium", "model": s.defaultModelID},
+			previousMode:          prevMode,
+			config:                config,
 			firstPrompt:           false,
 			additionalDirectories: req.AdditionalDirectories,
 			mcpServers:            req.McpServers,
@@ -830,7 +906,8 @@ func (s *AgentServer) OnResumeSession(ctx context.Context, req openacp.ResumeSes
 				ss.processMgr = pm
 			}
 		}
-
+		// Build the session-scoped Runtime once; reused for every prompt.
+		ss.rt = s.buildRuntimeForSession(req.SessionID, ss)
 		s.putSession(req.SessionID, ss)
 	}
 	// Load persisted plan into memory (no replay per ACP spec:
@@ -854,9 +931,6 @@ func (s *AgentServer) OnCloseSession(ctx context.Context, req openacp.CloseSessi
 }
 
 func (s *AgentServer) OnDeleteSession(ctx context.Context, req openacp.DeleteSessionRequest) (*openacp.DeleteSessionResponse, error) {
-	if s.PluginMgr != nil {
-		s.PluginMgr.OnSessionDestroy(ctx, wasm.SessionCtx{SessionID: string(req.SessionID)})
-	}
 	ss := s.getSession(req.SessionID)
 	if ss != nil {
 		s.disconnectMCP(ss.mcpSessions)
@@ -865,20 +939,15 @@ func (s *AgentServer) OnDeleteSession(ctx context.Context, req openacp.DeleteSes
 		}
 	}
 	s.removeSession(req.SessionID)
-	if s.SessionStore != nil {
-		_ = s.SessionStore.Delete(ctx, string(req.SessionID))
-	}
-	if s.Mem != nil {
-		_ = s.Mem.DeleteSession(ctx, string(req.SessionID))
+	// Runtime.Delete removes metadata and messages together.
+	if err := s.Runtime.Delete(ctx, string(req.SessionID)); err != nil {
+		slog.Warn("openagent: session delete failed", "session", req.SessionID, "error", err)
 	}
 	return &openacp.DeleteSessionResponse{}, nil
 }
 
 func (s *AgentServer) OnListSessions(ctx context.Context, req openacp.ListSessionsRequest) (*openacp.ListSessionsResponse, error) {
-	if s.SessionStore == nil {
-		return &openacp.ListSessionsResponse{Sessions: []openacp.SessionInfo{}}, nil
-	}
-	list, err := s.SessionStore.List(ctx)
+	list, err := s.Runtime.List(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list sessions: %w", err)
 	}
@@ -971,7 +1040,7 @@ func (s *AgentServer) buildConfigOptions(sid openacp.SessionId) []openacp.Sessio
 
 func (s *AgentServer) buildModeState(sid openacp.SessionId) *openacp.SessionModeState {
 	ss := s.getSession(sid)
-	current := "auto"
+	current := s.defaultMode()
 	if ss != nil {
 		current = ss.Mode()
 	}
@@ -1026,6 +1095,10 @@ func (s *AgentServer) setSessionMode(ctx context.Context, sid openacp.SessionId,
 	// relative to plan notifications emitted by concurrent callbacks is
 	// preserved by the FIFO queue — see exit_plan_mode helper.
 	s.persistAndNotifyMode(ctx, sid, mode)
+
+	// Swap the permanent tool set + approver on the session runtime
+	// (plan ⇄ auto/manual). The skill cache and sandbox state survive.
+	s.applyModeTools(sid, ss, ss.rt)
 	return nil
 }
 
@@ -1086,6 +1159,9 @@ func (s *AgentServer) OnSetSessionConfigOption(ctx context.Context, req openacp.
 		}
 	}
 
+	// Persist the updated options so a restored session keeps them.
+	s.saveConfig(ctx, string(req.SessionID))
+
 	// Sync session mode when the client sets the "mode" config option
 	// (most clients use set_config_option rather than set_mode).
 	// setSessionMode now sends both current_mode_update and
@@ -1095,6 +1171,23 @@ func (s *AgentServer) OnSetSessionConfigOption(ctx context.Context, req openacp.
 		if v, ok := ss.config["mode"].(string); ok {
 			_ = s.setSessionMode(ctx, req.SessionID, v)
 			needsConfigUpdate = false // already sent by setSessionMode
+		}
+	}
+
+	// Live-sync model / reasoning-effort onto the session runtime so the
+	// next prompt uses the new config without a runtime rebuild.
+	if ss.rt != nil {
+		switch req.ConfigID {
+		case "model":
+			if v, ok := ss.config["model"].(string); ok {
+				if m, ok := s.Models[v]; ok {
+					ss.rt.SetModel(m)
+				}
+			}
+		case "thought_level":
+			if v, ok := ss.config["thought_level"].(string); ok && v != "" {
+				ss.rt.SetReasoningEffort(v)
+			}
 		}
 	}
 
@@ -1163,8 +1256,15 @@ func (s *AgentServer) OnPrompt(ctx context.Context, req openacp.PromptRequest, s
 		sender.SendAvailableCommands(s.availableCommands())
 	}
 
-	// ── Build agent clone for this turn ──
-	agent := s.agentForTurn(req.SessionID)
+	// ── Session-scoped Runtime, reused across turns ──
+	// Built once at session creation; per-turn changes are incremental
+	// (plan tools rebinding below, mode transitions via applyModeTools).
+	// The skill cache, sandbox state, and tool set survive across turns.
+	agent := ss.rt
+	if agent == nil {
+		agent = s.buildRuntimeForSession(req.SessionID, ss)
+		ss.rt = agent
+	}
 
 	providerID, modelID := s.resolveModelConfig(ss)
 	oaSession := openagent.Session{
@@ -1175,8 +1275,8 @@ func (s *AgentServer) OnPrompt(ctx context.Context, req openacp.PromptRequest, s
 		// (RunHooks via SessionFromContext, e.g. the artifact hook's
 		// context-window threshold) can read ContextWindow() without
 		// depending on every call site to re-resolve from ModelID.
-		// agentForTurn already set clone.Model to the selected model.
-		Model:     agent.Model,
+		// buildRuntimeForSession already set clone.Model to the selected model.
+		Model:     agent.Model(),
 		CreatedAt: ss.createdAt,
 		Metadata: map[string]any{
 			"cwd":                   ss.cwd,
@@ -1198,64 +1298,10 @@ func (s *AgentServer) OnPrompt(ctx context.Context, req openacp.PromptRequest, s
 		ctx = process.WithManager(ctx, ss.processMgr)
 	}
 
-	// ── Register mode-specific planning tools ──
-	if ss.Mode() == "plan" {
-		// plan_create: only available in plan mode.
-		agent.AppendTools(plan.NewCreateTool(s.makeCreateCallback(ctx, req.SessionID, ss, sender)))
-		// exit_plan_mode: only available in plan mode. Restores the mode
-		// that was active before entering plan (auto/manual), injects the
-		// full tool set, and wires the approver for manual.
-		agent.AppendTools(plan.NewExitTool(s.makeExitCallback(ctx, req.SessionID, ss, agent, sender)))
-	} else {
-		// enter_plan_mode: available in auto and manual mode. Changes the
-		// session mode to "plan" and immediately injects plan_create +
-		// exit_plan_mode into the agent clone so they are available this
-		// same turn.
-		enterTool := plan.NewEnterTool(func() error {
-			wasPlan := ss.Mode() == "plan"
-			if err := s.enterPlanMode(ctx, req.SessionID, ss); err != nil {
-				return err
-			}
-			// Inject plan_create + exit_plan_mode on the FIRST transition
-			// into plan mode within this turn. The injection block is
-			// serialized under modeMu so two concurrent enter_plan_mode
-			// calls in one model response make the second a no-op (the
-			// flag is already set) and only one injection happens.
-			ss.modeMu.Lock()
-			if !wasPlan && !ss.injectedPlanTools {
-				ss.injectedPlanTools = true
-				ss.modeMu.Unlock()
-				agent.AppendTools(
-					plan.NewCreateTool(s.makeCreateCallback(ctx, req.SessionID, ss, sender)))
-				agent.AppendTools(
-					plan.NewExitTool(s.makeExitCallback(ctx, req.SessionID, ss, agent, sender)))
-			} else {
-				ss.modeMu.Unlock()
-			}
-			return nil
-		})
-		agent.AppendTools(enterTool)
-	}
-
-	// ── Register plan_update tool (all modes) ──
-	// Always registered so it can track plan progress. ApplyPlanUpdates
-	// validates-then-mutates under modeMu and runs the mode-gated
-	// notification in the same critical section, so the notified snapshot
-	// is consistent with the mutation and ordered relative to a
-	// concurrent exit_plan_mode's empty-plan notification.
-	pu := plan.NewUpdateTool(func(updates []plan.Update) ([]plan.Entry, error) {
-		snap, err := ss.ApplyPlanUpdates(updates, func(snap []plan.Entry) {
-			if ss.mode == "plan" {
-				sender.SendPlanUpdate(s.entriesToACP(snap))
-			}
-		})
-		if err != nil {
-			return nil, err
-		}
-		s.savePlan(ctx, string(req.SessionID), snap)
-		return snap, nil
-	})
-	agent.AppendTools(pu)
+	// ── Rebind per-prompt plan tools ──
+	// plan_create/plan_update/exit_plan_mode/enter_plan_mode close over the
+	// per-prompt sender, so they are removed and re-appended each prompt.
+	s.reconcilePlanTools(ctx, req.SessionID, ss, agent, sender)
 	// ── Run the agent ──
 	ch := agent.RunStream(ctx, oaSession, input)
 	var usage openagent.Usage
@@ -1292,8 +1338,11 @@ func (s *AgentServer) OnPrompt(ctx context.Context, req openacp.PromptRequest, s
 			})
 
 		case openagent.StreamToolResult:
+			// Structured failure first; text-prefix kept as a fallback for
+			// tools that don't populate Result.
 			status := "completed"
-			if strings.HasPrefix(evt.Message.Content, "error: ") ||
+			if (evt.Message.Result != nil && evt.Message.Result.Error != nil) ||
+				strings.HasPrefix(evt.Message.Content, "error: ") ||
 				strings.HasPrefix(evt.Message.Content, "Error: ") {
 				status = "failed"
 			}
@@ -1322,6 +1371,15 @@ func (s *AgentServer) OnPrompt(ctx context.Context, req openacp.PromptRequest, s
 		}
 	}
 
+	// Checkpoint: recoverable restore point after a completed run.
+	if s.Runtime != nil {
+		cpCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		if err := s.Runtime.Checkpoint(cpCtx, string(req.SessionID)); err != nil {
+			slog.Warn("openagent: session checkpoint failed", "session", req.SessionID, "error", err)
+		}
+	}
+
 	ss.totalTokens += usage.TotalTokens
 
 	// Report *current* context usage (this turn's PromptTokens), not
@@ -1329,8 +1387,8 @@ func (s *AgentServer) OnPrompt(ctx context.Context, req openacp.PromptRequest, s
 	// in context" — PromptTokens is the best proxy for that.
 	if usage.PromptTokens > 0 {
 		cw := 0
-		if agent.Model != nil {
-			cw = agent.Model.ContextWindow()
+		if m := agent.Model(); m != nil {
+			cw = m.ContextWindow()
 		}
 		sender.SendUsageUpdate(usage.PromptTokens, cw, nil)
 	}
@@ -1433,104 +1491,243 @@ func (s *AgentServer) OnLogout(ctx context.Context, req openacp.LogoutRequest) (
 
 // updateTitle sets the session title in the persistent store.
 func (s *AgentServer) updateTitle(ctx context.Context, sessionID openacp.SessionId, title string) {
-	if s.SessionStore == nil || title == "" {
+	if title == "" {
 		return
 	}
-	info, err := s.SessionStore.Get(ctx, string(sessionID))
+	info, err := s.Runtime.Get(ctx, string(sessionID))
 	if err != nil || info == nil {
 		return
 	}
 	if info.Title == "" {
 		info.Title = title
-		info.UpdatedAt = time.Now()
-		_ = s.SessionStore.Save(ctx, *info)
+		if err := s.Runtime.Save(ctx, *info); err != nil {
+			slog.Warn("openagent: session meta save failed", "error", err)
+		}
 	}
 }
 
-// agentForTurn prepares an Agent clone for a single prompt turn.
-//
-// Clone is necessary because s.Agent is a shared template — per-turn
-// overrides (Approver sessionID binding, plan-mode instruction overlay,
-// per-session MCP tools, ReasoningEffort from config) must mutate an
-// isolated copy.  Agent.Clone() creates an independent Tools backing
-// array so append() doesn't grow the template's slice.
-func (s *AgentServer) agentForTurn(sid openacp.SessionId) *openagent.Agent {
-	clone := s.Agent.Clone()
+// buildRuntimeForSession builds the session-scoped Runtime once, at session
+// creation or load. It carries the permanent tool set (execution tools for
+// auto/manual, read-only tools for plan) plus the session's model, prompts,
+// and approval wiring. Plan tools (plan_create/plan_update/exit_plan_mode/
+// enter_plan_mode) are NOT injected here — they close over the per-prompt
+// sender and are rebound each turn by reconcilePlanTools.
+func (s *AgentServer) buildRuntimeForSession(sid openacp.SessionId, ss *agentSession) *kernel.Runtime {
+	cfg := s.Cfg.Clone()
+	deps := s.Deps
+	deps.Tools = nil // tools are injected per mode via applyModeTools
+	deps.HumanApprover = nil
+	// Session-mode tools are excluded from sub-agent tool sets: their
+	// callbacks are session-bound and would be nil in the child runtime.
+	deps.SubAgentExcludeTools = []string{
+		"plan_create", "plan_update",
+		"enter_plan_mode", "exit_plan_mode",
+	}
+	// Share the server-level persisted approval memory so the policy
+	// chain's Memory layer recalls "always allow" decisions across turns
+	// (written by acpApprover.always into the same instance).
+	deps.ApprovalMemory = s.approvalMemory
 
-	// Apply session-level config to the clone.
-	if ss := s.getSession(sid); ss != nil {
-		// Resolve model from the registry.
-		modelID := s.defaultModelID
-		if v, ok := ss.config["model"]; ok {
-			if val, ok := v.(string); ok {
-				modelID = val
-			}
+	// Resolve model from the session config registry.
+	modelID := s.defaultModelID
+	if v, ok := ss.config["model"]; ok {
+		if val, ok := v.(string); ok {
+			modelID = val
 		}
-		if m, ok := s.Models[modelID]; ok {
-			clone.Model = m
+	}
+	if m, ok := s.Models[modelID]; ok {
+		cfg.Model = m
+	}
+	if v, ok := ss.config["thought_level"]; ok {
+		if val, ok := v.(string); ok && val != "" {
+			cfg.ReasoningEffort = val
 		}
+	}
 
-		if v, ok := ss.config["thought_level"]; ok {
-			if val, ok := v.(string); ok && val != "" {
-				clone.ReasoningEffort = val
-			}
+	// Override system prompts with session-cwd-aware profiles so each
+	// session picks up SOUL/SYSTEM/AGENTS from its own project directory.
+	if s.ProfileResolver != nil && ss.cwd != "" {
+		if prompts := s.ProfileResolver(ss.cwd); len(prompts) > 0 {
+			cfg.SystemPrompts = prompts
 		}
+	}
 
-		// ── Mode-gated tool injection ──
-		switch ss.Mode() {
-		case "plan":
-			// Plan mode: read-only tools only. No execution tools, no
-			// approver (no side effects to approve).
-			clone.NoSpawn = true
-			clone.Approver = nil
+	// Sub-agents are always registered (kernel.New turns cfg.SubAgents into
+	// delegation tools); applyModeTools removes them in plan mode and
+	// re-appends the cached instances in execution modes. Plan mode never
+	// clears them from the config, so a plan→auto transition can restore
+	// delegation.
+	rt := kernel.New(cfg, deps)
 
-			// ACP read_file is safe (reads from client filesystem), but
-			// only register it if the client advertised fs.readTextFile.
-			if s.clientRPC != nil && s.clientCanReadFile() {
-				clone.Tools = append(clone.Tools,
-					opentool.NewACPReadFile(s.clientRPC, sid),
-				)
-			}
-
-			// plan_create, plan_update, exit_plan_mode are injected in
-			// OnPrompt — not here — because they need closures over the
-			// session and sender.
-
-		case "auto":
-			// Auto mode: full tool set, no approval prompts.
-			// Safety is handled by Guard.in/Guard.out (if configured).
-			clone.Approver = nil
-			if s.clientRPC != nil && s.clientCanReadFile() {
-				clone.Tools = append(clone.Tools,
-					opentool.NewACPReadFile(s.clientRPC, sid),
-				)
-			}
-			s.injectExecutionTools(clone, sid, ss)
-
-		case "manual":
-			// Manual mode: full tool set, per-tool user approval via ACP.
-			if s.clientRPC != nil {
-				clone.Approver = &acpApprover{client: s.clientRPC, sessionID: sid}
-				if s.clientCanReadFile() {
-					clone.Tools = append(clone.Tools,
-						opentool.NewACPReadFile(s.clientRPC, sid),
-					)
+	// Cache delegation tools for re-injection after plan mode.
+	if len(cfg.SubAgents) > 0 {
+		want := subAgentToolNames(cfg)
+		for _, t := range rt.SnapshotTools() {
+			for _, n := range want {
+				if t.Definition().Name == n {
+					ss.subAgentTools = append(ss.subAgentTools, t)
 				}
 			}
-			s.injectExecutionTools(clone, sid, ss)
-		}
-
-		// Override system prompts with session-cwd-aware profiles so each
-		// session picks up SOUL/SYSTEM/AGENTS from its own project directory.
-		if s.ProfileResolver != nil && ss.cwd != "" {
-			if prompts := s.ProfileResolver(ss.cwd); len(prompts) > 0 {
-				clone.SystemPrompts = prompts
-			}
 		}
 	}
 
-	return clone
+	// Initial mode tool set + approver.
+	s.applyModeTools(sid, ss, rt)
+	return rt
 }
+
+// applyModeTools swaps the permanent tool set and approver for the
+// session's CURRENT mode. It removes the previously injected mode tools
+// (tracked in ss.modeTools — the actual instances, not a hard-coded
+// whitelist) plus the cached sub-agent tools (plan has no delegation),
+// then injects the mode-appropriate set and records it for the next
+// transition. The runtime's skill cache and sandbox state survive.
+//
+// Called at runtime build and on every mode transition. Plan tools are
+// NOT touched here — they close over the per-prompt sender and are
+// rebound each prompt by reconcilePlanTools.
+func (s *AgentServer) applyModeTools(sid openacp.SessionId, ss *agentSession, rt *kernel.Runtime) {
+	// Drop the previous mode's tools by the names we actually injected.
+	drop := toolNames(ss.modeTools)
+	drop = append(drop, subAgentToolNames(rt.Config())...)
+	rt.RemoveTools(drop...)
+	ss.modeTools = nil
+
+	var add []openagent.Tool
+	switch ss.Mode() {
+	case "plan":
+		// Read-only tools only — local read/ls/grep plus client
+		// read_client_file, so the model can inspect the workspace while
+		// planning. No execution tools, no approver (no side effects to
+		// approve), no delegation.
+		if s.ToolFactory != nil && ss.cwd != "" {
+			for _, t := range s.ToolFactory(ss.cwd) {
+				if readOnlyToolNames[t.Definition().Name] {
+					add = append(add, t)
+				}
+			}
+		}
+		if s.clientRPC != nil && s.clientCanReadFile() {
+			add = append(add, opentool.NewACPReadFile(s.clientRPC, sid))
+		}
+		rt.SetHumanApprover(nil)
+
+	default:
+		// Auto/manual: full tool set. Auto has no approval prompts (safety
+		// is handled by Guard.in/Guard.out if configured); manual routes
+		// EVERY tool call through the ACP approver — including read-only
+		// tools (no Safety layer, so nothing auto-approves). "Always allow"
+		// decisions still shortcut through the approval memory; handoffs
+		// stay free.
+		if s.clientRPC != nil && s.clientCanReadFile() {
+			add = append(add, opentool.NewACPReadFile(s.clientRPC, sid))
+		}
+		add = append(add, s.executionTools(sid, ss)...)
+		add = append(add, ss.subAgentTools...)
+
+		if ss.Mode() == "manual" && s.clientRPC != nil {
+			rt.SetHumanApprover(&acpApprover{client: s.clientRPC, sessionID: sid, memory: s.approvalMemory})
+		} else {
+			rt.SetHumanApprover(nil)
+		}
+	}
+
+	ss.modeTools = add
+	rt.AppendTools(add...)
+}
+
+// toolNames extracts the Definition().Name of each tool in the slice.
+func toolNames(tools []openagent.Tool) []string {
+	names := make([]string, 0, len(tools))
+	for _, t := range tools {
+		names = append(names, t.Definition().Name)
+	}
+	return names
+}
+
+// subAgentToolNames returns the delegation tool names for a config's
+// sub-agents (registered as tools by kernel.New).
+func subAgentToolNames(cfg *agent.Agent) []string {
+	var names []string
+	for _, sa := range cfg.SubAgents {
+		names = append(names, sa.Name)
+	}
+	return names
+}
+
+// reconcilePlanTools rebinds the per-prompt plan tools (plan_create,
+// plan_update, exit_plan_mode, enter_plan_mode) to the current sender.
+// Called at the top of every prompt. The tools close over the sender and
+// session state, so they cannot live on the session-scoped runtime.
+func (s *AgentServer) reconcilePlanTools(ctx context.Context, sid openacp.SessionId, ss *agentSession, rt *kernel.Runtime, sender openacp.SessionEventSender) {
+	rt.RemoveTools("plan_create", "plan_update", "enter_plan_mode", "exit_plan_mode")
+
+	// plan_update is always registered so it can track plan progress.
+	// ApplyPlanUpdates validates-then-mutates under modeMu and runs the
+	// mode-gated notification in the same critical section, so the
+	// notified snapshot is consistent with the mutation and ordered
+	// relative to a concurrent exit_plan_mode's empty-plan notification.
+	pu := plan.NewUpdateTool(func(updates []plan.Update) ([]plan.Entry, error) {
+		snap, err := ss.ApplyPlanUpdates(updates, func(snap []plan.Entry) {
+			// Called with modeMu held (ApplyPlanUpdates) — read the field
+			// directly, Mode() would re-lock and self-deadlock.
+			if ss.mode == "plan" {
+				sender.SendPlanUpdate(s.entriesToACP(snap))
+			}
+		})
+		if err != nil {
+			return nil, err
+		}
+		s.savePlan(ctx, string(sid), snap)
+		return snap, nil
+	})
+	rt.AppendTools(pu)
+
+	switch ss.Mode() {
+	case "plan":
+		// plan_create + exit_plan_mode are injected in OnPrompt — not in
+		// buildRuntimeForSession — because they need closures over the
+		// session and sender.
+		rt.AppendTools(plan.NewCreateTool(s.makeCreateCallback(ctx, sid, ss, sender)))
+		rt.AppendTools(plan.NewExitTool(s.makeExitCallback(ctx, sid, ss, rt, sender)))
+
+	default:
+		// enter_plan_mode: available in auto and manual mode. Changes the
+		// session mode to "plan" and immediately injects plan_create +
+		// exit_plan_mode into the agent clone so they are available this
+		// same turn.
+		rt.AppendTools(plan.NewEnterTool(func() error {
+			wasPlan := ss.Mode() == "plan"
+			if err := s.setSessionMode(ctx, sid, "plan"); err != nil {
+				return err
+			}
+			// Inject plan_create + exit_plan_mode on the FIRST transition
+			// into plan mode within this turn. The injection block is
+			// serialized under modeMu so two concurrent enter_plan_mode
+			// calls in one model response make the second a no-op (the
+			// flag is already set) and only one injection happens.
+			ss.modeMu.Lock()
+			if !wasPlan && !ss.injectedPlanTools {
+				ss.injectedPlanTools = true
+				ss.modeMu.Unlock()
+				rt.AppendTools(
+					plan.NewCreateTool(s.makeCreateCallback(ctx, sid, ss, sender)))
+				rt.AppendTools(
+					plan.NewExitTool(s.makeExitCallback(ctx, sid, ss, rt, sender)))
+			} else {
+				ss.modeMu.Unlock()
+			}
+			return nil
+		}))
+	}
+}
+
+// readOnlyToolNames is the plan-mode tool whitelist — a single source:
+// the platform ToolClassifier's read-only set (the same list the policy
+// chain's Safety layer auto-allows). A second copy here drifted from
+// governance's list, so plan mode could offer a tool the policy chain
+// treats as dangerous (or vice versa).
+var readOnlyToolNames = governance.NewToolClassifier().ReadOnlyNames
 
 // injectExecutionTools appends all execution-capable tools to the agent
 // clone. Called in manual mode and after exit_plan_mode transitions.
@@ -1540,7 +1737,7 @@ func (s *AgentServer) agentForTurn(sid openacp.SessionId) *openagent.Agent {
 // callback, which executes within an executeTools parallel-goroutine
 // batch, so sibling tool goroutines read the clone's Tools via the
 // runner's SnapshotTools/findTool concurrently with this append.
-func (s *AgentServer) injectExecutionTools(clone *openagent.Agent, sid openacp.SessionId, ss *agentSession) {
+func (s *AgentServer) executionTools(sid openacp.SessionId, ss *agentSession) []openagent.Tool {
 	var add []openagent.Tool
 
 	// MCP tools from connected servers.
@@ -1554,7 +1751,7 @@ func (s *AgentServer) injectExecutionTools(clone *openagent.Agent, sid openacp.S
 	}
 
 	// Agent→Client RPC tools (write/terminal only — read_client_file is
-	// added by agentForTurn to avoid duplicate registration across modes).
+	// added by buildRuntimeForSession to avoid duplicate registration across modes).
 	// Each tool is gated on the corresponding client capability so the
 	// LLM is never offered a tool whose RPC the client will reject.
 	if s.clientRPC != nil {
@@ -1574,9 +1771,7 @@ func (s *AgentServer) injectExecutionTools(clone *openagent.Agent, sid openacp.S
 		}
 	}
 
-	if len(add) > 0 {
-		clone.AppendTools(add...)
-	}
+	return add
 }
 
 // makeCreateCallback builds the OnPlan callback shared by the plan-mode
@@ -1612,7 +1807,7 @@ func (s *AgentServer) makeCreateCallback(
 // injection + approver wiring happen after unlock.
 func (s *AgentServer) makeExitCallback(
 	ctx context.Context, sid openacp.SessionId, ss *agentSession,
-	agent *openagent.Agent, sender openacp.SessionEventSender,
+	rt *kernel.Runtime, sender openacp.SessionEventSender,
 ) func() error {
 	return func() error {
 		target := ss.PreviousMode()
@@ -1635,16 +1830,10 @@ func (s *AgentServer) makeExitCallback(
 		// Persist + notify (current_mode_update + config_option_update).
 		s.persistAndNotifyMode(ctx, sid, target)
 
-		// Inject execution tools into the running clone for subsequent
-		// model calls THIS turn. Safe: runner reads r.agent.Tools next
-		// model call, after executeTools' wg.Wait published the append.
-		s.injectExecutionTools(agent, sid, ss)
-
-		if target == "manual" && s.clientRPC != nil {
-			agent.Approver = &acpApprover{client: s.clientRPC, sessionID: sid}
-		} else {
-			agent.Approver = nil
-		}
+		// Swap the permanent tool set + approver for subsequent model calls
+		// THIS turn. Safe: rt.AppendTools/RemoveTools are lock-guarded, and
+		// the next executeTools batch reads the updated tool set.
+		s.applyModeTools(sid, ss, ss.rt)
 		return nil
 	}
 }
@@ -1722,10 +1911,7 @@ func (s *AgentServer) buildSlashContext(ctx context.Context, sid openacp.Session
 			return nil
 		},
 		ListSess: func() ([]slash.SessionInfo, error) {
-			if s.SessionStore == nil {
-				return nil, nil
-			}
-			list, err := s.SessionStore.List(ctx)
+			list, err := s.Runtime.List(ctx)
 			if err != nil {
 				return nil, err
 			}
@@ -1766,16 +1952,12 @@ func (s *AgentServer) buildSlashContext(ctx context.Context, sid openacp.Session
 
 // renameSession persists a new title and sends a session_info_update.
 func (s *AgentServer) renameSession(ctx context.Context, sid openacp.SessionId, title string) error {
-	if s.SessionStore == nil {
-		return fmt.Errorf("session store not available")
-	}
-	info, err := s.SessionStore.Get(ctx, string(sid))
+	info, err := s.Runtime.Get(ctx, string(sid))
 	if err != nil || info == nil {
 		return fmt.Errorf("session not found")
 	}
 	info.Title = title
-	info.UpdatedAt = time.Now()
-	if err := s.SessionStore.Save(ctx, *info); err != nil {
+	if err := s.Runtime.Save(ctx, *info); err != nil {
 		return err
 	}
 	// Notify the client of the title change.
@@ -1793,11 +1975,17 @@ func (s *AgentServer) renameSession(ctx context.Context, sid openacp.SessionId, 
 type acpApprover struct {
 	client    openacp.ClientRequester
 	sessionID openacp.SessionId
+	memory    governance.ApprovalMemory // session-scoped "always" persistence
 }
 
-func (a *acpApprover) Approve(ctx context.Context, call openagent.ToolCall, def openagent.FunctionDefinition, session openagent.Session) (bool, string) {
+// Ask implements governance.HumanApprover. The ACP permission response
+// carries allow/deny (and optionally modified input); the policy engine
+// treats Ask as the human layer.
+func (a *acpApprover) Ask(ctx context.Context, call openagent.ToolCall, def openagent.FunctionDefinition, session openagent.Session) (governance.Decision, error) {
 	if a.client == nil {
-		return true, ""
+		// Fail closed: no approval channel must mean denied, not silently
+		// allowed — an unapprovable call should never auto-execute.
+		return governance.Decision{Action: governance.Deny, Reason: "no approval client configured"}, nil
 	}
 	resp, err := a.client.RequestPermission(ctx, openacp.RequestPermissionRequest{
 		SessionID: a.sessionID,
@@ -1810,29 +1998,38 @@ func (a *acpApprover) Approve(ctx context.Context, call openagent.ToolCall, def 
 		},
 		Options: []openacp.PermissionOption{
 			{OptionID: "allow", Name: "Allow", Kind: openacp.PermissionAllowOnce},
+			{OptionID: "always", Name: "Always allow", Kind: openacp.PermissionAllowAlways},
 			{OptionID: "reject", Name: "Reject", Kind: openacp.PermissionRejectOnce},
 		},
 	})
 	if err != nil {
-		return false, fmt.Sprintf("permission request failed: %v", err)
+		return governance.Decision{Action: governance.Deny, Reason: "permission request failed: " + err.Error()}, nil
 	}
 	if resp.Outcome.Cancelled {
-		return false, "cancelled"
+		return governance.Decision{Action: governance.Deny, Reason: "cancelled"}, nil
 	}
 	if resp.Outcome.OptionID == nil {
-		return false, "no option selected"
+		return governance.Decision{Action: governance.Deny, Reason: "no option selected"}, nil
 	}
 	switch *resp.Outcome.OptionID {
 	case "allow":
-		return true, ""
+		return governance.Decision{Action: governance.Allow}, nil
+	case "always":
+		d := governance.Decision{Action: governance.Allow, Reason: "always allow"}
+		if a.memory != nil {
+			if err := a.memory.Remember(ctx, session.ID, call.Function.Name, d); err != nil {
+				slog.Warn("openagent: approval always persistence failed", "session", session.ID, "error", err)
+			}
+		}
+		return d, nil
 	case "reject":
 		reason := "rejected by user"
 		if fb, ok := resp.Outcome.Meta["feedback"].(string); ok && fb != "" {
 			reason = fb
 		}
-		return false, reason
+		return governance.Decision{Action: governance.Deny, Reason: reason}, nil
 	default:
-		return false, fmt.Sprintf("unknown option: %s", *resp.Outcome.OptionID)
+		return governance.Decision{Action: governance.Deny, Reason: "unknown option: " + *resp.Outcome.OptionID}, nil
 	}
 }
 

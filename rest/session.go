@@ -1,9 +1,9 @@
 package rest
 
 import (
-	"log/slog"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"sync"
 	"time"
@@ -17,12 +17,16 @@ import (
 type sessionEntry interface {
 	sessionInfo() *session.SessionInfo
 	isActive() bool
+	// Approval slot: the chat and orchestrate sessions share the same
+	// single pending-approval mechanism (one dialog at a time).
+	takePending() *pendingApproval
+	setPending(p *pendingApproval)
 }
 
 // sessionHooks parameterises sessionManager by entry type E.
 type sessionHooks[E sessionEntry] struct {
 	kind       string
-	newEntry   func(info session.SessionInfo) E
+	newEntry   func(ctx context.Context, info session.SessionInfo) E
 	fillDetail func(e E, detail *SessionDetail)
 	onDelete   func(e E)
 	cleanupDir func(sessionID string)
@@ -32,11 +36,17 @@ type sessionHooks[E sessionEntry] struct {
 
 // sessionManager handles session CRUD, store-backed restores,
 // message listing, and bus subscriptions for a single mode.
+//
+// Lifecycle operations (create/save/delete/checkpoint) go through the
+// session.Runtime API — one explicit entry instead of juggling the
+// metadata Store and message SessionStore separately. The message store
+// stays reachable for listing (the messages endpoint needs full
+// messages, not the lightweight Restore refs).
 type sessionManager[E sessionEntry] struct {
-	store  session.Store
-	memory openagent.Memory
-	bus    *eventbus.Bus[SSEEvent]
-	hooks  sessionHooks[E]
+	memory  session.SessionStore
+	runtime session.Runtime // nil until SetStore
+	bus     *eventbus.Bus[SSEEvent]
+	hooks   sessionHooks[E]
 
 	mu         sync.RWMutex
 	entries    map[string]E
@@ -44,13 +54,11 @@ type sessionManager[E sessionEntry] struct {
 }
 
 func newSessionManager[E sessionEntry](
-	store session.Store,
-	memory openagent.Memory,
+	memory session.SessionStore,
 	bus *eventbus.Bus[SSEEvent],
 	hooks sessionHooks[E],
 ) *sessionManager[E] {
 	return &sessionManager[E]{
-		store:      store,
 		memory:     memory,
 		bus:        bus,
 		hooks:      hooks,
@@ -59,11 +67,26 @@ func newSessionManager[E sessionEntry](
 	}
 }
 
-func (sm *sessionManager[E]) SetStore(s session.Store)      { sm.store = s }
+func (sm *sessionManager[E]) SetStore(s session.Store) {
+	sm.runtime = session.NewRuntime(s, sm.memory)
+}
 func (sm *sessionManager[E]) SetCleanupDir(fn func(string)) { sm.hooks.cleanupDir = fn }
 func (sm *sessionManager[E]) Bus() *eventbus.Bus[SSEEvent]  { return sm.bus }
-func (sm *sessionManager[E]) Memory() openagent.Memory      { return sm.memory }
-func (sm *sessionManager[E]) Store() session.Store          { return sm.store }
+func (sm *sessionManager[E]) Memory() session.SessionStore  { return sm.memory }
+func (sm *sessionManager[E]) Runtime() session.Runtime      { return sm.runtime }
+
+// Checkpoint marks the current message count as a recoverable restore
+// point (crash recovery). Called after a completed run.
+func (sm *sessionManager[E]) Checkpoint(ctx context.Context, id string) {
+	if sm.runtime == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := sm.runtime.Checkpoint(ctx, id); err != nil {
+		slog.Warn("openagent: session checkpoint failed", "session", id, "error", err)
+	}
+}
 
 func (sm *sessionManager[E]) Exists(id string) bool {
 	sm.mu.RLock()
@@ -93,13 +116,13 @@ func (sm *sessionManager[E]) touch(id string) {
 }
 
 func (sm *sessionManager[E]) syncMeta(inf *session.SessionInfo) {
-	if sm.store == nil {
+	if sm.runtime == nil {
 		return
 	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if err := sm.store.Save(ctx, *inf); err != nil {
+		if err := sm.runtime.Save(ctx, *inf); err != nil {
 			slog.Error("failed to persist session meta", "session", inf.ID, "error", err)
 		}
 	}()
@@ -110,7 +133,10 @@ func (sm *sessionManager[E]) syncMeta(inf *session.SessionInfo) {
 func (sm *sessionManager[E]) create(w http.ResponseWriter, r *http.Request) {
 	var req CreateSessionRequest
 	if r.Body != nil {
-		json.NewDecoder(r.Body).Decode(&req)
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, `{"error":"invalid session request"}`, http.StatusBadRequest)
+			return
+		}
 	}
 
 	id := generateID()
@@ -126,7 +152,7 @@ func (sm *sessionManager[E]) create(w http.ResponseWriter, r *http.Request) {
 	info.SetMeta("provider", req.Provider)
 
 	sm.mu.Lock()
-	sm.entries[id] = sm.hooks.newEntry(info)
+	sm.entries[id] = sm.hooks.newEntry(r.Context(), info)
 	sm.mu.Unlock()
 
 	sm.syncMeta(&info)
@@ -137,10 +163,10 @@ func (sm *sessionManager[E]) create(w http.ResponseWriter, r *http.Request) {
 }
 
 func (sm *sessionManager[E]) list(w http.ResponseWriter, r *http.Request) {
-	if sm.store != nil {
+	if sm.runtime != nil {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
-		list, err := sm.store.List(ctx)
+		list, err := sm.runtime.List(ctx)
 		if err != nil {
 			http.Error(w, `{"error":"failed to list sessions"}`, http.StatusInternalServerError)
 			return
@@ -185,7 +211,7 @@ func (sm *sessionManager[E]) get(w http.ResponseWriter, r *http.Request) {
 			sm.hooks.fillDetail(e, &detail)
 		}
 		if sm.memory != nil {
-			if n, _ := sm.memory.Count(context.Background(), id); n > 0 {
+			if n, _ := sm.memory.Count(r.Context(), id); n > 0 {
 				detail.MessageCount = n
 			}
 		}
@@ -194,10 +220,10 @@ func (sm *sessionManager[E]) get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if sm.store != nil {
+	if sm.runtime != nil {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
-		stored, err := sm.store.Get(ctx, id)
+		stored, err := sm.runtime.Get(ctx, id)
 		if err != nil {
 			http.Error(w, `{"error":"failed to get session"}`, http.StatusInternalServerError)
 			return
@@ -205,7 +231,7 @@ func (sm *sessionManager[E]) get(w http.ResponseWriter, r *http.Request) {
 		if stored != nil {
 			detail := SessionDetail{SessionInfo: *stored}
 			if sm.memory != nil {
-				if n, _ := sm.memory.Count(context.Background(), id); n > 0 {
+				if n, _ := sm.memory.Count(r.Context(), id); n > 0 {
 					detail.MessageCount = n
 				}
 			}
@@ -229,11 +255,11 @@ func (sm *sessionManager[E]) update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if sm.store != nil {
+	if sm.runtime != nil {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
-		if stored, err := sm.store.Get(ctx, id); err == nil && stored != nil {
-			sm.getOrCreate(id)
+		if stored, err := sm.runtime.Get(ctx, id); err == nil && stored != nil {
+			sm.getOrCreate(r.Context(), id)
 		}
 	}
 
@@ -290,18 +316,13 @@ func (sm *sessionManager[E]) messages(w http.ResponseWriter, r *http.Request) {
 func (sm *sessionManager[E]) del(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
-	if sm.store != nil {
-		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-		defer cancel()
-		if err := sm.store.Delete(ctx, id); err != nil {
-			slog.Error("failed to delete session from store", "session", id, "error", err)
-		}
-	}
-
-	if sm.memory != nil {
+	// Runtime.Delete removes metadata and messages together.
+	if sm.runtime != nil {
 		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 		defer cancel()
-		_ = sm.memory.DeleteSession(ctx, id)
+		if err := sm.runtime.Delete(ctx, id); err != nil {
+			slog.Error("failed to delete session", "session", id, "error", err)
+		}
 	}
 
 	sm.mu.Lock()
@@ -353,13 +374,13 @@ func (sm *sessionManager[E]) evictIdle(maxIdle time.Duration) {
 			continue
 		}
 
-		if sm.store != nil {
+		if sm.runtime != nil {
 			info := *e.sessionInfo()
 			info.UpdatedAt = now
 			go func(inf session.SessionInfo) {
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
-				if err := sm.store.Save(ctx, inf); err != nil {
+				if err := sm.runtime.Save(ctx, inf); err != nil {
 					slog.Error("failed to persist session before eviction", "session", id, "error", err)
 				}
 			}(info)
@@ -374,7 +395,7 @@ func (sm *sessionManager[E]) evictIdle(maxIdle time.Duration) {
 }
 
 // getOrCreate returns the existing entry or creates a new one.
-func (sm *sessionManager[E]) getOrCreate(id string) E {
+func (sm *sessionManager[E]) getOrCreate(ctx context.Context, id string) E {
 	sm.mu.Lock()
 	if e, ok := sm.entries[id]; ok {
 		sm.lastAccess[id] = time.Now()
@@ -385,10 +406,12 @@ func (sm *sessionManager[E]) getOrCreate(id string) E {
 
 	var info session.SessionInfo
 	restored := false
-	if sm.store != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if sm.runtime != nil {
+		// Bound the restore by the caller's context (the request) plus a
+		// cap — a slow store must not hold the request forever.
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
-		if stored, err := sm.store.Get(ctx, id); err == nil && stored != nil {
+		if stored, err := sm.runtime.Get(ctx, id); err == nil && stored != nil {
 			info = *stored
 			restored = true
 		}
@@ -411,11 +434,11 @@ func (sm *sessionManager[E]) getOrCreate(id string) E {
 		return e
 	}
 
-	e := sm.hooks.newEntry(info)
+	e := sm.hooks.newEntry(ctx, info)
 	sm.entries[id] = e
 	sm.lastAccess[id] = time.Now()
 
-	if !restored && sm.store != nil {
+	if !restored && sm.runtime != nil {
 		sm.syncMeta(&info)
 	}
 

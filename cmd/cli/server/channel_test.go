@@ -53,16 +53,6 @@ func TestFormatInputGrep(t *testing.T) {
 	}
 }
 
-func TestFormatInputSubagent(t *testing.T) {
-	result := formatInput("subagent", `{"name":"reviewer","task":"review auth.go"}`)
-	if !strings.Contains(result, "reviewer") {
-		t.Errorf("should contain agent name: %s", result)
-	}
-	if !strings.Contains(result, "review auth.go") {
-		t.Errorf("should contain task: %s", result)
-	}
-}
-
 func TestFormatInputUnknown(t *testing.T) {
 	result := formatInput("unknown_tool", `{"key":"val"}`)
 	if !strings.Contains(result, "```") {

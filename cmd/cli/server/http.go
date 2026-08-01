@@ -10,6 +10,7 @@ import (
 	"time"
 
 	openagent "github.com/yusheng-g/openagent-go"
+	"github.com/yusheng-g/openagent-go/agent"
 	"github.com/yusheng-g/openagent-go/keyring"
 	"github.com/yusheng-g/openagent-go/rest"
 	"github.com/yusheng-g/openagent-go/sandbox/native"
@@ -20,12 +21,13 @@ import (
 	"github.com/yusheng-g/openagent-go/plugin/wasmhost"
 
 	"github.com/yusheng-g/openagent-go/cmd/cli/config"
+	ctxpkg "github.com/yusheng-g/openagent-go/context"
 )
 
 // ── REST server ──
 
 // RunREST starts the REST API server (HTTP + SSE).
-func RunREST(ctx context.Context, cfg *config.Config, caps Capabilities) error {
+func RunREST(ctx context.Context, cfg *config.Config, caps config.Capabilities) error {
 	models, modelInfos := buildModels(cfg.Provider)
 	m := firstModel(models)
 
@@ -46,29 +48,39 @@ func RunREST(ctx context.Context, cfg *config.Config, caps Capabilities) error {
 	}
 
 	profilesDir := resolveProfilesDir(cfg.Profiles)
-	mem, store, cleanup, err := buildMemory(profilesDir)
+	ms, knowledge, store, cleanup, err := buildMemory(profilesDir, cfg.Embedding, caps.OnEmbedder())
 	if err != nil {
 		return err
 	}
 	defer cleanup()
 
-	opts := []openagent.AgentOption{
-		openagent.WithModel(m),
-		openagent.WithSystemPrompts(resolveProfiles(cfg.Profiles, "")...),
-		openagent.WithMaxTurns(100),
+	opts := []agent.Option{
+		agent.WithModel(m),
+		agent.WithSystemPrompts(resolveProfiles(cfg.Profiles, "")...),
+		agent.WithMaxTurns(100),
 	}
+	opts, skillProvider := buildOpts(opts, caps, m)
+	agentCfg := agent.New("openagent", opts...)
+
+	deps := buildRuntimeDeps(caps, cfg.Sensitive)
+	deps.Tools = tools
+	deps.SkillProvider = skillProvider
 	if caps.OnMemory() {
-		opts = append(opts, openagent.WithMemory(mem))
+		deps.SessionStore = ms
+		deps.Compressor = ms
+		deps.MemoryProvider = knowledge
+		// One shared background extractor per server (never per run).
+		deps.Extractor = ctxpkg.NewAsyncExtractor(ctxpkg.NewLLMExtractor(m, knowledge))
 	}
-	opts = append(opts, openagent.WithTools(tools...))
-	opts = buildOpts(opts, caps, m, cfg.Sensitive)
-	agent := openagent.NewAgent("openagent", opts...)
 
 	if caps.OnSummarizer() && m != nil && caps.OnMemory() {
-		mem.WithSummarizer(summarizer.New(m).WithMaxTokens(agent.MaxCompressedTokens))
+		ms.WithSummarizer(summarizer.New(m).WithMaxTokens(agentCfg.MaxCompressedTokens))
 	}
 
-	handler := rest.NewHandler(agent).
+	if err := applyContextProviders(cfg, &deps); err != nil {
+		return err
+	}
+	handler := rest.NewHandler(agentCfg, deps).
 		WithSessionStore(store).
 		WithCleanupDir(func(sessionID string) {
 			// Matches the artifact hook's layout
@@ -79,13 +91,13 @@ func RunREST(ctx context.Context, cfg *config.Config, caps Capabilities) error {
 			_ = os.RemoveAll(dir)
 		}).
 		WithApproverEnabled(caps.OnApprover()).
-		WithProcessDir(filepath.Join(os.TempDir(), "openagent"))
+		WithProcessDir(opentool.ArtifactRoot())
 	handler.StartJanitor(ctx, 1*time.Hour, 24*time.Hour)
 	for _, mi := range modelInfos {
 		handler.RegisterModel(mi.ID, mi.Model, mi.Provider, mi.APIKey, mi.BaseURL)
 	}
 
-	// Plugin manager — loads agent:tools, agent:observers, agent:sessions.
+	// Plugin manager — loads agent:tools and agent:observers plugins.
 	pluginDir := filepath.Join(profilesDir, "plugins")
 	mgr := wasm.NewManager(pluginDir).WithHostAPI(wasmhost.NewHostAPI(keyring.NewKeyring()))
 	if err := mgr.Discover(ctx); err != nil {
@@ -95,7 +107,7 @@ func RunREST(ctx context.Context, cfg *config.Config, caps Capabilities) error {
 	}
 
 	// Start IM channels in the background.
-	if err := RunChannels(ctx, agent, cfg.Channels); err != nil {
+	if err := RunChannels(ctx, agentCfg, deps, cfg.Channels); err != nil {
 		slog.Warn("channel error", "error", err)
 	}
 
@@ -109,7 +121,14 @@ func RunREST(ctx context.Context, cfg *config.Config, caps Capabilities) error {
 	addr := fmt.Sprintf(":%d", cfg.Server.Port)
 	srv := &http.Server{Addr: addr, Handler: withMiddleware(mux)}
 
-	go func() { <-ctx.Done(); slog.Info("shutting down"); srv.Shutdown(context.Background()) }()
+	go func() {
+		<-ctx.Done()
+		slog.Info("shutting down")
+		// Bounded shutdown: SSE long-pollers can block Close() forever.
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		srv.Shutdown(shutdownCtx)
+	}()
 
 	slog.Info("REST server listening", "addr", addr)
 	err = srv.ListenAndServe()

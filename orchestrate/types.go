@@ -15,6 +15,7 @@ import (
 	"time"
 
 	openagent "github.com/yusheng-g/openagent-go"
+	"github.com/yusheng-g/openagent-go/agent"
 )
 
 // ── Status types ──
@@ -115,7 +116,7 @@ type DepResult struct {
 
 // StepContext is the input assembled for a step from its dependency results.
 // The executor formats it as a system message and passes it via
-// [openagent.AgentRunner.RunWithPrefix].
+// [agent.AgentRunner.RunWithPrefix].
 type StepContext struct {
 	Goal         string      `json:"goal"`
 	Task         string      `json:"task"`
@@ -222,7 +223,7 @@ type ReplanInput struct {
 	Feedback     string           // user's natural language suggestions
 	DoneSteps    []ReplanDoneStep // completed steps (context, do not regenerate)
 	Affected     []StepDef        // steps that need replacing
-	Agents       []openagent.AgentInfo
+	Agents       []agent.AgentInfo
 	SurvivingIDs []string // step IDs that must NOT be reused
 }
 

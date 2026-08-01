@@ -1,25 +1,30 @@
 package rest
 
 import (
-	"log/slog"
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"sync"
 	"time"
 
 	openagent "github.com/yusheng-g/openagent-go"
-	"github.com/yusheng-g/openagent-go/session"
+	"github.com/yusheng-g/openagent-go/agent"
+	"github.com/yusheng-g/openagent-go/governance"
 	"github.com/yusheng-g/openagent-go/eventbus"
+	"github.com/yusheng-g/openagent-go/kernel"
 	"github.com/yusheng-g/openagent-go/orchestrate"
+	"github.com/yusheng-g/openagent-go/session"
 )
 
 // OrchestrateAgentTemplate describes an agent available for plan steps.
 type OrchestrateAgentTemplate struct {
 	Name        string
 	Description string
-	Runner      openagent.AgentRunner // *Agent, Team, or external ACP runner
+	Runner      agent.AgentRunner // external ACP runner (for in-process agents use Cfg+Deps)
+	Cfg         *agent.Agent      // in-process agent configuration
+	Deps        kernel.Deps       // in-process agent runtime deps
 }
 
 // ── OrchestrateHandler ──
@@ -43,6 +48,10 @@ type planSessionState struct {
 	execCancel      context.CancelFunc // set during execution, nil otherwise
 	running         bool               // true while plan is executing
 
+	// approvalMemory persists session-scoped "allow always" decisions
+	// (same wiring as the chat sessions).
+	approvalMemory governance.ApprovalMemory
+
 	// Pause/resume support (AutoReplan=false).
 	execState *orchestrate.PlanState       // current execution state (set when paused)
 	retryCh   chan orchestrate.RetryAction // closed/signaled to resume from pause
@@ -58,14 +67,30 @@ func (s *planSessionState) isActive() bool {
 	return s.running || s.pendingApproval != nil
 }
 
+// takePending returns and clears the pending approval (nil if none).
+func (s *planSessionState) takePending() *pendingApproval {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p := s.pendingApproval
+	s.pendingApproval = nil
+	return p
+}
+
+// setPending parks the approval responder on the session.
+func (s *planSessionState) setPending(p *pendingApproval) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pendingApproval = p
+}
+
 // NewPlanHandler creates a OrchestrateHandler.
 // model is used for both the Planner and step output summarisation.
 // At least one agent template is required.
-func NewOrchestrateHandler(mem openagent.Memory, model openagent.Model, agents ...OrchestrateAgentTemplate) *OrchestrateHandler {
+func NewOrchestrateHandler(mem session.SessionStore, model openagent.Model, agents ...OrchestrateAgentTemplate) *OrchestrateHandler {
 	h := &OrchestrateHandler{agents: agents, model: model}
 
 	bus := eventbus.New[SSEEvent](1000)
-	h.sm = newSessionManager[*planSessionState](nil, mem, bus, sessionHooks[*planSessionState]{
+	h.sm = newSessionManager[*planSessionState](mem, bus, sessionHooks[*planSessionState]{
 		kind:     "plan",
 		newEntry: h.newEntry,
 	})
@@ -111,13 +136,23 @@ func (h *OrchestrateHandler) WithCleanupDir(fn func(sessionID string)) *Orchestr
 
 // ── Session CRUD ──
 
-func (h *OrchestrateHandler) handleCreateSession(w http.ResponseWriter, r *http.Request) { h.sm.create(w, r) }
-func (h *OrchestrateHandler) handleListSessions(w http.ResponseWriter, r *http.Request)  { h.sm.list(w, r) }
-func (h *OrchestrateHandler) handleGetSession(w http.ResponseWriter, r *http.Request)    { h.sm.get(w, r) }
-func (h *OrchestrateHandler) handleUpdateSession(w http.ResponseWriter, r *http.Request) { h.sm.update(w, r) }
-func (h *OrchestrateHandler) handleDeleteSession(w http.ResponseWriter, r *http.Request) { h.sm.del(w, r) }
+func (h *OrchestrateHandler) handleCreateSession(w http.ResponseWriter, r *http.Request) {
+	h.sm.create(w, r)
+}
+func (h *OrchestrateHandler) handleListSessions(w http.ResponseWriter, r *http.Request) {
+	h.sm.list(w, r)
+}
+func (h *OrchestrateHandler) handleGetSession(w http.ResponseWriter, r *http.Request) { h.sm.get(w, r) }
+func (h *OrchestrateHandler) handleUpdateSession(w http.ResponseWriter, r *http.Request) {
+	h.sm.update(w, r)
+}
+func (h *OrchestrateHandler) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
+	h.sm.del(w, r)
+}
 
-func (h *OrchestrateHandler) handlePlanMessages(w http.ResponseWriter, r *http.Request) { h.sm.messages(w, r) }
+func (h *OrchestrateHandler) handlePlanMessages(w http.ResponseWriter, r *http.Request) {
+	h.sm.messages(w, r)
+}
 
 // ── Plan generation ──
 
@@ -132,7 +167,17 @@ func (h *OrchestrateHandler) handleGenerate(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	s := h.sm.getOrCreate(id)
+	s := h.sm.getOrCreate(r.Context(), id)
+
+	// One generator at a time: a concurrent generate would overwrite
+	// currentDef under a running plan.
+	s.mu.Lock()
+	if s.running || s.currentDef != nil {
+		s.mu.Unlock()
+		http.Error(w, `{"error":"a plan already exists — delete it or finish executing"}`, http.StatusConflict)
+		return
+	}
+	s.mu.Unlock()
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -178,7 +223,7 @@ func (h *OrchestrateHandler) handleGenerate(w http.ResponseWriter, r *http.Reque
 func (h *OrchestrateHandler) handleGetPlan(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
-	s := h.sm.getOrCreate(id)
+	s := h.sm.getOrCreate(r.Context(), id)
 
 	s.mu.Lock()
 	def := s.currentDef
@@ -198,7 +243,7 @@ func (h *OrchestrateHandler) handleGetPlan(w http.ResponseWriter, r *http.Reques
 func (h *OrchestrateHandler) handleUpdatePlan(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
-	s := h.sm.getOrCreate(id)
+	s := h.sm.getOrCreate(r.Context(), id)
 
 	var def orchestrate.PlanDef
 	if err := json.NewDecoder(r.Body).Decode(&def); err != nil {
@@ -244,7 +289,7 @@ func (h *OrchestrateHandler) handleUpdatePlan(w http.ResponseWriter, r *http.Req
 func (h *OrchestrateHandler) handleExecute(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
-	s := h.sm.getOrCreate(id)
+	s := h.sm.getOrCreate(r.Context(), id)
 
 	s.mu.Lock()
 	if s.running {
@@ -399,7 +444,7 @@ func (h *OrchestrateHandler) handleEvents(w http.ResponseWriter, r *http.Request
 func (h *OrchestrateHandler) handleCancel(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
-	s := h.sm.getOrCreate(id)
+	s := h.sm.getOrCreate(r.Context(), id)
 
 	s.mu.Lock()
 	cancel := s.execCancel
@@ -424,7 +469,7 @@ func (h *OrchestrateHandler) handleStepRetry(w http.ResponseWriter, r *http.Requ
 	id := r.PathValue("id")
 	stepID := r.PathValue("stepID")
 
-	s := h.sm.getOrCreate(id)
+	s := h.sm.getOrCreate(r.Context(), id)
 
 	s.mu.Lock()
 	state := s.execState
@@ -476,7 +521,7 @@ func (h *OrchestrateHandler) handleReplan(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	s := h.sm.getOrCreate(id)
+	s := h.sm.getOrCreate(r.Context(), id)
 
 	s.mu.Lock()
 	state := s.execState
@@ -514,7 +559,10 @@ func (h *OrchestrateHandler) handleReplan(w http.ResponseWriter, r *http.Request
 	})
 	if err != nil {
 		h.sm.Bus().Publish(id, SSEEvent{Type: "plan_error", Error: err.Error()})
-		http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusInternalServerError)
+		// Marshal the message — raw concatenation could produce invalid
+		// JSON when the error contains quotes or backslashes.
+		msg, _ := json.Marshal(map[string]string{"error": err.Error()})
+		http.Error(w, string(msg), http.StatusInternalServerError)
 		return
 	}
 
@@ -537,44 +585,15 @@ func (h *OrchestrateHandler) handleReplan(w http.ResponseWriter, r *http.Request
 // ── Tool approval during plan execution ──
 
 func (h *OrchestrateHandler) handleApprove(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-
-	var body ApproveRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, `{"error":"allowed is required"}`, http.StatusBadRequest)
-		return
-	}
-
-	s := h.sm.getOrCreate(id)
-
-	s.mu.Lock()
-	p := s.pendingApproval
-	s.pendingApproval = nil
-	s.mu.Unlock()
-
-	if p == nil {
-		http.Error(w, `{"error":"no pending approval"}`, http.StatusBadRequest)
-		return
-	}
-
-	reason := "denied"
-	if body.Feedback != "" {
-		reason = "denied: " + body.Feedback
-	}
-	if body.Allowed {
-		reason = "approved"
-	}
-	p.respond <- approveResponse{allowed: body.Allowed, reason: reason}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": reason})
+	handleApproveShared(h.sm, w, r)
 }
 
 // ── Factory ──
 
-func (h *OrchestrateHandler) newEntry(info session.SessionInfo) *planSessionState {
+func (h *OrchestrateHandler) newEntry(ctx context.Context, info session.SessionInfo) *planSessionState {
 	s := &planSessionState{
-		info: info,
+		info:           info,
+		approvalMemory: governance.NewPersistentApprovalMemory(h.sm.Runtime()),
 	}
 
 	// Build plan with agents.
@@ -588,10 +607,18 @@ func (h *OrchestrateHandler) newEntry(info session.SessionInfo) *planSessionStat
 
 	mem := h.sm.Memory()
 	for _, t := range h.agents {
-		// Clone in-process agents so each session has isolated state.
+		// In-process agents: bind config + deps into a per-session runtime.
 		runner := t.Runner
-		if ag, ok := t.Runner.(*openagent.Agent); ok {
-			runner = cloneAgentForPlan(ag, mem, s, h.submitApproval)
+		if t.Cfg != nil {
+			deps := t.Deps
+			deps.SessionStore = mem
+			deps.HumanApprover = &restApprover{
+				submit: func(call openagent.ToolCall, resp chan approveResponse) {
+					h.submitApproval(s, call, resp)
+				},
+				memory: s.approvalMemory,
+			}
+			runner = kernel.New(t.Cfg.Clone(), deps)
 		}
 		opts = append(opts, orchestrate.WithAgent(t.Name, t.Description, runner))
 	}
@@ -603,44 +630,7 @@ func (h *OrchestrateHandler) newEntry(info session.SessionInfo) *planSessionStat
 // ── Approval bridge ──
 
 func (h *OrchestrateHandler) submitApproval(s *planSessionState, call openagent.ToolCall, resp chan approveResponse) {
-	tcj := &SSEToolCall{
-		ID: call.ID,
-		Function: SSEToolCallFunction{
-			Name:      call.Function.Name,
-			Arguments: call.Function.Arguments,
-		},
-	}
-
-	evt := SSEEvent{
-		Type:     "tool_approval",
-		ToolCall: tcj,
-	}
-
-	s.mu.Lock()
-	s.pendingApproval = &pendingApproval{respond: resp}
-	s.mu.Unlock()
-
-	h.sm.Bus().Publish(s.info.ID, evt)
-}
-
-// cloneAgentForPlan clones an Agent for use in a plan session, injecting the REST approver bridge.
-// If mem is non-nil, it overrides the template's memory so plan steps persist their messages.
-func cloneAgentForPlan(tmpl *openagent.Agent, mem openagent.Memory, s *planSessionState, submitFn func(*planSessionState, openagent.ToolCall, chan approveResponse)) *openagent.Agent {
-	if mem == nil {
-		mem = tmpl.Memory
-	}
-	return openagent.NewAgent(tmpl.Name,
-		openagent.WithModel(tmpl.Model),
-		openagent.WithMemory(mem),
-		openagent.WithTools(tmpl.Tools...),
-		openagent.WithSystemPrompts(tmpl.SystemPrompts...),
-		openagent.WithMaxTurns(tmpl.MaxTurns),
-		openagent.WithApprover(&restApprover{
-			submit: func(call openagent.ToolCall, resp chan approveResponse) {
-				submitFn(s, call, resp)
-			},
-		}),
-	)
+	submitApprovalShared(h.sm, s, call, resp)
 }
 
 // ── PlanEvent → SSE ──

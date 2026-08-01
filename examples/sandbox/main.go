@@ -114,19 +114,19 @@ func main() {
 	// ── Test 5: File tools ──
 	fmt.Println("─── Test 5: File tools ──")
 	r := tool.NewReadFile(workDir)
-	out, err := r.Execute(ctx, []byte(`{"path":"secret.txt"}`))
-	fmt.Printf("  read secret.txt: %v\n", trim(out))
+	out := r.Execute(ctx, []byte(`{"path":"secret.txt"}`))
+	fmt.Printf("  read secret.txt: %v\n", trim(out.Content))
 
-	out, err = r.Execute(ctx, []byte(`{"path":"../outside.txt"}`))
-	fmt.Printf("  read ../outside.txt: %v\n", trim(out))
+	out = r.Execute(ctx, []byte(`{"path":"../outside.txt"}`))
+	fmt.Printf("  read ../outside.txt: %v\n", trim(out.Content))
 
 	w := tool.NewWriteFile(workDir)
-	out, err = w.Execute(ctx, []byte(`{"path":"demo.txt","content":"written by sandbox demo"}`))
-	fmt.Printf("  write demo.txt: %v\n", trim(out))
+	out = w.Execute(ctx, []byte(`{"path":"demo.txt","content":"written by sandbox demo"}`))
+	fmt.Printf("  write demo.txt: %v\n", trim(out.Content))
 
 	l := tool.NewListDir(workDir)
-	out, err = l.Execute(ctx, []byte(`{}`))
-	fmt.Printf("  ls:\n%s", out)
+	out = l.Execute(ctx, []byte(`{}`))
+	fmt.Printf("  ls:\n%s", out.Content)
 	fmt.Println()
 
 	// ── Test 6: Shell tool ──
@@ -136,8 +136,8 @@ func main() {
 	fmt.Printf("  Tool name: %s\n", def.Name)
 	fmt.Printf("  Description: %s\n", def.Description)
 
-	out, err = shell.Execute(ctx, []byte(`{"command":"echo hello from shell tool && ls"}`))
-	fmt.Printf("  Execute: %v\n", trim(out))
+	out = shell.Execute(ctx, []byte(`{"command":"echo hello from shell tool && ls"}`))
+	fmt.Printf("  Execute: %v\n", trim(out.Content))
 	fmt.Println()
 
 	fmt.Println("🏖️  All sandbox tests passed!")

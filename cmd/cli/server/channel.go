@@ -1,27 +1,31 @@
 package server
 
 import (
-	"log/slog"
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
 
 	openagent "github.com/yusheng-g/openagent-go"
+	"github.com/yusheng-g/openagent-go/agent"
 	"github.com/yusheng-g/openagent-go/channel"
 	"github.com/yusheng-g/openagent-go/channel/feishu"
+	"github.com/yusheng-g/openagent-go/kernel"
 
 	"github.com/yusheng-g/openagent-go/cmd/cli/config"
 )
 
 // RunChannels starts all configured IM channels.
-func RunChannels(ctx context.Context, agent *openagent.Agent, cfg config.ChannelsConfig) error {
+// cfg is the agent configuration (pure); deps carry the runtime
+// capabilities (Tools, Memory, Hooks, Observer).
+func RunChannels(ctx context.Context, cfg *agent.Agent, deps kernel.Deps, channelsCfg config.ChannelsConfig) error {
 	var channels []channel.Channel
 
-	if cfg.Feishu != nil {
-		channels = append(channels, feishu.New(cfg.Feishu.AppID, cfg.Feishu.AppSecret))
+	if channelsCfg.Feishu != nil {
+		channels = append(channels, feishu.New(channelsCfg.Feishu.AppID, channelsCfg.Feishu.AppSecret))
 	}
 
 	if len(channels) == 0 {
@@ -38,14 +42,14 @@ func RunChannels(ctx context.Context, agent *openagent.Agent, cfg config.Channel
 					// Carry the resolved Model instance so downstream
 					// consumers (RunHooks via SessionFromContext, e.g. the
 					// artifact hook's context-window threshold) read the
-					// same model the runner uses. channelAgent.Model was
-					// injected in acp.go before RunChannels.
+					// same model the runner uses. cfg.Model was injected in
+					// acp.go before RunChannels.
 					session := openagent.Session{
 						ID:        sessionID,
-						Model:     agent.Model,
+						Model:     cfg.Model,
 						CreatedAt: time.Now(),
 					}
-					stream := agent.RunStream(msgCtx, session, openagent.UserMessage(msg.Text))
+					stream := kernel.New(cfg, deps).RunStream(msgCtx, session, openagent.UserMessage(msg.Text))
 					streamReply(reply, stream)
 				}()
 			})
@@ -310,10 +314,10 @@ func mkCard(title, body string, color channel.CardColor) *channel.Card {
 type stage int
 
 const (
-	stageThinking stage = iota // 🤔 思考中
-	stageToolCalling           // 🔧 调用工具中
-	stageAnswering             // 💬 回答中
-	stageDone                  // ✅ 已完成
+	stageThinking    stage = iota // 🤔 思考中
+	stageToolCalling              // 🔧 调用工具中
+	stageAnswering                // 💬 回答中
+	stageDone                     // ✅ 已完成
 )
 
 func (s stage) title() string {
@@ -475,13 +479,6 @@ func formatInput(name, args string) string {
 		if path != "" {
 			return "`" + path + "`"
 		}
-	case "subagent":
-		n := jsonStr(m, "name")
-		t := jsonStr(m, "task")
-		if n != "" {
-			return "**" + n + "** — " + trunc(t, 200)
-		}
-		return trunc(t, 200)
 	}
 	return "```\n" + trunc(args, 200) + "\n```"
 }
@@ -511,8 +508,6 @@ func toolEmoji(name string) string {
 		return "🔗"
 	case "recall":
 		return "🧠"
-	case "subagent":
-		return "🤖"
 	case "load_skill":
 		return "📦"
 	default:

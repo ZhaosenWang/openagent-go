@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"testing"
 
-	openagent "github.com/yusheng-g/openagent-go"
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
+	openagent "github.com/yusheng-g/openagent-go"
 )
 
 // echoTool is a simple openagent.Tool for testing.
@@ -16,20 +16,14 @@ func (t *echoTool) Definition() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
 		Name:        "echo",
 		Description: "Echoes the input message back.",
-		Parameters: json.RawMessage(`{
-			"type": "object",
-			"properties": {
-				"message": {"type": "string", "description": "The message to echo"}
-			},
-			"required": ["message"]
-		}`),
+		Parameters:  openagent.SchemaOf[Test1Params](),
 	}
 }
 
-func (t *echoTool) Execute(_ context.Context, args json.RawMessage) (string, error) {
+func (t *echoTool) Execute(_ context.Context, args json.RawMessage) *openagent.ToolResult {
 	var p struct{ Message string }
 	json.Unmarshal(args, &p)
-	return "echo: " + p.Message, nil
+	return &openagent.ToolResult{Content: "echo: " + p.Message}
 }
 
 func TestServerAddTool(t *testing.T) {
@@ -48,8 +42,8 @@ type emptyNameTool struct{}
 func (t *emptyNameTool) Definition() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{Name: ""}
 }
-func (t *emptyNameTool) Execute(_ context.Context, args json.RawMessage) (string, error) {
-	return "", nil
+func (t *emptyNameTool) Execute(_ context.Context, args json.RawMessage) *openagent.ToolResult {
+	return &openagent.ToolResult{}
 }
 
 func TestServerClientRoundTrip(t *testing.T) {
@@ -92,12 +86,12 @@ func TestServerClientRoundTrip(t *testing.T) {
 
 	// Call the tool.
 	args, _ := json.Marshal(map[string]string{"message": "hello"})
-	output, err := tools[0].Execute(ctx, args)
-	if err != nil {
-		t.Fatalf("Execute: %v", err)
+	result := tools[0].Execute(ctx, args)
+	if result.Error != nil {
+		t.Fatalf("Execute: %v", result.Error)
 	}
-	if output != "echo: hello" {
-		t.Fatalf("expected 'echo: hello', got %q", output)
+	if result.Content != "echo: hello" {
+		t.Fatalf("expected 'echo: hello', got %q", result.Content)
 	}
 
 	// Close client session.
@@ -113,7 +107,7 @@ func TestSchemaConversion(t *testing.T) {
 	def := openagent.FunctionDefinition{
 		Name:        "test",
 		Description: "a test tool",
-		Parameters:  json.RawMessage(`{"type":"object","properties":{"x":{"type":"integer"}}}`),
+		Parameters:  openagent.SchemaOf[Test2Params](),
 	}
 
 	mcpTool := ToMCPTool(def)
@@ -164,4 +158,12 @@ func TestClientSessionClose(t *testing.T) {
 	if err := session.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
+}
+
+type Test1Params struct {
+	Message string `json:"message" jsonschema:"description=The message to echo"`
+}
+
+type Test2Params struct {
+	X int `json:"x,omitempty"`
 }

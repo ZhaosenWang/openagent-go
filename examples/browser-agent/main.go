@@ -19,6 +19,8 @@ import (
 	"time"
 
 	openagent "github.com/yusheng-g/openagent-go"
+	"github.com/yusheng-g/openagent-go/agent"
+	"github.com/yusheng-g/openagent-go/kernel"
 	"github.com/yusheng-g/openagent-go/mcp"
 	"github.com/yusheng-g/openagent-go/model/openai"
 )
@@ -68,10 +70,9 @@ func main() {
 	}
 
 	// ── Build agent ──
-	agent := openagent.NewAgent("browser-agent",
-		openagent.WithModel(model),
-		openagent.WithTools(tools...),
-		openagent.WithSystemPrompts(`You control a web browser using Playwright tools. Use the available browser tools to complete tasks.
+	cfg := agent.New("browser-agent",
+		agent.WithModel(model),
+		agent.WithSystemPrompts(`You control a web browser using Playwright tools. Use the available browser tools to complete tasks.
 
 ## How to fill in forms
 1. browser_navigate(url) — go to the login page
@@ -88,8 +89,11 @@ func main() {
 - If you see a CAPTCHA, tell the user — you cannot solve CAPTCHAs.
 - If login fails, report the exact error message shown on the page.
 - browser_console_messages() helps debug JavaScript errors.`),
-		openagent.WithMaxTurns(15),
+		agent.WithMaxTurns(15),
 	)
+	deps := kernel.Deps{
+		Tools: tools,
+	}
 
 	sess := openagent.Session{
 		ID: "browser-demo", UserID: "user-1",
@@ -119,7 +123,7 @@ func main() {
 	}
 	fmt.Printf("\nTask: %s\n\n", task)
 
-	result, err := agent.Run(ctx, sess, openagent.UserMessage(task))
+	result, err := kernel.New(cfg, deps).Run(ctx, sess, openagent.UserMessage(task))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 		os.Exit(1)

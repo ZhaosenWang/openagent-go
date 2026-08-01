@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 )
 
-// FunctionDefinition is the JSON Schema definition of a tool function.
-// Follows OpenAI function calling format.
+// FunctionDefinition is the definition of a tool function: name,
+// description, and provider-neutral [Parameters]. The Parameters model's
+// JSON form IS a JSON Schema, so serializing the FunctionDefinition
+// directly yields the provider's schema (OpenAI "parameters", Anthropic
+// "input_schema", MCP "inputSchema") with no per-provider conversion.
 type FunctionDefinition struct {
-	Name        string          `json:"name"`
-	Description string          `json:"description"`
-	Parameters  json.RawMessage `json:"parameters"` // JSON Schema
+	Name        string      `json:"name"`
+	Description string      `json:"description"`
+	Parameters  *Parameters `json:"parameters"`
 
 	// EndTurn, when true, tells the runner to end the agent turn loop
 	// immediately after executing this tool. Used by handoff tools
@@ -20,9 +23,17 @@ type FunctionDefinition struct {
 
 // Tool represents a callable tool. Both local tools and MCP-imported tools
 // implement this interface — the Runner does not distinguish between them.
+//
+// Execute returns a structured [ToolResult]. Failures are carried in
+// Result.Error (structured, with Retryable marking errors the runtime may
+// retry and Code for audit) — there is no separate error return; a nil
+// result.Error means success. The runner applies the configured
+// [ResultPolicy] (truncation) after hooks and before the result enters
+// memory. Framework-level problems (tool not found, panic) are handled by
+// the runtime and never appear in tool signatures.
 type Tool interface {
 	Definition() FunctionDefinition
-	Execute(ctx context.Context, args json.RawMessage) (string, error)
+	Execute(ctx context.Context, args json.RawMessage) *ToolResult
 }
 
 // ToolStreamChunk is a single chunk of streaming output from a tool that
@@ -32,17 +43,6 @@ type Tool interface {
 type ToolStreamChunk struct {
 	Content string `json:"content"`
 	Error   error  `json:"-"`
-}
-
-// SelfApproving is an optional interface for tools that can determine at
-// runtime whether they're safe to execute without user approval. Read-only
-// tools (read, ls, grep) check that their resolved target path is within
-// the workspace boundary; anything outside still requires approval.
-//
-// Runner calls CanSelfApprove BEFORE the tool executes. If true, the
-// Approver is bypassed for this specific call.
-type SelfApproving interface {
-	CanSelfApprove(args json.RawMessage) bool
 }
 
 // StreamExecutor is an optional interface for tools that produce streaming

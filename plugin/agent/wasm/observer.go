@@ -56,8 +56,7 @@ func (s *wasmObserver) invoke(ctx context.Context, event openagent.StageEvent) (
 		return nil, fmt.Errorf("wasm stage %q: parse output: %w", s.meta.Name, err)
 	}
 
-	if out.Action == ActionAbort {
-		return &out, fmt.Errorf("wasm stage %q aborted: %s", s.meta.Name, out.Reason)
-	}
+	// ActionAbort is an output (stop the run), not an error — the caller
+	// decides from Action, never from err.
 	return &out, nil
 }

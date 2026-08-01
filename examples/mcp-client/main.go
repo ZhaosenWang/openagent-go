@@ -15,6 +15,8 @@ import (
 	"time"
 
 	openagent "github.com/yusheng-g/openagent-go"
+	"github.com/yusheng-g/openagent-go/agent"
+	"github.com/yusheng-g/openagent-go/kernel"
 	"github.com/yusheng-g/openagent-go/mcp"
 	"github.com/yusheng-g/openagent-go/model/openai"
 )
@@ -85,11 +87,9 @@ func main() {
 	// Progress observer so the user sees live output.
 	prog := &progressObserver{}
 
-	coordinator := openagent.NewAgent("iac-coordinator",
-		openagent.WithModel(model),
-		openagent.WithTools(tools...),
-		openagent.WithRunObserver(prog),
-		openagent.WithSystemPrompts(`You are an IaC orchestrator controlling a 6-step deployment pipeline. You MUST call each tool IN ORDER — one at a time — and use the actual output of each step as input to the next. Never simulate or invent results.
+	cfg := agent.New("iac-coordinator",
+		agent.WithModel(model),
+		agent.WithSystemPrompts(`You are an IaC orchestrator controlling a 6-step deployment pipeline. You MUST call each tool IN ORDER — one at a time — and use the actual output of each step as input to the next. Never simulate or invent results.
 
 Step 1: Call iac_intent_parse with the user's goal as the task. WAIT for the JSON result.
 Step 2: Call iac_architecture_design. The task MUST include the full JSON from step 1: "Based on this ApplicationProfile: <paste the JSON output from step 1>, design 3 architecture options."
@@ -97,8 +97,12 @@ Step 3: Pick the recommended plan (option B). Call iac_generate_terraform. The t
 Step 4: Call iac_review_plan. Task: "Review the generated Terraform plan."
 Step 5: Summarize what happened — which resources were planned, estimated cost, any issues.
 Step 6: Do NOT call iac_apply unless the user explicitly asks for it.`),
-		openagent.WithMaxTurns(12),
+		agent.WithMaxTurns(12),
 	)
+	deps := kernel.Deps{
+		Tools:    tools,
+		Observer: prog,
+	}
 
 	sess := openagent.Session{
 		ID: "iac-mcp-demo", UserID: "user-1",
@@ -112,7 +116,7 @@ Step 6: Do NOT call iac_apply unless the user explicitly asks for it.`),
 	}
 	fmt.Printf("\nGoal: %s\n\n", goal)
 
-	result, err := coordinator.Run(ctx, sess, openagent.UserMessage(goal))
+	result, err := kernel.New(cfg, deps).Run(ctx, sess, openagent.UserMessage(goal))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 		os.Exit(1)

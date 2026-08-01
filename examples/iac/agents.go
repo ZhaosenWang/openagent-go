@@ -5,6 +5,11 @@ import (
 	"encoding/json"
 
 	openagent "github.com/yusheng-g/openagent-go"
+	"github.com/yusheng-g/openagent-go/agent"
+	ctxpkg "github.com/yusheng-g/openagent-go/context"
+	"github.com/yusheng-g/openagent-go/kernel"
+	"github.com/yusheng-g/openagent-go/provider/skill"
+	"github.com/yusheng-g/openagent-go/session"
 	"github.com/yusheng-g/openagent-go/skill/fs"
 
 	"github.com/yusheng-g/openagent-go/examples/iac/tools"
@@ -15,9 +20,6 @@ var templatesFS embed.FS
 
 //go:embed skills/*
 var skillsFS embed.FS
-
-// newFSLoader creates a skill loader from the given directory.
-func newFSLoader(dir string) openagent.SkillLoader { return fs.New(dir) }
 
 // ── Schema types ──
 
@@ -63,7 +65,8 @@ func parseArchitecturePlans(raw string) ([]ArchitecturePlan, error) {
 type agentDef struct {
 	Name        string
 	Description string
-	Runner      openagent.AgentRunner
+	Cfg         *agent.Agent
+	Deps        kernel.Deps
 }
 
 // buildIACAgents creates the 6-agent IaC pipeline.
@@ -71,25 +74,26 @@ type agentDef struct {
 // skillDir is the workspace skills/ path for the skill loader.
 func buildIACAgents(
 	model openagent.Model,
-	mem openagent.Memory,
+	mem session.SessionStore,
+	knowledge ctxpkg.MemoryProvider,
 	tfTool *tools.TerraformTool,
 	fileTools []openagent.Tool,
 	skillDir string,
 ) []agentDef {
 	tfT := tfTool.AsTools()
 	tfRO := []openagent.Tool{tfT[0], tfT[1], tfT[3]} // init, plan, output
-	tfApply := []openagent.Tool{tfT[2]}               // apply
+	tfApply := []openagent.Tool{tfT[2]}              // apply
 
-	var skillLoader openagent.SkillLoader
+	var skillProvider skill.Provider
 	if skillDir != "" {
-		skillLoader = fs.New(skillDir)
+		skillProvider = skill.NewFSBridge(fs.New(skillDir))
 	}
 
-	intentParser := openagent.NewAgent("intent_parser",
-		openagent.WithModel(model),
-		openagent.WithMemory(mem),
-		openagent.WithDescription("Analyzes user input (GitHub URL or natural language) to infer application runtime, database, cache, storage, CDN, HTTPS needs. Outputs a structured ApplicationProfile JSON."),
-		openagent.WithSystemPrompts(`You are an Application Intent Parser. Analyze the user's deployment request and produce a JSON ApplicationProfile.
+	intentParserCfg := agent.New(
+		"intentParser",
+		agent.WithModel(model),
+		agent.WithDescription("Analyzes user input (GitHub URL or natural language) to infer application runtime, database, cache, storage, CDN, HTTPS needs. Outputs a structured ApplicationProfile JSON."),
+		agent.WithSystemPrompts(`You are an Application Intent Parser. Analyze the user's deployment request and produce a JSON ApplicationProfile.
 
 ## Inference Rules
 - GitHub URL with package.json → runtime=nodejs
@@ -113,15 +117,19 @@ Output ONLY the JSON object. No markdown, no explanation.
   "container": "none",
   "traffic": "medium"
 }`),
-		openagent.WithMaxTurns(1),
+		agent.WithMaxTurns(1),
 	)
+	intentParserDeps := kernel.Deps{
+		SessionStore:   mem,
+		Compressor:     ctxpkg.CompressorOf(mem),
+		MemoryProvider: knowledge,
+	}
 
-	architect := openagent.NewAgent("architect",
-		openagent.WithModel(model),
-		openagent.WithMemory(mem),
-		openagent.WithDescription("Designs cloud architecture from an ApplicationProfile. Uses pricing and deployment pattern skills. Produces 3 architecture options (A/B/C) with resource lists and monthly cost estimates. Requires human approval to select which option to implement."),
-		openagent.WithSkillLoader(skillLoader),
-		openagent.WithSystemPrompts(`You are a Cloud Architect. Design infrastructure for the given ApplicationProfile.
+	architectCfg := agent.New(
+		"architect",
+		agent.WithModel(model),
+		agent.WithDescription("Designs cloud architecture from an ApplicationProfile. Uses pricing and deployment pattern skills. Produces 3 architecture options (A/B/C) with resource lists and monthly cost estimates. Requires human approval to select which option to implement."),
+		agent.WithSystemPrompts(`You are a Cloud Architect. Design infrastructure for the given ApplicationProfile.
 
 ## Process
 1. Load skills: load_skill("deployment-patterns") for pricing and patterns.
@@ -145,8 +153,14 @@ Return ONLY a JSON array. No markdown fences.
   },
   ...
 ]`),
-		openagent.WithMaxTurns(3),
+		agent.WithMaxTurns(3),
 	)
+	architectDeps := kernel.Deps{
+		SessionStore:   mem,
+		Compressor:     ctxpkg.CompressorOf(mem),
+		MemoryProvider: knowledge,
+		SkillProvider:  skillProvider,
+	}
 
 	// Tools for module_planner: read templates, write .tf files, terraform_init.
 	moduleTools := []openagent.Tool{tfT[0]} // terraform_init
@@ -154,13 +168,11 @@ Return ONLY a JSON array. No markdown fences.
 		moduleTools = append(moduleTools, fileTools...)
 	}
 
-	modulePlanner := openagent.NewAgent("module_planner",
-		openagent.WithModel(model),
-		openagent.WithMemory(mem),
-		openagent.WithDescription("Translates a selected architecture plan into Terraform configuration files. Reads module templates from disk, fills variables, and writes .tf files."),
-		openagent.WithSkillLoader(skillLoader),
-		openagent.WithTools(moduleTools...),
-		openagent.WithSystemPrompts(`You are a Terraform Module Planner. Generate .tf files from templates for the chosen architecture plan.
+	modulePlannerCfg := agent.New(
+		"modulePlanner",
+		agent.WithModel(model),
+		agent.WithDescription("Translates a selected architecture plan into Terraform configuration files. Reads module templates from disk, fills variables, and writes .tf files."),
+		agent.WithSystemPrompts(`You are a Terraform Module Planner. Generate .tf files from templates for the chosen architecture plan.
 
 ## Process
 1. Use read_file to read templates/templates/*.tf.tmpl to see what variables each module needs.
@@ -169,7 +181,7 @@ Return ONLY a JSON array. No markdown fences.
 4. Use write_file to write the result to terraform/<name>.tf
 5. Run terraform_init to verify the configuration.
 
-## Template Files (read_file)
+## Template Files (read_file),
 - templates/provider.tf.tmpl → terraform/provider.tf
 - templates/ecs.tf.tmpl → terraform/ecs.tf
 - templates/rds.tf.tmpl → terraform/rds.tf
@@ -180,15 +192,21 @@ Return ONLY a JSON array. No markdown fences.
 - Replace ALL placeholders with concrete values before writing.
 - Do NOT run terraform_plan or terraform_apply — that is the reviewer/applier's job.
 - Use sensible defaults for unspecified values.`),
-		openagent.WithMaxTurns(5),
+		agent.WithMaxTurns(5),
 	)
+	modulePlannerDeps := kernel.Deps{
+		SessionStore:   mem,
+		Compressor:     ctxpkg.CompressorOf(mem),
+		MemoryProvider: knowledge,
+		SkillProvider:  skillProvider,
+		Tools:          moduleTools,
+	}
 
-	reviewer := openagent.NewAgent("reviewer",
-		openagent.WithModel(model),
-		openagent.WithMemory(mem),
-		openagent.WithDescription("Reviews Terraform configurations: runs terraform init + plan, parses plan output, produces human-readable summary of changes, costs, and risks."),
-		openagent.WithTools(tfRO...),
-		openagent.WithSystemPrompts(`You are a Terraform Plan Reviewer. Review configurations before they are applied.
+	reviewerCfg := agent.New(
+		"reviewer",
+		agent.WithModel(model),
+		agent.WithDescription("Reviews Terraform configurations: runs terraform init + plan, parses plan output, produces human-readable summary of changes, costs, and risks."),
+		agent.WithSystemPrompts(`You are a Terraform Plan Reviewer. Review configurations before they are applied.
 
 ## Process
 1. Run terraform_init
@@ -203,15 +221,20 @@ Return ONLY a JSON array. No markdown fences.
 **Recommendation**: Approve or Reject with reasoning
 
 Be concise. This is an approval gate.`),
-		openagent.WithMaxTurns(3),
+		agent.WithMaxTurns(3),
 	)
+	reviewerDeps := kernel.Deps{
+		SessionStore:   mem,
+		Compressor:     ctxpkg.CompressorOf(mem),
+		MemoryProvider: knowledge,
+		Tools:          tfRO,
+	}
 
-	applier := openagent.NewAgent("applier",
-		openagent.WithModel(model),
-		openagent.WithMemory(mem),
-		openagent.WithDescription("Applies approved Terraform plans. Runs terraform apply and reports results."),
-		openagent.WithTools(tfApply...),
-		openagent.WithSystemPrompts(`You are the Terraform Applier. Apply an approved plan.
+	applierCfg := agent.New(
+		"applier",
+		agent.WithModel(model),
+		agent.WithDescription("Applies approved Terraform plans. Runs terraform apply and reports results."),
+		agent.WithSystemPrompts(`You are the Terraform Applier. Apply an approved plan.
 
 ## Process
 1. Confirm the plan has been reviewed and approved
@@ -222,15 +245,21 @@ Be concise. This is an approval gate.`),
 - NEVER apply without explicit approval
 - If apply fails, report the error clearly
 - After success, suggest running terraform_output for connection details`),
-		openagent.WithMaxTurns(2),
+		agent.WithMaxTurns(2),
 	)
+	applierDeps := kernel.Deps{
+		SessionStore:   mem,
+		Compressor:     ctxpkg.CompressorOf(mem),
+		MemoryProvider: knowledge,
+		Tools:          tfApply,
+	}
 
-	monitor := openagent.NewAgent("monitor",
-		openagent.WithModel(model),
-		openagent.WithMemory(mem),
-		openagent.WithDescription("Post-deployment health checks and optimization recommendations."),
-		openagent.WithTools(tfT[3]), // terraform_output
-		openagent.WithSystemPrompts(`You are a Post-Deployment Monitor.
+	monitorCfg := agent.New(
+		"monitor",
+		agent.WithModel(model),
+		agent.WithDescription("Post-deployment health checks and optimization recommendations."),
+		// terraform_output
+		agent.WithSystemPrompts(`You are a Post-Deployment Monitor.
 
 ## Process
 1. Run terraform_output to get resource endpoints
@@ -241,17 +270,23 @@ Be concise. This is an approval gate.`),
    - Performance: add CDN, resize instances
 
 ## Output
-- Health Summary (one per resource)
+- Health Summary (one per resource),
 - Optimization Suggestions (numbered, with estimated savings)`),
-		openagent.WithMaxTurns(2),
+		agent.WithMaxTurns(2),
 	)
+	monitorDeps := kernel.Deps{
+		SessionStore:   mem,
+		Compressor:     ctxpkg.CompressorOf(mem),
+		MemoryProvider: knowledge,
+		Tools:          []openagent.Tool{tfT[3]},
+	}
 
 	return []agentDef{
-		{Name: "intent_parser", Description: intentParser.Description, Runner: intentParser},
-		{Name: "architect", Description: architect.Description, Runner: architect},
-		{Name: "module_planner", Description: modulePlanner.Description, Runner: modulePlanner},
-		{Name: "reviewer", Description: reviewer.Description, Runner: reviewer},
-		{Name: "applier", Description: applier.Description, Runner: applier},
-		{Name: "monitor", Description: monitor.Description, Runner: monitor},
+		{Name: "intent_parser", Description: intentParserCfg.Description, Cfg: intentParserCfg, Deps: intentParserDeps},
+		{Name: "architect", Description: architectCfg.Description, Cfg: architectCfg, Deps: architectDeps},
+		{Name: "module_planner", Description: modulePlannerCfg.Description, Cfg: modulePlannerCfg, Deps: modulePlannerDeps},
+		{Name: "reviewer", Description: reviewerCfg.Description, Cfg: reviewerCfg, Deps: reviewerDeps},
+		{Name: "applier", Description: applierCfg.Description, Cfg: applierCfg, Deps: applierDeps},
+		{Name: "monitor", Description: monitorCfg.Description, Cfg: monitorCfg, Deps: monitorDeps},
 	}
 }

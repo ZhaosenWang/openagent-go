@@ -78,7 +78,7 @@ func (c *Client) ConnectStdio(ctx context.Context, env []string, command string,
 		return nil, fmt.Errorf("acp start %q: %w", command, err)
 	}
 
-	return c.connectIO(stdin, stdout, subprocessCloser(cmd), &stderrBuf), nil
+	return c.connectIO(ctx, stdin, stdout, subprocessCloser(cmd), &stderrBuf), nil
 }
 
 // connectIO wires a [Session] to arbitrary io streams and starts the reader
@@ -88,8 +88,9 @@ func (c *Client) ConnectStdio(ctx context.Context, env []string, command string,
 // This is the seam that separates process-spawning ([ConnectStdio]) from the
 // JSON-RPC transport, so a Session can also be driven in-process (e.g. over
 // io.Pipe for tests or an already-spawned process's pipes).
-func (c *Client) connectIO(stdin io.Writer, stdout io.Reader, closer io.Closer, stderr *bytes.Buffer) *Session {
+func (c *Client) connectIO(ctx context.Context, stdin io.Writer, stdout io.Reader, closer io.Closer, stderr *bytes.Buffer) *Session {
 	sess := &Session{
+		ctx:       ctx,
 		stdin:     stdin,
 		stdout:    bufio.NewScanner(stdout),
 		closer:    closer,
@@ -97,7 +98,7 @@ func (c *Client) connectIO(stdin io.Writer, stdout io.Reader, closer io.Closer, 
 		writeMu:   new(sync.Mutex),
 		pending:   make(map[string]*pendingCall),
 	}
-	go sess.startReader()
+	go sess.startReader(ctx)
 	return sess
 }
 
@@ -129,6 +130,9 @@ func (f closerFunc) Close() error { return f() }
 // [Session.SetEventHandler]. The handler must be set before [Session.Prompt]
 // to receive streaming output.
 type Session struct {
+	// ctx is the connection lifecycle context (from ConnectStdio); inbound
+	// agent->client RPC handlers run under it so they cancel on disconnect.
+	ctx    context.Context
 	stdin  io.Writer
 	stdout *bufio.Scanner
 
@@ -451,7 +455,7 @@ type EventHandler interface {
 //	Request:      method + id present → agent→client RPC. Handle synchronously.
 //	Notification: method present, no id → dispatch to EventHandler.
 //	Response:     no method, id present → deliver to pending call.
-func (s *Session) startReader() {
+func (s *Session) startReader(ctx context.Context) {
 	s.stdout.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
 	for s.stdout.Scan() {
 		line := s.stdout.Bytes()
@@ -475,7 +479,7 @@ func (s *Session) startReader() {
 		case env.Method != "" && len(env.ID) > 0:
 			// Agent→Client RPC request. Handle synchronously and write
 			// the response back to the agent on stdin.
-			s.handleAgentRequest(env.Method, env.ID, env.Params)
+			s.handleAgentRequest(ctx, env.Method, env.ID, env.Params)
 
 		case env.Method != "":
 			// Notification — dispatch to EventHandler.
@@ -501,7 +505,7 @@ func (s *Session) startReader() {
 
 // handleAgentRequest dispatches an incoming Agent→Client RPC request
 // and writes the JSON-RPC 2.0 response back to the agent on stdin.
-func (s *Session) handleAgentRequest(method string, id json.RawMessage, params json.RawMessage) {
+func (s *Session) handleAgentRequest(ctx context.Context, method string, id json.RawMessage, params json.RawMessage) {
 	s.mu.Lock()
 	h := s.clientReqH
 	s.mu.Unlock()
@@ -517,44 +521,60 @@ func (s *Session) handleAgentRequest(method string, id json.RawMessage, params j
 	switch method {
 	case "session/request_permission":
 		var req RequestPermissionRequest
-		if json.Unmarshal(params, &req) == nil {
-			resp, err = h.HandleRequestPermission(context.Background(), req)
+		if err := json.Unmarshal(params, &req); err != nil {
+			s.writeRPCResponse(id, nil, fmt.Errorf("invalid params for session/request_permission: %w", err))
+			return
 		}
+		resp, err = h.HandleRequestPermission(ctx, req)
 	case "fs/read_text_file":
 		var req ReadTextFileRequest
-		if json.Unmarshal(params, &req) == nil {
-			resp, err = h.HandleReadTextFile(context.Background(), req)
+		if err := json.Unmarshal(params, &req); err != nil {
+			s.writeRPCResponse(id, nil, fmt.Errorf("invalid params for fs/read_text_file: %w", err))
+			return
 		}
+		resp, err = h.HandleReadTextFile(ctx, req)
 	case "fs/write_text_file":
 		var req WriteTextFileRequest
-		if json.Unmarshal(params, &req) == nil {
-			resp, err = h.HandleWriteTextFile(context.Background(), req)
+		if err := json.Unmarshal(params, &req); err != nil {
+			s.writeRPCResponse(id, nil, fmt.Errorf("invalid params for fs/write_text_file: %w", err))
+			return
 		}
+		resp, err = h.HandleWriteTextFile(ctx, req)
 	case "terminal/create":
 		var req CreateTerminalRequest
-		if json.Unmarshal(params, &req) == nil {
-			resp, err = h.HandleCreateTerminal(context.Background(), req)
+		if err := json.Unmarshal(params, &req); err != nil {
+			s.writeRPCResponse(id, nil, fmt.Errorf("invalid params for terminal/create: %w", err))
+			return
 		}
+		resp, err = h.HandleCreateTerminal(ctx, req)
 	case "terminal/output":
 		var req TerminalOutputRequest
-		if json.Unmarshal(params, &req) == nil {
-			resp, err = h.HandleTerminalOutput(context.Background(), req)
+		if err := json.Unmarshal(params, &req); err != nil {
+			s.writeRPCResponse(id, nil, fmt.Errorf("invalid params for terminal/output: %w", err))
+			return
 		}
+		resp, err = h.HandleTerminalOutput(ctx, req)
 	case "terminal/wait_for_exit":
 		var req WaitForTerminalExitRequest
-		if json.Unmarshal(params, &req) == nil {
-			resp, err = h.HandleWaitForTerminalExit(context.Background(), req)
+		if err := json.Unmarshal(params, &req); err != nil {
+			s.writeRPCResponse(id, nil, fmt.Errorf("invalid params for terminal/wait_for_exit: %w", err))
+			return
 		}
+		resp, err = h.HandleWaitForTerminalExit(ctx, req)
 	case "terminal/kill":
 		var req KillTerminalRequest
-		if json.Unmarshal(params, &req) == nil {
-			resp, err = h.HandleKillTerminal(context.Background(), req)
+		if err := json.Unmarshal(params, &req); err != nil {
+			s.writeRPCResponse(id, nil, fmt.Errorf("invalid params for terminal/kill: %w", err))
+			return
 		}
+		resp, err = h.HandleKillTerminal(ctx, req)
 	case "terminal/release":
 		var req ReleaseTerminalRequest
-		if json.Unmarshal(params, &req) == nil {
-			resp, err = h.HandleReleaseTerminal(context.Background(), req)
+		if err := json.Unmarshal(params, &req); err != nil {
+			s.writeRPCResponse(id, nil, fmt.Errorf("invalid params for terminal/release: %w", err))
+			return
 		}
+		resp, err = h.HandleReleaseTerminal(ctx, req)
 	}
 
 	if err != nil {

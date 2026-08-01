@@ -14,6 +14,7 @@ package keyring
 import (
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 
@@ -98,7 +99,11 @@ func (s *Store) Get(service, key string) (string, error) {
 
 func (s *Store) Set(service, key, value string) error {
 	if value == "" {
-		return s.backend.Delete(service, key)
+		// Empty value used to silently DELETE the stored secret — combined
+		// with Get mapping not-found to ("", nil), a mistaken empty string
+		// (e.g. an unset API key) destroyed the credential with no trace.
+		// Deletion is explicit: use Delete.
+		return fmt.Errorf("keyring: refusing to store an empty value (use Delete to remove)")
 	}
 	return s.backend.Set(service, key, value)
 }
@@ -171,10 +176,11 @@ func (m *MemStore) Set(service, key, value string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if value == "" {
-		delete(m.keys, m.gk(service, key))
-	} else {
-		m.keys[m.gk(service, key)] = value
+		// Same policy as Store.Set: empty values are refused, deletion is
+		// explicit via Delete.
+		return fmt.Errorf("keyring: refusing to store an empty value (use Delete to remove)")
 	}
+	m.keys[m.gk(service, key)] = value
 	return nil
 }
 

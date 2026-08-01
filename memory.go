@@ -1,59 +1,10 @@
 package openagent
 
-import (
-	"context"
-	"io"
-)
-
-// Memory stores and retrieves conversation history. Three-layer model:
-//
-//	Layer 1: Working    — recent context, kept verbatim. The Runner manages
-//	                       the working set by token budget, not message count.
-//	                       Recent() is a pure query — it does not trigger compaction.
-//	Layer 2: Compressed — summary + retrieval hints for history beyond Working.
-//	                       Updated by Compact() when the Runner detects the working
-//	                       set exceeds the token budget (incremental/rolling compression).
-//	Layer 3: Archive    — full history, searchable on demand via Search() and
-//	                       the recall_memory tool. Original messages are NEVER deleted.
-//
-// All methods are scoped by sessionID. nil Memory = no persistence,
-// each run starts fresh.
-//
-// Memory embeds io.Closer — implementations that hold external resources
-// (database connections, file handles) must release them in Close().
-// Callers that receive a Memory interface should defer Close() to prevent
-// resource leaks. Implementations that don't hold resources may return nil.
-type Memory interface {
-	io.Closer
-
-	// Layer 1: Working memory — returns up to n most recent messages, skipping
-	// the first offset messages from the end. offset=0 returns the latest n.
-	Recent(ctx context.Context, sessionID string, n int, offset int) ([]Message, error)
-
-	// Count returns the total number of stored messages for a session.
-	Count(ctx context.Context, sessionID string) (int, error)
-
-	// Layer 2: Compact compresses messages up to throughIndex into a summary.
-	// messages is an optional pre-fetched slice (from the caller) to avoid
-	// a redundant read. When nil, the backend fetches messages internally.
-	// The backend records throughIndex as the new ThroughIndex marker.
-	// Original messages are NEVER deleted.
-	Compact(ctx context.Context, sessionID string, throughIndex int, messages []Message) error
-
-	// Compressed returns the stored CompressedContext, or nil if none exists.
-	Compressed(ctx context.Context, sessionID string) (*CompressedContext, error)
-
-	// Layer 3: Archive search — full-text / vector search over all stored messages.
-	Search(ctx context.Context, sessionID, query string, limit int) ([]SearchResult, error)
-
-	// Append adds a message to the conversation history.
-	Append(ctx context.Context, sessionID string, msg Message) error
-
-	// DeleteSession removes all data for the given session. After this call,
-	// Recent, Compressed, Search, Compact, and Append all operate on a clean slate.
-	// It is safe to call on a session that doesn't exist.
-	DeleteSession(ctx context.Context, sessionID string) error
-}
+// The legacy monolithic Memory interface has been split (P2, Context
+// Architecture): short-term conversation storage lives in
+// session.SessionStore, token-budget compression in session.Compressor,
+// and durable knowledge in provider/memory.MemoryProvider. The root
+// package keeps only the shared types below.
 
 // CompressedContext bundles a summary with retrieval hints for the model.
 type CompressedContext struct {
@@ -64,13 +15,6 @@ type CompressedContext struct {
 	// The next compression pass only compresses messages after this index.
 	// 0 means no compression has occurred (or the summary was produced by
 	// an older version that didn't track this value).
-}
-
-// SearchResult is a single match from Memory.Search.
-type SearchResult struct {
-	Message  Message `json:"message"`
-	Score    float64 `json:"score"`
-	Turn     int     `json:"turn"`
 }
 
 // SafeCompressionBoundary adjusts the overflow index so compression doesn't

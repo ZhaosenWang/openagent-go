@@ -44,7 +44,9 @@ import (
 	"github.com/yusheng-g/openagent-go/cmd/mcp/iac-server/provider/huaweicloud"
 	"github.com/yusheng-g/openagent-go/mcp"
 	"github.com/yusheng-g/openagent-go/model/openai"
-	sqlitememory "github.com/yusheng-g/openagent-go/memory/sqlite"
+	memorysqlite "github.com/yusheng-g/openagent-go/provider/memory/sqlite"
+	"github.com/yusheng-g/openagent-go/provider/skill"
+	sessionsqlite "github.com/yusheng-g/openagent-go/session/sqlite"
 	skillfs "github.com/yusheng-g/openagent-go/skill/fs"
 )
 
@@ -59,6 +61,12 @@ func main() {
 	if iacHome == "" {
 		home, _ := os.UserHomeDir()
 		iacHome = filepath.Join(home, ".openagent", "mcp", "iac-server")
+	}
+	// Create the home directory BEFORE opening the log file — O_CREATE does
+	// not create parent directories, and a fresh machine has no ~/.openagent
+	// tree yet (this used to crash first-run with ENOENT).
+	if err := os.MkdirAll(iacHome, 0o755); err != nil {
+		fatal(fmt.Errorf("create iac home: %w", err))
 	}
 	logPath := filepath.Join(iacHome, "iac-server.log")
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
@@ -100,8 +108,8 @@ func main() {
 	}
 	slog.Info("skills directory", "path", skillsDir)
 
-	// ── Skill loader ──
-	loader := skillfs.New(skillsDir)
+	// ── Skill provider ──
+	loader := skill.NewFSBridge(skillfs.New(skillsDir))
 
 	// ── Deployments ──
 	// Each cloud gets its own subtree: $IAC_HOME/<cloud>/d-NNN/.
@@ -116,11 +124,16 @@ func main() {
 	// estimate_cost see plan_deployment's reasoning, troubleshoot see prior
 	// attempts, etc. FTS5 gives fast full-text search across history.
 	memoryPath := filepath.Join(cloudHome, "memory.db")
-	sqliteMem, err := sqlitememory.New(memoryPath)
+	ms, err := sessionsqlite.NewMessageStore(memoryPath)
 	if err != nil {
 		fatal(fmt.Errorf("create memory: %w", err))
 	}
-	defer sqliteMem.Close()
+	defer ms.Close()
+	knowledge, err := memorysqlite.New(memoryPath)
+	if err != nil {
+		fatal(fmt.Errorf("create knowledge store: %w", err))
+	}
+	defer knowledge.Close()
 	slog.Info("memory database", "path", memoryPath)
 
 	dryRun := os.Getenv("IAC_DRY_RUN") == "true"
@@ -134,7 +147,7 @@ func main() {
 	}
 
 	// ── Assemble planner + tools ──
-	planner := agent.New(model, cloud, loader, sqliteMem, cloudHome, deploymentsDir, dryRun, binaryMirrors, providerMirrors)
+	planner := agent.New(model, cloud, loader, ms, knowledge, cloudHome, deploymentsDir, dryRun, binaryMirrors, providerMirrors)
 	tools := iacmcp.NewTools(iacmcp.Config{
 		Planner:         planner,
 		Cloud:           cloud,

@@ -25,29 +25,17 @@ func (t *ACPReadFile) Definition() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
 		Name:        "read_client_file",
 		Description: "Read a file from the client's filesystem. Use this when the file is on the user's machine rather than the agent's workspace. Path must be absolute.",
-		Parameters: json.RawMessage(`{
-  "type": "object",
-  "properties": {
-    "path":    { "type": "string", "description": "Absolute path to the file to read." },
-    "line":    { "type": "integer", "description": "Optional 1-based line number to start reading from." },
-    "limit":   { "type": "integer", "description": "Optional maximum number of lines to read." }
-  },
-  "required": ["path"]
-}`),
+		Parameters:  openagent.SchemaOf[AcpFs1Params](),
 	}
 }
 
-func (t *ACPReadFile) Execute(ctx context.Context, args json.RawMessage) (string, error) {
-	var params struct {
-		Path  string `json:"path"`
-		Line  *int   `json:"line"`
-		Limit *int   `json:"limit"`
-	}
-	if err := json.Unmarshal(args, &params); err != nil {
-		return "", fmt.Errorf("read_client_file: invalid arguments: %w", err)
+func (t *ACPReadFile) Execute(ctx context.Context, args json.RawMessage) *openagent.ToolResult {
+	params, err := openagent.ParseArgs[AcpFs1Params](args)
+	if err != nil {
+		return openagent.ErrorResult(fmt.Errorf("read_client_file: %w", err), false, "")
 	}
 	if strings.TrimSpace(params.Path) == "" {
-		return "", fmt.Errorf("read_client_file: path is required")
+		return openagent.ErrorResult(fmt.Errorf("read_client_file: path is required"), false, "")
 	}
 
 	resp, err := t.client.ReadTextFile(ctx, openacp.ReadTextFileRequest{
@@ -57,9 +45,9 @@ func (t *ACPReadFile) Execute(ctx context.Context, args json.RawMessage) (string
 		Limit:     params.Limit,
 	})
 	if err != nil {
-		return "", fmt.Errorf("read_client_file: %w", err)
+		return openagent.ErrorResult(fmt.Errorf("read_client_file: %w", err), false, "")
 	}
-	return resp.Content, nil
+	return &openagent.ToolResult{Content: resp.Content}
 }
 
 // ACPWriteFile writes content to a file on the client's filesystem via
@@ -77,36 +65,37 @@ func (t *ACPWriteFile) Definition() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
 		Name:        "write_client_file",
 		Description: "Write content to a file on the client's filesystem. Use this when the file needs to be written to the user's machine rather than the agent's workspace. Path must be absolute.",
-		Parameters: json.RawMessage(`{
-  "type": "object",
-  "properties": {
-    "path":    { "type": "string", "description": "Absolute path to the file to write." },
-    "content": { "type": "string", "description": "Text content to write to the file." }
-  },
-  "required": ["path","content"]
-}`),
+		Parameters:  openagent.SchemaOf[AcpFs2Params](),
 	}
 }
 
-func (t *ACPWriteFile) Execute(ctx context.Context, args json.RawMessage) (string, error) {
-	var params struct {
-		Path    string `json:"path"`
-		Content string `json:"content"`
-	}
-	if err := json.Unmarshal(args, &params); err != nil {
-		return "", fmt.Errorf("write_client_file: invalid arguments: %w", err)
+func (t *ACPWriteFile) Execute(ctx context.Context, args json.RawMessage) *openagent.ToolResult {
+	params, err := openagent.ParseArgs[AcpFs2Params](args)
+	if err != nil {
+		return openagent.ErrorResult(fmt.Errorf("write_client_file: %w", err), false, "")
 	}
 	if strings.TrimSpace(params.Path) == "" {
-		return "", fmt.Errorf("write_client_file: path is required")
+		return openagent.ErrorResult(fmt.Errorf("write_client_file: path is required"), false, "")
 	}
 
-	_, err := t.client.WriteTextFile(ctx, openacp.WriteTextFileRequest{
+	_, err = t.client.WriteTextFile(ctx, openacp.WriteTextFileRequest{
 		SessionID: t.sessionID,
 		Path:      params.Path,
 		Content:   params.Content,
 	})
 	if err != nil {
-		return "", fmt.Errorf("write_client_file: %w", err)
+		return openagent.ErrorResult(fmt.Errorf("write_client_file: %w", err), false, "")
 	}
-	return "File written successfully.", nil
+	return &openagent.ToolResult{Content: "File written successfully."}
+}
+
+type AcpFs1Params struct {
+	Path  string `json:"path" jsonschema:"description=Absolute path to the file to read."`
+	Line  *int   `json:"line,omitempty" jsonschema:"description=Optional 1-based line number to start reading from."`
+	Limit *int   `json:"limit,omitempty" jsonschema:"description=Optional maximum number of lines to read."`
+}
+
+type AcpFs2Params struct {
+	Path    string `json:"path" jsonschema:"description=Absolute path to the file to write."`
+	Content string `json:"content" jsonschema:"description=Text content to write to the file."`
 }

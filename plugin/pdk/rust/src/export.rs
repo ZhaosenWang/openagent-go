@@ -75,17 +75,6 @@ pub trait Plugin: Sized {
         StageOutput { action: alloc::string::String::from("continue"), reason: alloc::string::String::new() }
     }
 
-    // ── agent:sessions ──
-
-    /// Called on session creation. Return Some(SessionConfig) to override
-    /// Agent opts for this session, or None to leave defaults.
-    fn on_session_init(_ctx: &SessionCtx) -> Result<Option<SessionConfig>, String> {
-        Ok(None)
-    }
-
-    /// Called on session deletion. Fire-and-forget — return value is ignored.
-    fn on_session_destroy(_ctx: &SessionCtx) {}
-
     // ── Internal: assemble metadata JSON ──
 
     fn build_metadata() -> PluginMeta {
@@ -161,23 +150,6 @@ macro_rules! export {
             let input: $crate::types::StageInput = $crate::read_input_json($crate::pk(ptr, len));
             let out = <$t as $crate::export::Plugin>::observe_stage(&input);
             $crate::sdk_return_json(&out)
-        }
-
-        // ── agent:sessions ──
-        #[no_mangle]
-        pub extern "C" fn session_init(ptr: u32, len: u32) -> u64 {
-            let ctx: $crate::types::SessionCtx = $crate::read_input_json($crate::pk(ptr, len));
-            match <$t as $crate::export::Plugin>::on_session_init(&ctx) {
-                Ok(Some(cfg)) => $crate::sdk_return_json(&cfg),
-                Ok(None) => $crate::sdk_return(b"null"),
-                Err(e) => $crate::sdk_return_json(&$crate::types::HostResult { error: e }),
-            }
-        }
-
-        #[no_mangle]
-        pub extern "C" fn session_destroy(ptr: u32, len: u32) {
-            let ctx: $crate::types::SessionCtx = $crate::read_input_json($crate::pk(ptr, len));
-            <$t as $crate::export::Plugin>::on_session_destroy(&ctx);
         }
     };
 }

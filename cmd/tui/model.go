@@ -6,11 +6,12 @@ import (
 	"fmt"
 	"strings"
 
-	openagent "github.com/yusheng-g/openagent-go"
 	"charm.land/bubbles/v2/textarea"
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	openagent "github.com/yusheng-g/openagent-go"
+	"github.com/yusheng-g/openagent-go/kernel"
 )
 
 // ── Styles ──
@@ -32,7 +33,7 @@ var (
 type tuiState int
 
 const (
-	stateIdle      tuiState = iota
+	stateIdle tuiState = iota
 	stateStreaming
 	stateApproving
 )
@@ -62,7 +63,7 @@ type model struct {
 	viewport viewport.Model
 	textarea textarea.Model
 
-	agent   *openagent.Agent
+	rt      *kernel.Runtime
 	session openagent.Session
 
 	messages []chatMsg
@@ -81,7 +82,7 @@ type model struct {
 	err    error
 }
 
-func newModel(agent *openagent.Agent, session openagent.Session, approveCh <-chan approveRequest) model {
+func newModel(rt *kernel.Runtime, session openagent.Session, approveCh <-chan approveRequest) model {
 	ta := textarea.New()
 	ta.Placeholder = "Type a message... (Enter to send)"
 	ta.SetHeight(3)
@@ -92,7 +93,7 @@ func newModel(agent *openagent.Agent, session openagent.Session, approveCh <-cha
 	return model{
 		viewport:  vp,
 		textarea:  ta,
-		agent:     agent,
+		rt:        rt,
 		session:   session,
 		messages:  make([]chatMsg, 0),
 		approveCh: approveCh,
@@ -150,7 +151,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.err = nil
 			m.updateViewport()
 			return m, tea.Batch(
-				runAgentCmd(m.agent, m.session, openagent.UserMessage(input)),
+				runAgentCmd(m.rt, m.session, openagent.UserMessage(input)),
 				listenForApproval(m.approveCh),
 			)
 		}
@@ -343,9 +344,9 @@ func (m *model) View() tea.View {
 
 // ── Commands ──
 
-func runAgentCmd(agent *openagent.Agent, session openagent.Session, input openagent.Message) tea.Cmd {
+func runAgentCmd(rt *kernel.Runtime, session openagent.Session, input openagent.Message) tea.Cmd {
 	return func() tea.Msg {
-		ch := agent.RunStreamWithPrefix(context.Background(), session, nil, input)
+		ch := rt.RunStreamWithPrefix(context.Background(), session, nil, input)
 		evt, ok := <-ch
 		if !ok {
 			return streamEndMsg{}
@@ -382,11 +383,11 @@ func (t *calculatorTool) Definition() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
 		Name:        "calculator",
 		Description: "Evaluate a math expression like '15+27' or '100/3'.",
-		Parameters:  json.RawMessage(`{"type":"object","properties":{"expression":{"type":"string"}},"required":["expression"]}`),
+		Parameters:  openagent.SchemaOf[Tui1Params](),
 	}
 }
 
-func (t *calculatorTool) Execute(_ context.Context, args json.RawMessage) (string, error) {
+func (t *calculatorTool) Execute(_ context.Context, args json.RawMessage) *openagent.ToolResult {
 	var p struct{ Expression string }
 	json.Unmarshal(args, &p)
 	expr := strings.ReplaceAll(p.Expression, " ", "")
@@ -395,18 +396,18 @@ func (t *calculatorTool) Execute(_ context.Context, args json.RawMessage) (strin
 	fmt.Sscanf(expr, "%d%c%d", &a, &op, &b)
 	switch op {
 	case '+':
-		return fmt.Sprintf("%d", a+b), nil
+		return &openagent.ToolResult{Content: fmt.Sprintf("%d", a+b)}
 	case '-':
-		return fmt.Sprintf("%d", a-b), nil
+		return &openagent.ToolResult{Content: fmt.Sprintf("%d", a-b)}
 	case '*':
-		return fmt.Sprintf("%d", a*b), nil
+		return &openagent.ToolResult{Content: fmt.Sprintf("%d", a*b)}
 	case '/':
 		if b == 0 {
-			return "", fmt.Errorf("division by zero")
+			return openagent.ErrorResult(fmt.Errorf("division by zero"), false, "")
 		}
-		return fmt.Sprintf("%d", a/b), nil
+		return &openagent.ToolResult{Content: fmt.Sprintf("%d", a/b)}
 	}
-	return "", fmt.Errorf("unsupported operator: %c", op)
+	return openagent.ErrorResult(fmt.Errorf("unsupported operator: %c", op), false, "")
 }
 
 type echoTool struct{}
@@ -415,12 +416,20 @@ func (t *echoTool) Definition() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
 		Name:        "echo",
 		Description: "Echoes the input message back.",
-		Parameters:  json.RawMessage(`{"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}`),
+		Parameters:  openagent.SchemaOf[Tui2Params](),
 	}
 }
 
-func (t *echoTool) Execute(_ context.Context, args json.RawMessage) (string, error) {
+func (t *echoTool) Execute(_ context.Context, args json.RawMessage) *openagent.ToolResult {
 	var p struct{ Message string }
 	json.Unmarshal(args, &p)
-	return fmt.Sprintf("you said: %s", p.Message), nil
+	return &openagent.ToolResult{Content: fmt.Sprintf("you said: %s", p.Message)}
+}
+
+type Tui1Params struct {
+	Expression string `json:"expression"`
+}
+
+type Tui2Params struct {
+	Message string `json:"message"`
 }

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os/exec"
 	"strings"
+	"sync/atomic"
 
 	openagent "github.com/yusheng-g/openagent-go"
 )
@@ -151,8 +152,14 @@ func (s *Sandbox) confineAndRunStream(ctx context.Context, cmd *openagent.Comman
 		done := make(chan struct{}, 2)
 		var firstStderr string
 		firstStderrCh := make(chan string, 1)
+		// Track whether the inner command produced any stdout: a bwrap
+		// setup failure produces none (mirroring the non-streaming path's
+		// result.Stdout == "" check). Without this, a sandboxed command
+		// that prints "bwrap: ..." to stderr and fails would be mistaken
+		// for a setup failure and executed TWICE.
+		var sawStdout atomic.Bool
 		go readLinesWithFirst(serrR, ch, done, firstStderrCh)
-		go readLines(soutR, ch, done)
+		go readLines(&sawReader{r: soutR, saw: &sawStdout}, ch, done)
 		<-done
 		<-done
 
@@ -168,7 +175,7 @@ func (s *Sandbox) confineAndRunStream(ctx context.Context, cmd *openagent.Comman
 		}
 
 		// Detect bwrap setup failure: no stdout + stderr starts with "bwrap:".
-		if waitErr != nil && strings.HasPrefix(firstStderr, "bwrap:") {
+		if waitErr != nil && !sawStdout.Load() && strings.HasPrefix(firstStderr, "bwrap:") {
 			for chunk := range s.unconfinedRunStream(ctx, cmd) {
 				ch <- chunk
 			}
@@ -179,6 +186,21 @@ func (s *Sandbox) confineAndRunStream(ctx context.Context, cmd *openagent.Comman
 		}
 	}()
 	return ch
+}
+
+// sawReader sets a flag on the first non-empty read — used to distinguish
+// "bwrap setup failed before any output" from "the sandboxed command ran".
+type sawReader struct {
+	r   io.Reader
+	saw *atomic.Bool
+}
+
+func (r *sawReader) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	if n > 0 {
+		r.saw.Store(true)
+	}
+	return n, err
 }
 
 // readLinesWithFirst is like readLines but also sends the first line it

@@ -28,10 +28,11 @@ import (
 	"time"
 
 	"github.com/yusheng-g/openagent-go"
-	"github.com/yusheng-g/openagent-go/memory/file"
 	"github.com/yusheng-g/openagent-go/model/openai"
+	memoryfile "github.com/yusheng-g/openagent-go/provider/memory/file"
 	"github.com/yusheng-g/openagent-go/rest"
 	"github.com/yusheng-g/openagent-go/sandbox/native"
+	sessionfile "github.com/yusheng-g/openagent-go/session/file"
 	opentool "github.com/yusheng-g/openagent-go/tool"
 
 	iactools "github.com/yusheng-g/openagent-go/examples/iac/tools"
@@ -64,11 +65,15 @@ func main() {
 	model := openai.New(apiKey, modelID, baseURL).WithContextWindow(128_000)
 
 	// ── Memory ──
-	mem, err := file.New(filepath.Join(iacDir, "memory"))
+	ms, err := sessionfile.NewMessageStore(filepath.Join(iacDir, "memory"))
 	if err != nil {
-		log.Fatalf("memory: %v", err)
+		log.Fatalf("message store: %v", err)
 	}
-	defer mem.Close()
+	defer ms.Close()
+	knowledge, err := memoryfile.New(filepath.Join(iacDir, "memory"))
+	if err != nil {
+		log.Fatalf("knowledge store: %v", err)
+	}
 
 	// ── File tools ──
 	// Agents use read_file/write_file/ls to inspect templates and write .tf files.
@@ -99,16 +104,16 @@ func main() {
 	}
 
 	// ── Agents ──
-	agentDefs := buildIACAgents(model, mem, tfTool, fileTools, skillDir)
+	agentDefs := buildIACAgents(model, ms, knowledge, tfTool, fileTools, skillDir)
 
 	var planTemplates []rest.OrchestrateAgentTemplate
 	for _, def := range agentDefs {
 		planTemplates = append(planTemplates, rest.OrchestrateAgentTemplate{
-			Name: def.Name, Description: def.Description, Runner: def.Runner,
+			Name: def.Name, Description: def.Description, Cfg: def.Cfg, Deps: def.Deps,
 		})
 	}
 
-	ph := rest.NewOrchestrateHandler(mem, model, planTemplates...)
+	ph := rest.NewOrchestrateHandler(ms, model, planTemplates...)
 
 	// ── Routes ──
 	mux := http.NewServeMux()
@@ -198,7 +203,10 @@ type responseWriter struct {
 	statusCode int
 }
 
-func (rw *responseWriter) WriteHeader(code int) { rw.statusCode = code; rw.ResponseWriter.WriteHeader(code) }
+func (rw *responseWriter) WriteHeader(code int) {
+	rw.statusCode = code
+	rw.ResponseWriter.WriteHeader(code)
+}
 func (rw *responseWriter) Flush() {
 	if f, ok := rw.ResponseWriter.(http.Flusher); ok {
 		f.Flush()

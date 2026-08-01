@@ -1,9 +1,9 @@
 package rest
 
 import (
-	"log/slog"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"sort"
 	"strings"
@@ -11,7 +11,10 @@ import (
 	"time"
 
 	openagent "github.com/yusheng-g/openagent-go"
+	"github.com/yusheng-g/openagent-go/agent"
 	"github.com/yusheng-g/openagent-go/eventbus"
+	"github.com/yusheng-g/openagent-go/governance"
+	"github.com/yusheng-g/openagent-go/kernel"
 	"github.com/yusheng-g/openagent-go/session"
 )
 
@@ -25,7 +28,7 @@ type TeamHandler struct {
 	// Model registry, mirroring Handler. Frontend model selection in team mode
 	// resolves through this; the chosen model overrides every team agent's
 	// model for that run via openagent.Session.Model (runner.go:68-70).
-	models    map[string]openagent.Model // "provider:id" → model instance
+	models    map[string]openagent.Model // "provider/modelId" → model instance
 	modelList []ModelInfo                // ordered list for /models endpoint
 	modelsMu  sync.RWMutex
 
@@ -36,18 +39,19 @@ type TeamHandler struct {
 type TeamAgentTemplate struct {
 	Name        string
 	Description string
-	Agent       *openagent.Agent // Model, Tools, Instructions, MaxTurns are captured
+	Agent       *agent.Agent // configuration: Model, Instructions, MaxTurns
+	Deps        kernel.Deps  // runtime deps: Tools, Memory, Hooks, Observer
 }
 
 // NewTeamHandler creates a TeamHandler.
 // At least one agent template is required (its Model is used for dynamically added agents).
-func NewTeamHandler(mem openagent.Memory, agents ...TeamAgentTemplate) *TeamHandler {
+func NewTeamHandler(mem session.SessionStore, agents ...TeamAgentTemplate) *TeamHandler {
 	var model openagent.Model
 	if len(agents) > 0 {
 		model = agents[0].Agent.Model
 	}
 	for _, t := range agents {
-		if t.Agent.Model == nil {
+		if t.Agent != nil && t.Agent.Model == nil {
 			slog.Warn("team agent has nil model", "agent", t.Name)
 		}
 	}
@@ -58,7 +62,7 @@ func NewTeamHandler(mem openagent.Memory, agents ...TeamAgentTemplate) *TeamHand
 	h := &TeamHandler{agents: agents, model: model, models: make(map[string]openagent.Model)}
 
 	bus := eventbus.New[SSEEvent](500)
-	h.sm = newSessionManager[*teamSessionState](nil, mem, bus, sessionHooks[*teamSessionState]{
+	h.sm = newSessionManager[*teamSessionState](mem, bus, sessionHooks[*teamSessionState]{
 		kind:       "team",
 		newEntry:   h.newEntry,
 		fillDetail: h.fillDetail,
@@ -80,24 +84,27 @@ func NewTeamHandler(mem openagent.Memory, agents ...TeamAgentTemplate) *TeamHand
 func (h *TeamHandler) RegisterModel(id string, model openagent.Model, provider string) {
 	h.modelsMu.Lock()
 	defer h.modelsMu.Unlock()
-	h.models[provider+":"+id] = model
+	// Composite key "provider/modelId" — must match Handler.RegisterModel
+	// (they were "provider:id" and "provider/id" respectively; a mixed key
+	// would silently miss on lookup).
+	h.models[provider+"/"+id] = model
 	h.modelList = append(h.modelList, ModelInfo{ID: id, Provider: provider})
 }
 
 // lookupModel finds a registered model. Mirrors Handler.lookupModel.
-// When provider is non-empty, uses the exact composite key "provider:modelId";
+// When provider is non-empty, uses the exact composite key "provider/modelId";
 // otherwise scans for the first registered model matching modelId.
 func (h *TeamHandler) lookupModel(provider, modelID string) openagent.Model {
 	h.modelsMu.RLock()
 	defer h.modelsMu.RUnlock()
 	if provider != "" {
-		return h.models[provider+":"+modelID]
+		return h.models[provider+"/"+modelID]
 	}
 	for key, m := range h.models {
 		if key == "default" {
 			continue
 		}
-		if strings.HasSuffix(key, ":"+modelID) {
+		if strings.HasSuffix(key, "/"+modelID) {
 			return m
 		}
 	}
@@ -140,9 +147,12 @@ func (h *TeamHandler) WithCleanupDir(fn func(sessionID string)) *TeamHandler {
 
 type teamSessionState struct {
 	info      session.SessionInfo
-	team      *openagent.Team
+	team      *agent.Team
 	agentList []agentInfo
 	agentMems []*teamAgentMemory // per-agent memory wrappers for cleanup
+
+	// approvalMemory persists session-scoped "allow always" decisions.
+	approvalMemory governance.ApprovalMemory
 
 	mu              sync.Mutex
 	running         bool // true while agent goroutine is active
@@ -157,6 +167,22 @@ func (s *teamSessionState) isActive() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.running || s.pendingApproval != nil
+}
+
+// takePending returns and clears the pending approval (nil if none).
+func (s *teamSessionState) takePending() *pendingApproval {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p := s.pendingApproval
+	s.pendingApproval = nil
+	return p
+}
+
+// setPending parks the approval responder on the session.
+func (s *teamSessionState) setPending(p *pendingApproval) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pendingApproval = p
 }
 
 type agentInfo struct {
@@ -203,7 +229,7 @@ func (h *TeamHandler) handleListMessages(w http.ResponseWriter, r *http.Request)
 	}
 
 	// Each agent's private partition: tool calls and tool results.
-	s := h.sm.getOrCreate(id)
+	s := h.sm.getOrCreate(r.Context(), id)
 	for _, tam := range s.agentMems {
 		priv, _ := tam.PrivateRecent(ctx, id, limit+before, 0)
 		msgs = append(msgs, priv...)
@@ -239,7 +265,7 @@ func (h *TeamHandler) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s := h.sm.getOrCreate(id)
+	s := h.sm.getOrCreate(r.Context(), id)
 
 	s.mu.Lock()
 	s.running = true
@@ -285,7 +311,7 @@ func (h *TeamHandler) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 		defer cancel()
 		defer func() {
 			s.mu.Lock()
@@ -328,11 +354,17 @@ func (h *TeamHandler) handleApprove(w http.ResponseWriter, r *http.Request) {
 
 	var body ApproveRequest
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, `{"error":"allowed is required"}`, http.StatusBadRequest)
+		http.Error(w, `{"error":"invalid approve request"}`, http.StatusBadRequest)
+		return
+	}
+	switch body.Action {
+	case "allow", "deny", "always", "edit":
+	default:
+		http.Error(w, `{"error":"action must be allow|deny|always|edit"}`, http.StatusBadRequest)
 		return
 	}
 
-	s := h.sm.getOrCreate(id)
+	s := h.sm.getOrCreate(r.Context(), id)
 
 	s.mu.Lock()
 	p := s.pendingApproval
@@ -344,17 +376,20 @@ func (h *TeamHandler) handleApprove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	reason := "denied"
-	if body.Feedback != "" {
-		reason = "denied: " + body.Feedback
+	resp := approveResponse{action: body.Action, modifiedArgs: body.Args}
+	switch body.Action {
+	case "deny":
+		resp.reason = "denied"
+		if body.Feedback != "" {
+			resp.reason = "denied: " + body.Feedback
+		}
+	default:
+		resp.reason = "approved"
 	}
-	if body.Allowed {
-		reason = "approved"
-	}
-	p.respond <- approveResponse{allowed: body.Allowed, reason: reason}
+	p.respond <- resp
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": reason})
+	json.NewEncoder(w).Encode(map[string]string{"status": resp.reason})
 }
 
 // ── Agents ──
@@ -362,7 +397,7 @@ func (h *TeamHandler) handleApprove(w http.ResponseWriter, r *http.Request) {
 func (h *TeamHandler) handleListAgents(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
-	s := h.sm.getOrCreate(id)
+	s := h.sm.getOrCreate(r.Context(), id)
 
 	s.mu.Lock()
 	list := make([]agentInfo, len(s.agentList))
@@ -386,7 +421,7 @@ func (h *TeamHandler) handleAddAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s := h.sm.getOrCreate(id)
+	s := h.sm.getOrCreate(r.Context(), id)
 
 	if h.model == nil {
 		http.Error(w, `{"error":"no model available for new agent"}`, http.StatusInternalServerError)
@@ -394,25 +429,30 @@ func (h *TeamHandler) handleAddAgent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Wrap memory for agent-private persistence, same as newEntry.
-	var agentMem openagent.Memory
+	var agentMem session.SessionStore
 	var tam *teamAgentMemory
 	if mem := h.sm.Memory(); mem != nil {
 		tam = newTeamAgentMemory(body.Name, mem)
 		agentMem = tam
 	}
-	agent := openagent.NewAgent(body.Name,
-		openagent.WithModel(h.model),
-		openagent.WithMemory(agentMem),
-		openagent.WithSystemPrompts(body.Instructions),
-		openagent.WithMaxTurns(3),
-		openagent.WithApprover(&restApprover{
+	agentCfg := agent.New(body.Name,
+		agent.WithModel(h.model),
+		agent.WithSystemPrompts(body.Instructions),
+		agent.WithMaxTurns(3),
+	)
+	agentDeps := kernel.Deps{
+		SessionStore: agentMem,
+		HumanApprover: &restApprover{
 			submit: func(call openagent.ToolCall, resp chan approveResponse) {
 				h.submitApproval(s, call, resp)
 			},
-		}),
-	)
-
-	if err := s.team.AddAgent(body.Name, body.Description, agent); err != nil {
+			memory: s.approvalMemory,
+		},
+	}
+	binder := func(tc agent.TeamContext) (agent.AgentRunner, error) {
+		return kernel.New(agentCfg, agentDeps), nil
+	}
+	if err := s.team.AddBinderAgent(body.Name, body.Description, binder); err != nil {
 		http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusBadRequest)
 		return
 	}
@@ -439,7 +479,7 @@ func (h *TeamHandler) handleRemoveAgent(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	s := h.sm.getOrCreate(id)
+	s := h.sm.getOrCreate(r.Context(), id)
 
 	s.team.RemoveAgent(name)
 
@@ -472,30 +512,40 @@ func (h *TeamHandler) handleRemoveAgent(w http.ResponseWriter, r *http.Request) 
 
 // ── Factory ──
 
-func (h *TeamHandler) newEntry(info session.SessionInfo) *teamSessionState {
+func (h *TeamHandler) newEntry(ctx context.Context, info session.SessionInfo) *teamSessionState {
 	s := &teamSessionState{
 		info: info,
 	}
 
-	teamOpts := make([]openagent.TeamOption, 0, len(h.agents)+1)
-	teamOpts = append(teamOpts, openagent.WithTeamMaxHandoffs(10))
+	teamOpts := make([]agent.TeamOption, 0, len(h.agents)+1)
+	teamOpts = append(teamOpts, agent.WithTeamMaxHandoffs(10))
 
 	mem := h.sm.Memory()
 	for _, t := range h.agents {
 		// Wrap memory so each agent gets agent-private persistence
 		// (tool calls/results) separate from team-shared messages
 		// (user input, handoffs, text output).
-		var agentMem openagent.Memory
+		var agentMem session.SessionStore
 		var tam *teamAgentMemory
 		if mem != nil {
 			tam = newTeamAgentMemory(t.Name, mem)
 			agentMem = tam
-		} else if t.Agent.Memory != nil {
-			agentMem = t.Agent.Memory
+		} else if t.Deps.SessionStore != nil {
+			agentMem = t.Deps.SessionStore
 		}
-		agent := cloneAgentForSession(t.Agent, agentMem, s, h.submitApproval)
+		agentCfg := t.Agent.Clone()
+		agentDeps := t.Deps
+		agentDeps.SessionStore = agentMem
+		agentDeps.HumanApprover = &restApprover{
+			submit: func(call openagent.ToolCall, resp chan approveResponse) {
+				h.submitApproval(s, call, resp)
+			},
+		}
+		binder := func(tc agent.TeamContext) (agent.AgentRunner, error) {
+			return kernel.New(agentCfg, agentDeps), nil
+		}
 		teamOpts = append(teamOpts,
-			openagent.WithTeamAgent(t.Name, t.Description, agent),
+			agent.WithTeamAgent(t.Name, t.Description, agentCfg, binder),
 		)
 		s.agentList = append(s.agentList, agentInfo{
 			Name: t.Name, Description: t.Description, Type: "internal",
@@ -505,7 +555,7 @@ func (h *TeamHandler) newEntry(info session.SessionInfo) *teamSessionState {
 		}
 	}
 
-	s.team = openagent.NewTeam(teamOpts...)
+	s.team = agent.NewTeam(teamOpts...)
 	return s
 }
 
@@ -522,23 +572,6 @@ func (h *TeamHandler) fillDetail(e *teamSessionState, detail *SessionDetail) {
 	if m != nil {
 		detail.ContextWindow = m.ContextWindow()
 	}
-}
-
-func cloneAgentForSession(tmpl *openagent.Agent, mem openagent.Memory, s *teamSessionState, submitFn func(*teamSessionState, openagent.ToolCall, chan approveResponse)) *openagent.Agent {
-	// mem is already resolved by the caller — either a teamAgentMemory
-	// wrapper for agent-private persistence or the template's own memory.
-	return openagent.NewAgent(tmpl.Name,
-		openagent.WithModel(tmpl.Model),
-		openagent.WithMemory(mem),
-		openagent.WithTools(tmpl.Tools...),
-		openagent.WithSystemPrompts(tmpl.SystemPrompts...),
-		openagent.WithMaxTurns(tmpl.MaxTurns),
-		openagent.WithApprover(&restApprover{
-			submit: func(call openagent.ToolCall, resp chan approveResponse) {
-				submitFn(s, call, resp)
-			},
-		}),
-	)
 }
 
 // ── Approval bridge ──
@@ -566,24 +599,24 @@ func (h *TeamHandler) submitApproval(s *teamSessionState, call openagent.ToolCal
 
 // ── TeamEvent → SSE ──
 
-func teamEventToSSE(evt openagent.TeamEvent) SSEEvent {
+func teamEventToSSE(evt agent.TeamEvent) SSEEvent {
 	switch evt.Type {
-	case openagent.TeamAgentStart:
+	case agent.TeamAgentStart:
 		return SSEEvent{Type: "agent_start", Agent: evt.Agent}
 
-	case openagent.TeamAgentEnd:
+	case agent.TeamAgentEnd:
 		se := SSEEvent{Type: "agent_end", Agent: evt.Agent}
 		if evt.Error != nil {
 			se.Error = evt.Error.Error()
 		}
 		return se
-	case openagent.TeamThought:
+	case agent.TeamThought:
 		return SSEEvent{Type: "thought", Agent: evt.Agent, Text: evt.Text}
 
-	case openagent.TeamTextDelta:
+	case agent.TeamTextDelta:
 		return SSEEvent{Type: "text_delta", Agent: evt.Agent, Text: evt.Text}
 
-	case openagent.TeamToolCall:
+	case agent.TeamToolCall:
 		var tcj *SSEToolCall
 		if evt.ToolCall != nil {
 			tcj = &SSEToolCall{
@@ -596,23 +629,23 @@ func teamEventToSSE(evt openagent.TeamEvent) SSEEvent {
 		}
 		return SSEEvent{Type: "tool_call", Agent: evt.Agent, ToolCall: tcj}
 
-	case openagent.TeamToolProgress:
+	case agent.TeamToolProgress:
 		return SSEEvent{Type: "tool_progress", Agent: evt.Agent, ToolCallID: evt.ToolCallID, Text: evt.Text}
 
-	case openagent.TeamToolResult:
+	case agent.TeamToolResult:
 		return SSEEvent{Type: "tool_result", Agent: evt.Agent, ToolCallID: evt.ToolCallID, Text: evt.Text}
 
-	case openagent.TeamRetrying:
+	case agent.TeamRetrying:
 		msg := "retrying"
 		if evt.Error != nil {
 			msg = evt.Error.Error()
 		}
 		return SSEEvent{Type: "retrying", Agent: evt.Agent, Text: msg}
 
-	case openagent.TeamHandoff:
+	case agent.TeamHandoff:
 		return SSEEvent{Type: "handoff", Agent: evt.Agent, HandoffTo: evt.Target}
 
-	case openagent.TeamDone:
+	case agent.TeamDone:
 		se := SSEEvent{Type: "done"}
 		if evt.Result != nil {
 			se.FinalOutput = evt.Result.FinalOutput
@@ -620,7 +653,7 @@ func teamEventToSSE(evt openagent.TeamEvent) SSEEvent {
 		}
 		return se
 
-	case openagent.TeamError:
+	case agent.TeamError:
 		se := SSEEvent{Type: "error"}
 		if evt.Error != nil {
 			se.Text = evt.Error.Error()

@@ -17,9 +17,11 @@ import (
 	"os"
 	"time"
 
-	openagent "github.com/yusheng-g/openagent-go"
-	"github.com/yusheng-g/openagent-go/model/openai"
 	tea "charm.land/bubbletea/v2"
+	openagent "github.com/yusheng-g/openagent-go"
+	"github.com/yusheng-g/openagent-go/agent"
+	"github.com/yusheng-g/openagent-go/kernel"
+	"github.com/yusheng-g/openagent-go/model/openai"
 )
 
 func main() {
@@ -36,23 +38,26 @@ func main() {
 
 	approveCh := make(chan approveRequest, 8)
 
-	agent := openagent.NewAgent("assistant",
-		openagent.WithModel(llm),
-		openagent.WithSystemPrompts("You are a capable assistant. Use tools when needed. Be concise and action-oriented."),
-		openagent.WithTools(&calculatorTool{}, &echoTool{}),
-		openagent.WithApprover(&TUIApprover{requests: approveCh}),
-		openagent.WithMaxTurns(20),
+	cfg := agent.New("assistant",
+		agent.WithModel(llm),
+		agent.WithSystemPrompts("You are a capable assistant. Use tools when needed. Be concise and action-oriented."),
+		agent.WithMaxTurns(20),
 	)
 
+	rt := kernel.New(cfg, kernel.Deps{
+		Tools:         []openagent.Tool{&calculatorTool{}, &echoTool{}},
+		HumanApprover: &TUIApprover{requests: approveCh},
+	})
+
 	session := openagent.Session{
-		ID:        fmt.Sprintf("tui-%d", time.Now().Unix()),
-		UserID:    "user",
+		ID:     fmt.Sprintf("tui-%d", time.Now().Unix()),
+		UserID: "user",
 
 		ModelID:   modelID,
 		CreatedAt: time.Now(),
 	}
 
-	m := newModel(agent, session, approveCh)
+	m := newModel(rt, session, approveCh)
 	p := tea.NewProgram(&m)
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "TUI error: %v\n", err)

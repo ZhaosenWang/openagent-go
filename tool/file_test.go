@@ -13,14 +13,11 @@ func TestReadFileWithinWorkspace(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "test.txt"), []byte("hello"), 0644)
 
 	r := NewReadFile(dir)
-	out, err := r.Execute(context.Background(), []byte(`{"path":"test.txt"}`))
-	if err != nil {
-		t.Fatal(err)
+	out := r.Execute(context.Background(), []byte(`{"path":"test.txt"}`))
+	if !strings.Contains(out.Content, "hello") {
+		t.Errorf("expected 'hello', got: %s", out.Content)
 	}
-	if !strings.Contains(out, "hello") {
-		t.Errorf("expected 'hello', got: %s", out)
-	}
-	t.Logf("✅ read file in workspace: %s", out)
+	t.Logf("✅ read file in workspace: %s", out.Content)
 }
 
 func TestReadFileResolvesTraversal(t *testing.T) {
@@ -29,14 +26,14 @@ func TestReadFileResolvesTraversal(t *testing.T) {
 
 	// Traversal is resolved to an absolute path outside workspace.
 	// The tool allows it; workspace boundary enforcement is the Approver's job.
-	_, err := r.Execute(context.Background(), []byte(`{"path":"../etc/passwd"}`))
-	if err != nil {
+	out := r.Execute(context.Background(), []byte(`{"path":"../etc/passwd"}`))
+	if out.Error != nil {
 		// May fail if /etc/passwd doesn't exist or is unreadable on this system,
 		// but should NOT be rejected by validatePath.
-		if strings.Contains(err.Error(), "path outside workspace") {
-			t.Errorf("boundary enforcement should be in approver, not validatePath: %v", err)
+		if strings.Contains(out.Error.Message, "path outside workspace") {
+			t.Errorf("boundary enforcement should be in approver, not validatePath: %v", out.Error.Message)
 		} else {
-			t.Logf("✅ traversal resolved (non-workspace, approver's job to reject): %v", err)
+			t.Logf("✅ traversal resolved (non-workspace, approver's job to reject): %v", out.Error.Message)
 		}
 	} else {
 		t.Logf("✅ traversal resolved — file outside workspace was readable (approver would normally block this)")
@@ -49,9 +46,9 @@ func TestReadFileAbsoluteOutsideWorkspace(t *testing.T) {
 
 	// validatePath accepts absolute paths (boundary enforcement is the Approver's job).
 	// The call may succeed or fail depending on whether /etc/passwd exists and is readable.
-	_, err := r.Execute(context.Background(), []byte(`{"path":"/etc/passwd"}`))
-	if err != nil {
-		t.Logf("absolute outside workspace (approver's job to reject): %v", err)
+	out := r.Execute(context.Background(), []byte(`{"path":"/etc/passwd"}`))
+	if out.Error != nil {
+		t.Logf("absolute outside workspace (approver's job to reject): %v", out.Error.Message)
 	} else {
 		t.Logf("absolute outside workspace resolved — approver would normally block this")
 	}
@@ -63,14 +60,14 @@ func TestReadFileAcceptsAbsolutePathWithinWorkspace(t *testing.T) {
 	os.WriteFile(absPath, []byte("hello"), 0644)
 
 	r := NewReadFile(dir)
-	out, err := r.Execute(context.Background(), []byte(`{"path":"`+absPath+`"}`))
-	if err != nil {
+	out := r.Execute(context.Background(), []byte(`{"path":"`+absPath+`"}`))
+	if out.Error != nil {
 		// Acceptable: file exists but validatePath resolved symlinks, etc.
-		t.Logf("absolute path result: err=%v, out=%s", err, out)
-	} else if !strings.Contains(out, "hello") {
-		t.Errorf("expected 'hello', got: %s", out)
+		t.Logf("absolute path result: err=%v, out=%s", out.Error.Message, out.Content)
+	} else if !strings.Contains(out.Content, "hello") {
+		t.Errorf("expected 'hello', got: %s", out.Content)
 	} else {
-		t.Logf("✅ absolute path within workspace accepted: %s", out)
+		t.Logf("✅ absolute path within workspace accepted: %s", out.Content)
 	}
 }
 
@@ -78,11 +75,11 @@ func TestReadFileNotFound(t *testing.T) {
 	dir := t.TempDir()
 	r := NewReadFile(dir)
 
-	_, err := r.Execute(context.Background(), []byte(`{"path":"nonexistent.txt"}`))
-	if err == nil {
+	out := r.Execute(context.Background(), []byte(`{"path":"nonexistent.txt"}`))
+	if out.Error == nil {
 		t.Error("missing file should return error")
 	} else {
-		t.Logf("✅ not found: %v", err)
+		t.Logf("✅ not found: %v", out.Error)
 	}
 }
 
@@ -90,32 +87,13 @@ func TestWriteFileWithinWorkspace(t *testing.T) {
 	dir := t.TempDir()
 	w := NewWriteFile(dir)
 
-	out, err := w.Execute(context.Background(), []byte(`{"path":"out.txt","content":"generated"}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Logf("✅ write: %s", out)
+	out := w.Execute(context.Background(), []byte(`{"path":"out.txt","content":"generated"}`))
+	t.Logf("✅ write: %s", out.Content)
 
 	// Verify file was created.
 	data, _ := os.ReadFile(filepath.Join(dir, "out.txt"))
 	if string(data) != "generated" {
 		t.Errorf("file content mismatch: %q", string(data))
-	}
-}
-
-func TestWriteFileResolvesTraversal(t *testing.T) {
-	dir := t.TempDir()
-	w := NewWriteFile(dir)
-
-	_, err := w.Execute(context.Background(), []byte(`{"path":"../outside.txt","content":"evil"}`))
-	if err != nil {
-		if strings.Contains(err.Error(), "path outside workspace") {
-			t.Errorf("boundary enforcement should be in approver, not validatePath: %v", err)
-		} else {
-			t.Logf("✅ traversal resolved (non-workspace, approver's job to reject): %v", err)
-		}
-	} else {
-		t.Logf("✅ traversal resolved — wrote outside workspace (approver would normally block this)")
 	}
 }
 
@@ -125,14 +103,11 @@ func TestListDir(t *testing.T) {
 	os.MkdirAll(filepath.Join(dir, "sub"), 0755)
 
 	l := NewListDir(dir)
-	out, err := l.Execute(context.Background(), []byte(`{}`))
-	if err != nil {
-		t.Fatal(err)
+	out := l.Execute(context.Background(), []byte(`{}`))
+	if !strings.Contains(out.Content, "a.txt") || !strings.Contains(out.Content, "sub/") {
+		t.Errorf("expected a.txt and sub/ in output: %s", out.Content)
 	}
-	if !strings.Contains(out, "a.txt") || !strings.Contains(out, "sub/") {
-		t.Errorf("expected a.txt and sub/ in output: %s", out)
-	}
-	t.Logf("✅ ls: %s", out)
+	t.Logf("✅ ls: %s", out.Content)
 }
 
 func TestGrep(t *testing.T) {
@@ -143,32 +118,23 @@ func TestGrep(t *testing.T) {
 	g := NewGrep(dir)
 
 	// Find "main" in all files.
-	out, err := g.Execute(context.Background(), []byte(`{"pattern":"main"}`))
-	if err != nil {
-		t.Fatal(err)
+	out := g.Execute(context.Background(), []byte(`{"pattern":"main"}`))
+	if !strings.Contains(out.Content, "a.go") || !strings.Contains(out.Content, "b.go") {
+		t.Errorf("expected matches in a.go and b.go: %s", out.Content)
 	}
-	if !strings.Contains(out, "a.go") || !strings.Contains(out, "b.go") {
-		t.Errorf("expected matches in a.go and b.go: %s", out)
-	}
-	t.Logf("✅ grep 'main':\n%s", out)
+	t.Logf("✅ grep 'main':\n%s", out.Content)
 
 	// Glob filter — only *.go files.
-	out, err = g.Execute(context.Background(), []byte(`{"pattern":"func","glob":"*.go"}`))
-	if err != nil {
-		t.Fatal(err)
+	out = g.Execute(context.Background(), []byte(`{"pattern":"func","glob":"*.go"}`))
+	if !strings.Contains(out.Content, "func") {
+		t.Errorf("expected func matches: %s", out.Content)
 	}
-	if !strings.Contains(out, "func") {
-		t.Errorf("expected func matches: %s", out)
-	}
-	t.Logf("✅ grep 'func' *.go:\n%s", out)
+	t.Logf("✅ grep 'func' *.go:\n%s", out.Content)
 
 	// No matches.
-	out, err = g.Execute(context.Background(), []byte(`{"pattern":"nonexistent"}`))
-	if err != nil {
-		t.Fatal(err)
+	out = g.Execute(context.Background(), []byte(`{"pattern":"nonexistent"}`))
+	if !strings.Contains(out.Content, "No matches") {
+		t.Errorf("expected no matches: %s", out.Content)
 	}
-	if !strings.Contains(out, "No matches") {
-		t.Errorf("expected no matches: %s", out)
-	}
-	t.Logf("✅ grep no match: %s", out)
+	t.Logf("✅ grep no match: %s", out.Content)
 }

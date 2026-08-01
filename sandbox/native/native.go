@@ -119,7 +119,7 @@ func readLines(r io.Reader, ch chan<- openagent.ToolStreamChunk, done chan<- str
 // those files directly — no OS pipe involved. After the process exits
 // (or ctx expires), the file content is read back into the builders.
 type cmdOutput struct {
-	stdout, stderr strings.Builder
+	stdout, stderr   strings.Builder
 	outFile, errFile *os.File // non-nil when child writes stdout/stderr to files directly
 }
 

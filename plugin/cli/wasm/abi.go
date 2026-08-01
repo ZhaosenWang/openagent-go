@@ -41,22 +41,22 @@ func (m CLIPluginMeta) Is(kind string) bool {
 // CommandDef describes a single CLI command or command group.
 // Commands with Children are groups (no RunE); leaves have RunE.
 type CommandDef struct {
-	Name     string        `json:"name"`
-	Use      string        `json:"use"`
-	Short    string        `json:"short"`
-	Long     string        `json:"long,omitempty"`
-	Args     string        `json:"args,omitempty"`     // arg rule: "exact=2", "min=1", "max=3", "range=1,5", "" = any
-	Flags    []FlagDef     `json:"flags,omitempty"`
-	Children []CommandDef  `json:"children,omitempty"`  // non-empty = group node, no RunE
-	Aliases  []string      `json:"aliases,omitempty"`
-	Example  string        `json:"example,omitempty"`
+	Name     string       `json:"name"`
+	Use      string       `json:"use"`
+	Short    string       `json:"short"`
+	Long     string       `json:"long,omitempty"`
+	Args     string       `json:"args,omitempty"` // arg rule: "exact=2", "min=1", "max=3", "range=1,5", "" = any
+	Flags    []FlagDef    `json:"flags,omitempty"`
+	Children []CommandDef `json:"children,omitempty"` // non-empty = group node, no RunE
+	Aliases  []string     `json:"aliases,omitempty"`
+	Example  string       `json:"example,omitempty"`
 }
 
 // FlagDef describes a command-line flag for a leaf command.
 type FlagDef struct {
 	Name         string `json:"name"`
 	Short        string `json:"short,omitempty"`
-	Kind         string `json:"kind"`          // "string" | "bool" | "int"
+	Kind         string `json:"kind"` // "string" | "bool" | "int"
 	DefaultValue string `json:"default_value"`
 	Description  string `json:"description"`
 }

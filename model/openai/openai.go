@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	openaisdk "github.com/openai/openai-go/v3"
@@ -45,7 +48,16 @@ func New(apiKey, modelID, baseURL string) *Model {
 
 func (m *Model) WithContextWindow(tokens int) *Model { m.contextWindow = tokens; return m }
 func (m *Model) ContextWindow() int                  { return m.contextWindow }
-func (m *Model) TokenizerModel() string               { return m.modelID }
+// TokenizerModel returns a tiktoken-encodable canonical name for the
+// model, not the user-assigned model ID (which tiktoken cannot map).
+// o1/o3 reasoning models use the o200k encoding; everything else uses
+// cl100k.
+func (m *Model) TokenizerModel() string {
+	if strings.HasPrefix(m.modelID, "o1") || strings.HasPrefix(m.modelID, "o3") {
+		return "gpt-4o"
+	}
+	return "gpt-4"
+}
 
 // modelContextWindow resolves the context window for a model ID. Falls
 // back to the shared model.ContextWindow lookup table.
@@ -121,6 +133,14 @@ func (m *Model) ChatCompletionStream(ctx context.Context, req openagent.ChatComp
 			OfStringArray: req.Stop,
 		}
 	}
+	if req.ReasoningEffort != "" {
+		params.ReasoningEffort = shared.ReasoningEffort(req.ReasoningEffort)
+	}
+	// Streaming responses omit usage by default; request it explicitly so
+	// the accumulated RunResult carries token counts.
+	params.StreamOptions = openaisdk.ChatCompletionStreamOptionsParam{
+		IncludeUsage: param.NewOpt(true),
+	}
 
 	stream := m.client.Chat.Completions.NewStreaming(ctx, params)
 	if err := stream.Err(); err != nil {
@@ -129,11 +149,26 @@ func (m *Model) ChatCompletionStream(ctx context.Context, req openagent.ChatComp
 	return &streamReader{stream: stream}, nil
 }
 
-// toRetryableError wraps 429/503 errors so the Runner can retry.
+// toRetryableError wraps transient API errors (429 + server 5xx) so the
+// Runner can retry with backoff. The Retry-After header, when present,
+// becomes the explicit backoff hint (RFC 7231; seconds or HTTP date).
 func toRetryableError(err error) error {
 	var apiErr *openaisdk.Error
-	if errors.As(err, &apiErr) && (apiErr.StatusCode == 429 || apiErr.StatusCode == 503) {
-		return &openagent.RetryableError{Err: err}
+	if errors.As(err, &apiErr) {
+		switch apiErr.StatusCode {
+		case 429, 500, 502, 503, 504:
+			re := &openagent.RetryableError{Err: err}
+			if apiErr.Response != nil {
+				if v := apiErr.Response.Header.Get("Retry-After"); v != "" {
+					if d, derr := http.ParseTime(v); derr == nil {
+						re.RetryAfter = time.Until(d)
+					} else if sec, serr := strconv.Atoi(v); serr == nil {
+						re.RetryAfter = time.Duration(sec) * time.Second
+					}
+				}
+			}
+			return re
+		}
 	}
 	return fmt.Errorf("chat completion: %w", err)
 }
@@ -206,6 +241,10 @@ func toSDKContentParts(parts []openagent.ContentPart) []openaisdk.ChatCompletion
 			out[i] = openaisdk.ImageContentPart(openaisdk.ChatCompletionContentPartImageImageURLParam{
 				URL: p.ImageURL.URL,
 			})
+		default:
+			// An unknown part type would serialize as an empty {} and be
+			// silently dropped by the API — drop it explicitly instead.
+			slog.Warn("openagent: unsupported content part type, dropping", "type", p.Type)
 		}
 	}
 	return out
@@ -230,14 +269,7 @@ func toSDKToolCallParams(calls []openagent.ToolCall) []openaisdk.ChatCompletionM
 func toSDKTools(defs []openagent.FunctionDefinition) []openaisdk.ChatCompletionToolUnionParam {
 	out := make([]openaisdk.ChatCompletionToolUnionParam, len(defs))
 	for i, d := range defs {
-		var params map[string]any
-		if len(d.Parameters) > 0 {
-			if err := json.Unmarshal(d.Parameters, &params); err != nil {
-				// Invalid JSON Schema — fall back to empty params so the
-				// tool is still sent to the model rather than dropped.
-				params = map[string]any{}
-			}
-		}
+		params := d.Parameters.SchemaMap()
 		out[i] = openaisdk.ChatCompletionToolUnionParam{
 			OfFunction: &openaisdk.ChatCompletionFunctionToolParam{
 				Function: openaisdk.FunctionDefinitionParam{
@@ -319,7 +351,7 @@ func (s *streamReader) Err() error {
 	}
 	return err
 }
-func (s *streamReader) Close() error                     { return s.stream.Close() }
+func (s *streamReader) Close() error { return s.stream.Close() }
 
 func toStreamChunk(c openaisdk.ChatCompletionChunk) openagent.StreamChunk {
 	sc := openagent.StreamChunk{}

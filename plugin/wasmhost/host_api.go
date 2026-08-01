@@ -78,9 +78,30 @@ const (
 // via the "host" module.  Runtime capabilities are accessed via
 // WithAgentRuntime / AgentRuntimeFromContext (context-based, not a field
 // on HostAPI) to avoid shared mutable state across goroutines.
+//
+// By default every export is available to every plugin — the host trusts
+// its plugins. Restricted deployments should set Deny to return an error
+// for sensitive exports (keyring_*, http_request, fs_*, runtime_set_*).
 type HostAPI struct {
 	Keyring Keyring
 	HTTP    HTTPClient
 	FS      FS
 	Logger  Logger
+	// Deny, when non-nil, is consulted for every sensitive export by
+	// name; returning true makes the export fail with "export disabled".
+	// nil = all exports allowed.
+	Deny func(export string) bool
+}
+
+// WithFS enables the fs_* exports (path boundary is the FS
+// implementation's responsibility). nil FS (default) makes fs_* return
+// "filesystem not available".
+func (h *HostAPI) WithFS(fs FS) *HostAPI {
+	h.FS = fs
+	return h
+}
+
+// denied reports whether an export is disabled by the Deny hook.
+func (h *HostAPI) denied(name string) bool {
+	return h.Deny != nil && h.Deny(name)
 }

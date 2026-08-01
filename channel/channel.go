@@ -62,11 +62,11 @@ type ReplyMessage struct {
 // WeChat Work template card).
 type Card struct {
 	Header    CardHeader
-	Content   string   // markdown body
-	Footer    string   // optional note at the bottom
+	Content   string // markdown body
+	Footer    string // optional note at the bottom
 	Color     CardColor
-	Collapsed bool     // body starts collapsed (platforms that support fold)
-	Panels    []Card   // nested collapsed sub-panels (when non-empty, Content is ignored)
+	Collapsed bool   // body starts collapsed (platforms that support fold)
+	Panels    []Card // nested collapsed sub-panels (when non-empty, Content is ignored)
 }
 
 // CardHeader is the title area of a card.

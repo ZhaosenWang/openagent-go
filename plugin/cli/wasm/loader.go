@@ -1,10 +1,10 @@
 package wasm
 
 import (
-	"log/slog"
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 
@@ -41,31 +41,8 @@ func (m *Module) CallInit(ctx context.Context, settingsJSON []byte) ([]byte, err
 	if m.Mod.ExportedFunction("init") == nil {
 		return settingsJSON, nil
 	}
-	if len(settingsJSON) == 0 {
-		return callExport(ctx, m.Mod, "init")
-	}
-	allocFn := m.Mod.ExportedFunction("alloc")
-	if allocFn == nil {
-		return nil, fmt.Errorf("alloc not exported")
-	}
-	allocRes, err := allocFn.Call(ctx, uint64(len(settingsJSON)))
-	if err != nil || len(allocRes) == 0 {
-		return nil, fmt.Errorf("alloc settings: %w", err)
-	}
-	ptr := uint32(allocRes[0])
-	m.Mod.Memory().Write(ptr, settingsJSON)
-	fn := m.Mod.ExportedFunction("init")
-	if fn == nil {
-		return settingsJSON, nil
-	}
-	results, err := fn.Call(ctx, uint64(ptr), uint64(len(settingsJSON)))
-	if err != nil {
-		return nil, fmt.Errorf("init: %w", err)
-	}
-	if len(results) == 0 {
-		return nil, fmt.Errorf("init: no result")
-	}
-	return wasmhost.ReadPacked(m.Mod, results[0]), nil
+	// Shared ABI helper (previously duplicated here and in the agent loader).
+	return wasmhost.CallWithInput(ctx, m.Mod, "init", settingsJSON)
 }
 
 func (m *Module) ReadCommands(ctx context.Context) ([]CommandDef, error) {
@@ -94,31 +71,15 @@ func RunCommand(ctx context.Context, cmdName string, argsJSON string) (string, e
 		return "", fmt.Errorf("command %q not found", cmdName)
 	}
 	mod := v.(api.Module)
-	fn := mod.ExportedFunction("run_" + cmdName)
-	if fn == nil {
+	if mod.ExportedFunction("run_"+cmdName) == nil {
 		return "", fmt.Errorf("command %q has no export run_%s", cmdName, cmdName)
 	}
-	allocFn := mod.ExportedFunction("alloc")
-	if allocFn == nil {
-		return "", fmt.Errorf("alloc not exported")
-	}
-	argsBytes := []byte(argsJSON)
-	allocRes, err := allocFn.Call(ctx, uint64(len(argsBytes)))
-	if err != nil || len(allocRes) == 0 {
-		return "", fmt.Errorf("alloc: %w", err)
-	}
-	ptr := uint32(allocRes[0])
-	mod.Memory().Write(ptr, argsBytes)
-	results, err := fn.Call(ctx, uint64(ptr), uint64(len(argsBytes)))
+	data, err := wasmhost.CallWithInput(ctx, mod, "run_"+cmdName, []byte(argsJSON))
 	if err != nil {
-		return "", fmt.Errorf("run_%s: %w", cmdName, err)
+		return "", err
 	}
-	if len(results) == 0 {
-		return "", fmt.Errorf("run_%s: no result", cmdName)
-	}
-	data := wasmhost.ReadPacked(mod, results[0])
 	if data == nil {
-		return "", fmt.Errorf("run_%s: read result failed", cmdName)
+		return "", fmt.Errorf("run_%s: empty result", cmdName)
 	}
 	return string(data), nil
 }

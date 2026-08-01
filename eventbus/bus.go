@@ -42,6 +42,16 @@ type Subscription[T any] struct {
 	closed atomic.Bool // ensure Close is called at most once
 }
 
+// subscriptionBuffer is the per-subscriber channel size. Publish is
+// non-blocking (the producer must never stall on a slow consumer), so a
+// larger buffer reduces drops under bursty traffic while keeping memory
+// bounded. Drops are still possible for a consumer slower than the
+// stream — acceptable for display events. Audit events go through the
+// same in-process bus today: the current Logger (BusLogger) is
+// memory-only and drops under load; a durable sink (file/DB) is not yet
+// implemented, so audit history is NOT guaranteed durable.
+const subscriptionBuffer = 256
+
 // New creates a Bus with per-session history capped at maxHistory events.
 // maxHistory controls the replay buffer size: when a new subscriber joins,
 // it immediately receives up to maxHistory past events before new ones.
@@ -187,7 +197,7 @@ func (t *topic[T]) subscribeLive() *Subscription[T] {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	ch := make(chan T, 64)
+	ch := make(chan T, subscriptionBuffer)
 	sub := &Subscription[T]{
 		C:  ch,
 		ch: ch,
@@ -202,22 +212,25 @@ func (t *topic[T]) subscribe() *Subscription[T] {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	ch := make(chan T, 64)
+	// FULL history replay: size the channel to fit the entire buffered
+	// history, then replay everything in order. A partial replay would
+	// drop the NEWEST events (the channel fills from the oldest first),
+	// handing late subscribers a stale view that can never be corrected.
+	cap := subscriptionBuffer
+	if len(t.history) > cap {
+		cap = len(t.history)
+	}
+	ch := make(chan T, cap)
 	sub := &Subscription[T]{
 		C:  ch,
 		ch: ch,
 		t:  t,
 	}
 
-	// Replay history into the new subscriber's channel.
-	// Non-blocking: if the channel fills up, the oldest history events
-	// are dropped — the subscriber catches up with recent state.
+	// The channel is sized to hold the whole history — this send never
+	// blocks (publish holds the topic lock, so no concurrent writers).
 	for _, evt := range t.history {
-		select {
-		case ch <- evt:
-		default:
-			// channel full; drop oldest history, keep sending recent
-		}
+		ch <- evt
 	}
 
 	t.subs = append(t.subs, sub)

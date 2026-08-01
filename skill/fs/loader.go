@@ -1,4 +1,5 @@
-// Package fs implements SkillLoader backed by a directory tree of SKILL.md files.
+// Package fs implements the filesystem skill backend: a directory tree of
+// SKILL.md files. It is consumed via provider/skill.NewFSBridge.
 //
 // Directory layout:
 //
@@ -98,17 +99,20 @@ func parseFrontmatter(path string) (map[string]any, string, error) {
 
 	// Find closing --- on its own line
 	idx := strings.Index(text[4:], "\n---\n")
+	closeLen := 5 // "\n---\n"
 	if idx == -1 {
-		// Try with trailing newline only
+		// Closing separator at EOF without a trailing newline ("...\n---").
+		// The body after it is empty — slice to len(text), not beyond it.
 		if strings.HasSuffix(text[4:], "\n---") {
 			idx = len(text[4:]) - 4
+			closeLen = 4 // "\n---"
 		} else {
 			return nil, "", fmt.Errorf("unclosed frontmatter")
 		}
 	}
 
 	yamlBlock := text[4 : 4+idx]
-	body := text[4+idx+5:] // skip \n---\n
+	body := text[4+idx+closeLen:] // skip the closing separator
 
 	var fm map[string]any
 	if err := yaml.Unmarshal([]byte(yamlBlock), &fm); err != nil {

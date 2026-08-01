@@ -1,6 +1,7 @@
 package iac
 
 import (
+	"archive/zip"
 	"context"
 	"fmt"
 	"io"
@@ -10,7 +11,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"archive/zip"
 
 	"github.com/hashicorp/go-version"
 	"github.com/hashicorp/hc-install"

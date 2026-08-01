@@ -15,6 +15,8 @@ import (
 	"time"
 
 	openagent "github.com/yusheng-g/openagent-go"
+	"github.com/yusheng-g/openagent-go/agent"
+	"github.com/yusheng-g/openagent-go/kernel"
 	"github.com/yusheng-g/openagent-go/model/openai"
 )
 
@@ -27,35 +29,35 @@ func main() {
 		WithContextWindow(128_000)
 
 	// ── Sub-agent 1: researcher — analyzes facts ──
-	researcher := openagent.NewAgent("researcher",
-		openagent.WithModel(sharedModel),
-		openagent.WithDescription("Analyzes data and finds key insights."),
-		openagent.WithSystemPrompts(`You are a researcher. Analyze the given task and provide:
+	researcher := agent.New("researcher",
+		agent.WithModel(sharedModel),
+		agent.WithDescription("Analyzes data and finds key insights."),
+		agent.WithSystemPrompts(`You are a researcher. Analyze the given task and provide:
 1. Key facts and data points
 2. Important trends or patterns
 3. A concise 2-3 sentence summary
 
 Be thorough but concise. Only respond with your analysis — do not ask follow-up questions.`),
-		openagent.WithMaxTurns(1),
+		agent.WithMaxTurns(1),
 	)
 
 	// ── Sub-agent 2: writer — writes reports ──
-	writer := openagent.NewAgent("writer",
-		openagent.WithModel(sharedModel),
-		openagent.WithDescription("Writes clear, well-structured reports."),
-		openagent.WithSystemPrompts(`You are a technical writer. Based on the task you receive, write:
+	writer := agent.New("writer",
+		agent.WithModel(sharedModel),
+		agent.WithDescription("Writes clear, well-structured reports."),
+		agent.WithSystemPrompts(`You are a technical writer. Based on the task you receive, write:
 1. A clear title
 2. 2-3 paragraphs of well-structured content
 3. A brief conclusion
 
 Write in a professional but accessible tone. Only respond with your writing — do not ask follow-up questions.`),
-		openagent.WithMaxTurns(1),
+		agent.WithMaxTurns(1),
 	)
 
 	// ── Coordinator: delegates to researcher + writer in parallel ──
-	coordinator := openagent.NewAgent("coordinator",
-		openagent.WithModel(sharedModel),
-		openagent.WithSystemPrompts(`You are a coordinator. When given a topic to report on:
+	coordinator := agent.New("coordinator",
+		agent.WithModel(sharedModel),
+		agent.WithSystemPrompts(`You are a coordinator. When given a topic to report on:
 1. Call BOTH researcher and writer tools IN THE SAME TURN
    - researcher: ask it to analyze the topic
    - writer: ask it to write a brief report on the topic
@@ -63,17 +65,21 @@ Write in a professional but accessible tone. Only respond with your writing — 
    Mention what each sub-agent contributed.
 
 IMPORTANT: Call both tools in a single response so they run in parallel.`),
-		openagent.WithTools(
-			researcher.AsTool(),
-			writer.AsTool(),
-		),
-		openagent.WithMaxTurns(3),
+		agent.WithMaxTurns(3),
 	)
+
+	// Runtime deps: sub-agents run isolated (no tools/memory/hooks of their own).
+	coordDeps := kernel.Deps{
+		Tools: []openagent.Tool{
+			kernel.AsTool(researcher, kernel.Deps{}),
+			kernel.AsTool(writer, kernel.Deps{}),
+		},
+	}
 
 	ctx := context.Background()
 	session := openagent.Session{
-		ID:        "delegate-session-1",
-		UserID:    "user-1",
+		ID:     "delegate-session-1",
+		UserID: "user-1",
 
 		ModelID:   modelID,
 		CreatedAt: time.Now(),
@@ -84,7 +90,7 @@ IMPORTANT: Call both tools in a single response so they run in parallel.`),
 	fmt.Println("User: Research and write a report about the Go programming language")
 	fmt.Println()
 
-	result, err := coordinator.Run(ctx, session,
+	result, err := kernel.New(coordinator, coordDeps).Run(ctx, session,
 		openagent.UserMessage("Research and write a brief report about the Go programming language. Cover its origins, key features, and why it's popular for backend development."))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)

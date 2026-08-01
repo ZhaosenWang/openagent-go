@@ -17,11 +17,13 @@ import (
 	"time"
 
 	openagent "github.com/yusheng-g/openagent-go"
-	"github.com/yusheng-g/openagent-go/memory/sqlite"
+	"github.com/yusheng-g/openagent-go/agent"
+	"github.com/yusheng-g/openagent-go/kernel"
 	"github.com/yusheng-g/openagent-go/model/openai"
+	memorysqlite "github.com/yusheng-g/openagent-go/provider/memory/sqlite"
 	"github.com/yusheng-g/openagent-go/rest"
-	sessionsqlite "github.com/yusheng-g/openagent-go/session/sqlite"
 	"github.com/yusheng-g/openagent-go/sandbox/native"
+	sessionsqlite "github.com/yusheng-g/openagent-go/session/sqlite"
 	"github.com/yusheng-g/openagent-go/tool"
 )
 
@@ -62,14 +64,19 @@ func main() {
 	llm := openai.New(apiKey, modelID, baseURL).WithContextWindow(128_000)
 
 	// ── Memory ──
-	mem, err := sqlite.New("./backend-memory.db")
+	ms, err := sessionsqlite.NewMessageStore("./backend-memory.db")
 	if err != nil {
-		log.Fatalf("memory: %v", err)
+		log.Fatalf("message store: %v", err)
 	}
-	defer mem.Close()
+	defer ms.Close()
+	knowledge, err := memorysqlite.New("./backend-memory.db")
+	if err != nil {
+		log.Fatalf("knowledge store: %v", err)
+	}
+	defer knowledge.Close()
 
 	// ── Session metadata store (survives restarts) ──
-	sessionStore, err := sessionsqlite.New(mem.DB())
+	sessionStore, err := sessionsqlite.New(ms.DB())
 	if err != nil {
 		log.Fatalf("session store: %v", err)
 	}
@@ -92,14 +99,18 @@ func main() {
 	}
 
 	// ── Single agent ──
-	agent := openagent.NewAgent("assistant",
-		openagent.WithModel(llm),
-		openagent.WithMemory(mem),
-		openagent.WithSystemPrompts("You are a capable assistant. Be concise and action-oriented."),
-		openagent.WithTools(sandboxTools...),
-		openagent.WithMaxTurns(10),
+	agentCfg := agent.New(
+		"assistant", agent.WithModel(llm),
+		agent.WithSystemPrompts("You are a capable assistant. Be concise and action-oriented."),
+		agent.WithMaxTurns(10),
 	)
-	handler := rest.NewHandler(agent).WithSessionStore(sessionStore)
+	agentDeps := kernel.Deps{
+		SessionStore:   ms,
+		Compressor:     ms,
+		MemoryProvider: knowledge,
+		Tools:          sandboxTools,
+	}
+	handler := rest.NewHandler(agentCfg, agentDeps).WithSessionStore(sessionStore)
 	// Register additional models so the frontend model selector shows >1 option.
 	// These share the same API key and base URL — only the model ID differs.
 	if apiKey != "" && baseURL != "" {
@@ -113,39 +124,55 @@ func main() {
 	}
 
 	// ── Team ──
-	analyst := openagent.NewAgent("analyst",
-		openagent.WithModel(llm),
-		openagent.WithMemory(mem),
-		openagent.WithTools(readOnlyTools(sandboxTools)...),
-		openagent.WithSystemPrompts("You are a requirements analyst. Understand the user's request, break it into clear requirements, then hand off to the designer with a structured spec. Include constraints and acceptance criteria. Use transfer_to_designer when done."),
-		openagent.WithMaxTurns(2),
+	analystCfg := agent.New(
+		"analyst", agent.WithModel(llm),
+		agent.WithSystemPrompts("You are a requirements analyst. Understand the user's request, break it into clear requirements, then hand off to the designer with a structured spec. Include constraints and acceptance criteria. Use transfer_to_designer when done."),
+		agent.WithMaxTurns(2),
 	)
-	designer := openagent.NewAgent("designer",
-		openagent.WithModel(llm),
-		openagent.WithMemory(mem),
-		openagent.WithTools(toolsWithout(sandboxTools, "shell")...),
-		openagent.WithSystemPrompts("You are a software designer. Take the specification from the analyst, design the architecture with components and interfaces. Write a design document to disk. Then hand off to the coder with clear file paths to the design doc. Use transfer_to_coder when done."),
-		openagent.WithMaxTurns(2),
+	analystDeps := kernel.Deps{
+		SessionStore:   ms,
+		Compressor:     ms,
+		MemoryProvider: knowledge,
+		Tools:          readOnlyTools(sandboxTools),
+	}
+	designerCfg := agent.New(
+		"designer", agent.WithModel(llm),
+		agent.WithSystemPrompts("You are a software designer. Take the specification from the analyst, design the architecture with components and interfaces. Write a design document to disk. Then hand off to the coder with clear file paths to the design doc. Use transfer_to_coder when done."),
+		agent.WithMaxTurns(2),
 	)
-	coder := openagent.NewAgent("coder",
-		openagent.WithModel(llm),
-		openagent.WithMemory(mem),
-		openagent.WithTools(sandboxTools...),
-		openagent.WithSystemPrompts("You are a software developer. Take the design and IMPLEMENT it by writing actual files to disk. When done, hand off to the reviewer with the list of files you created or modified (full paths). Use transfer_to_reviewer when done."),
-		openagent.WithMaxTurns(5),
+	designerDeps := kernel.Deps{
+		SessionStore:   ms,
+		Compressor:     ms,
+		MemoryProvider: knowledge,
+		Tools:          toolsWithout(sandboxTools, "shell"),
+	}
+	coderCfg := agent.New(
+		"coder", agent.WithModel(llm),
+		agent.WithSystemPrompts("You are a software developer. Take the design and IMPLEMENT it by writing actual files to disk. When done, hand off to the reviewer with the list of files you created or modified (full paths). Use transfer_to_reviewer when done."),
+		agent.WithMaxTurns(5),
 	)
-	reviewer := openagent.NewAgent("reviewer",
-		openagent.WithModel(llm),
-		openagent.WithMemory(mem),
-		openagent.WithTools(readOnlyTools(sandboxTools)...),
-		openagent.WithSystemPrompts("You are a code reviewer. Use read to examine the actual code files on disk. Check for correctness, style, and bugs. If issues found, hand off back to the coder with specific feedback referencing exact file paths and line numbers. If approved, produce the final summary. You are the final gate — do NOT hand off further."),
-		openagent.WithMaxTurns(2),
+	coderDeps := kernel.Deps{
+		SessionStore:   ms,
+		Compressor:     ms,
+		MemoryProvider: knowledge,
+		Tools:          sandboxTools,
+	}
+	reviewerCfg := agent.New(
+		"reviewer", agent.WithModel(llm),
+		agent.WithSystemPrompts("You are a code reviewer. Use read to examine the actual code files on disk. Check for correctness, style, and bugs. If issues found, hand off back to the coder with specific feedback referencing exact file paths and line numbers. If approved, produce the final summary. You are the final gate — do NOT hand off further."),
+		agent.WithMaxTurns(2),
 	)
-	teamHandler := rest.NewTeamHandler(mem,
-		rest.TeamAgentTemplate{Name: "analyst", Description: "Understands requirements and produces specifications", Agent: analyst},
-		rest.TeamAgentTemplate{Name: "designer", Description: "Designs architecture, components, and data flow", Agent: designer},
-		rest.TeamAgentTemplate{Name: "coder", Description: "Writes clean, well-structured code with error handling", Agent: coder},
-		rest.TeamAgentTemplate{Name: "reviewer", Description: "Reviews code for correctness, style, and security", Agent: reviewer},
+	reviewerDeps := kernel.Deps{
+		SessionStore:   ms,
+		Compressor:     ms,
+		MemoryProvider: knowledge,
+		Tools:          readOnlyTools(sandboxTools),
+	}
+	teamHandler := rest.NewTeamHandler(ms,
+		rest.TeamAgentTemplate{Name: "analyst", Description: "Understands requirements and produces specifications", Agent: analystCfg, Deps: analystDeps},
+		rest.TeamAgentTemplate{Name: "designer", Description: "Designs architecture, components, and data flow", Agent: designerCfg, Deps: designerDeps},
+		rest.TeamAgentTemplate{Name: "coder", Description: "Writes clean, well-structured code with error handling", Agent: coderCfg, Deps: coderDeps},
+		rest.TeamAgentTemplate{Name: "reviewer", Description: "Reviews code for correctness, style, and security", Agent: reviewerCfg, Deps: reviewerDeps},
 	).WithSessionStore(sessionStore)
 	// Register the same models on the team handler so the frontend model
 	// selector works in team mode too. The frontend fetches the list via
@@ -163,42 +190,52 @@ func main() {
 	}
 
 	// ── Plan agents ──
-	planResearcher := openagent.NewAgent("researcher",
-		openagent.WithModel(llm),
-		openagent.WithSystemPrompts("You research technical topics thoroughly. Use read/ls/grep tools to explore the codebase, shell to run commands. Be objective and data-driven."),
-		openagent.WithMaxTurns(2),
-		openagent.WithTools(sandboxTools...),
+	planResearcherCfg := agent.New(
+		"researcher", agent.WithModel(llm),
+		agent.WithSystemPrompts("You research technical topics thoroughly. Use read/ls/grep tools to explore the codebase, shell to run commands. Be objective and data-driven."),
+		agent.WithMaxTurns(2),
 	)
-	planArchitect := openagent.NewAgent("architect",
-		openagent.WithModel(llm),
-		openagent.WithSystemPrompts("You design software architecture. Use read/ls tools to understand existing code. Only output your design — no follow-up questions."),
-		openagent.WithMaxTurns(1),
-		openagent.WithTools(sandboxTools...),
+	planResearcherDeps := kernel.Deps{
+		Tools: sandboxTools,
+	}
+	planArchitectCfg := agent.New(
+		"architect", agent.WithModel(llm),
+		agent.WithSystemPrompts("You design software architecture. Use read/ls tools to understand existing code. Only output your design — no follow-up questions."),
+		agent.WithMaxTurns(1),
 	)
-	planCoder := openagent.NewAgent("coder",
-		openagent.WithModel(llm),
-		openagent.WithSystemPrompts("You write production-quality code. Use read/write to edit files, grep to search, shell to build and test. Output ONLY code — no explanations outside code comments."),
-		openagent.WithMaxTurns(3),
-		openagent.WithTools(sandboxTools...),
+	planArchitectDeps := kernel.Deps{
+		Tools: sandboxTools,
+	}
+	planCoderCfg := agent.New(
+		"coder", agent.WithModel(llm),
+		agent.WithSystemPrompts("You write production-quality code. Use read/write to edit files, grep to search, shell to build and test. Output ONLY code — no explanations outside code comments."),
+		agent.WithMaxTurns(3),
 	)
-	planReviewer := openagent.NewAgent("reviewer",
-		openagent.WithModel(llm),
-		openagent.WithSystemPrompts("You review code for correctness, style, and potential bugs. Use read/grep to examine the code. List specific issues and suggestions. Be constructive."),
-		openagent.WithMaxTurns(1),
-		openagent.WithTools(sandboxTools...),
+	planCoderDeps := kernel.Deps{
+		Tools: sandboxTools,
+	}
+	planReviewerCfg := agent.New(
+		"reviewer", agent.WithModel(llm),
+		agent.WithSystemPrompts("You review code for correctness, style, and potential bugs. Use read/grep to examine the code. List specific issues and suggestions. Be constructive."),
+		agent.WithMaxTurns(1),
 	)
-	planWriter := openagent.NewAgent("writer",
-		openagent.WithModel(llm),
-		openagent.WithSystemPrompts("You write clear documentation. Use read/ls to understand the codebase. Use markdown formatting."),
-		openagent.WithMaxTurns(1),
-		openagent.WithTools(sandboxTools...),
+	planReviewerDeps := kernel.Deps{
+		Tools: sandboxTools,
+	}
+	planWriterCfg := agent.New(
+		"writer", agent.WithModel(llm),
+		agent.WithSystemPrompts("You write clear documentation. Use read/ls to understand the codebase. Use markdown formatting."),
+		agent.WithMaxTurns(1),
 	)
+	planWriterDeps := kernel.Deps{
+		Tools: sandboxTools,
+	}
 	orchHandler := rest.NewOrchestrateHandler(nil, llm,
-		rest.OrchestrateAgentTemplate{Name: "researcher", Description: "Researches technical topics — provides comprehensive analysis with pros/cons, alternatives, and data-driven recommendations", Runner: planResearcher},
-		rest.OrchestrateAgentTemplate{Name: "architect", Description: "Designs software architecture — produces structured design documents with components, interfaces, and data flow", Runner: planArchitect},
-		rest.OrchestrateAgentTemplate{Name: "coder", Description: "Writes production-quality code with error handling and comments", Runner: planCoder},
-		rest.OrchestrateAgentTemplate{Name: "reviewer", Description: "Reviews code for correctness, style, and potential bugs — produces a list of issues and suggestions", Runner: planReviewer},
-		rest.OrchestrateAgentTemplate{Name: "writer", Description: "Writes clear, professional documentation: README, API docs, reports. Uses markdown formatting", Runner: planWriter},
+		rest.OrchestrateAgentTemplate{Name: "researcher", Description: "Researches technical topics — provides comprehensive analysis with pros/cons, alternatives, and data-driven recommendations", Cfg: planResearcherCfg, Deps: planResearcherDeps},
+		rest.OrchestrateAgentTemplate{Name: "architect", Description: "Designs software architecture — produces structured design documents with components, interfaces, and data flow", Cfg: planArchitectCfg, Deps: planArchitectDeps},
+		rest.OrchestrateAgentTemplate{Name: "coder", Description: "Writes production-quality code with error handling and comments", Cfg: planCoderCfg, Deps: planCoderDeps},
+		rest.OrchestrateAgentTemplate{Name: "reviewer", Description: "Reviews code for correctness, style, and potential bugs — produces a list of issues and suggestions", Cfg: planReviewerCfg, Deps: planReviewerDeps},
+		rest.OrchestrateAgentTemplate{Name: "writer", Description: "Writes clear, professional documentation: README, API docs, reports. Uses markdown formatting", Cfg: planWriterCfg, Deps: planWriterDeps},
 	).WithSessionStore(sessionStore)
 
 	// ── Routes ──

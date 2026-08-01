@@ -1,8 +1,8 @@
 package wasm
 
 import (
-	"log/slog"
 	"context"
+	"log/slog"
 	"sync"
 )
 
@@ -48,7 +48,9 @@ func (h *ObserverHub) broadcast(ctx context.Context, name string) {
 	h.mu.Unlock()
 	for _, m := range mods {
 		fn := m.Mod.ExportedFunction(name)
-		if fn == nil { continue }
+		if fn == nil {
+			continue
+		}
 		if _, err := fn.Call(ctx); err != nil {
 			slog.Error("cli observer error", "name", name, "error", err)
 		}
@@ -62,12 +64,18 @@ func (h *ObserverHub) broadcastStr(ctx context.Context, name string, arg string)
 	h.mu.Unlock()
 	for _, m := range mods {
 		fn := m.Mod.ExportedFunction(name)
-		if fn == nil { continue }
+		if fn == nil {
+			continue
+		}
 		allocFn := m.Mod.ExportedFunction("alloc")
-		if allocFn == nil { continue }
+		if allocFn == nil {
+			continue
+		}
 		b := []byte(arg)
 		res, err := allocFn.Call(ctx, uint64(len(b)))
-		if err != nil || len(res) == 0 { continue }
+		if err != nil || len(res) == 0 {
+			continue
+		}
 		ptr := uint32(res[0])
 		m.Mod.Memory().Write(ptr, b)
 		if _, err := fn.Call(ctx, uint64(ptr), uint64(len(b))); err != nil {

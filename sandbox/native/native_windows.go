@@ -53,9 +53,9 @@ func (s *Sandbox) confineAndRun(ctx context.Context, cmd openagent.Command) (ope
 		}, openagent.ErrProcessRunning
 	case err := <-waitCh:
 		result := openagent.Result{
-			Stdout:   stdout.String(),
-			Stderr:   stderr.String() + "\n[warning: windows sandbox not yet implemented, running unconfined]",
-			PID:      c.Process.Pid,
+			Stdout: stdout.String(),
+			Stderr: stderr.String() + "\n[warning: windows sandbox not yet implemented, running unconfined]",
+			PID:    c.Process.Pid,
 		}
 		if err != nil {
 			if exitErr, ok := err.(*exec.ExitError); ok {

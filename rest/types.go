@@ -27,7 +27,6 @@ import (
 
 // ── Session ──
 
-
 // SessionDetail is a single session enriched with runtime info.
 type SessionDetail struct {
 	session.SessionInfo
@@ -52,9 +51,13 @@ type ChatRequest struct {
 }
 
 // ApproveRequest is the body for POST /sessions/{id}/approve.
+//
+// Action is one of: "allow" (once), "deny", "always" (remember for the
+// session), "edit" (allow with modified args).
 type ApproveRequest struct {
-	Allowed  bool   `json:"allowed"`
-	Feedback string `json:"feedback,omitempty"` // optional user feedback when denying
+	Action   string          `json:"action"`
+	Args     json.RawMessage `json:"args,omitempty"` // edited args (action=edit)
+	Feedback string          `json:"feedback,omitempty"`
 }
 
 // ── SSE event ──

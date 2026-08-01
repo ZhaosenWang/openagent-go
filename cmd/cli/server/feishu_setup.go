@@ -31,7 +31,7 @@ func ResolveFeishuCredentials(ctx context.Context) (FeishuCredentials, error) {
 	}
 
 	// QR code registration.
-	fmt.Fprintln(os.Stderr,"feishu: no credentials found. Starting one-click app registration...")
+	fmt.Fprintln(os.Stderr, "feishu: no credentials found. Starting one-click app registration...")
 	return registerFeishuApp(ctx)
 }
 

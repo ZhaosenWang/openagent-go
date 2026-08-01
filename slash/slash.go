@@ -71,8 +71,8 @@ type Context struct {
 	ListSess func() ([]SessionInfo, error) // returns all sessions from the store
 
 	// Model selection.
-	SetModel   func(modelID string) error       // persists + sends config_option_update notification
-	ListModels func() []string // available model IDs
+	SetModel   func(modelID string) error // persists + sends config_option_update notification
+	ListModels func() []string            // available model IDs
 }
 
 // SessionInfo is a summary returned by /sessions.
@@ -87,8 +87,8 @@ type SessionInfo struct {
 
 // Registry holds registered slash commands and dispatches incoming text.
 type Registry struct {
-	cmds   []Command           // ordered list preserves insertion order
-	byName map[string]int      // name → index in cmds
+	cmds   []Command      // ordered list preserves insertion order
+	byName map[string]int // name → index in cmds
 }
 
 // NewRegistry creates an empty command registry.

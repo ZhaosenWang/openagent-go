@@ -2,7 +2,6 @@ package redact
 
 import (
 	"context"
-	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -24,17 +23,17 @@ func withEnv(t *testing.T, kv ...string) {
 func TestOnToolEnd_NoEnvNames_NoOp(t *testing.T) {
 	h := NewHook(nil)
 	out := "secret: abc"
-	res := out
-	h.OnToolEnd(context.Background(), openagent.FunctionDefinition{}, nil, &res, nil, nil)
-	if res != out {
-		t.Fatalf("nil envNames modified result: %q", res)
+	res := &openagent.ToolResult{Content: out}
+	h.OnToolEnd(context.Background(), openagent.FunctionDefinition{}, nil, res, nil)
+	if res.Content != out {
+		t.Fatalf("nil envNames modified result: %q", res.Content)
 	}
 
 	h2 := NewHook([]string{})
-	res2 := out
-	h2.OnToolEnd(context.Background(), openagent.FunctionDefinition{}, nil, &res2, nil, nil)
-	if res2 != out {
-		t.Fatalf("empty envNames modified result: %q", res2)
+	res2 := &openagent.ToolResult{Content: out}
+	h2.OnToolEnd(context.Background(), openagent.FunctionDefinition{}, nil, res2, nil)
+	if res2.Content != out {
+		t.Fatalf("empty envNames modified result: %q", res2.Content)
 	}
 }
 
@@ -44,10 +43,10 @@ func TestOnToolEnd_EmptyEnvValue_Skipped(t *testing.T) {
 	withEnv(t, "REDACT_EMPTY", "")
 	h := NewHook([]string{"REDACT_EMPTY"})
 	out := "nothing to see here"
-	res := out
-	h.OnToolEnd(context.Background(), openagent.FunctionDefinition{}, nil, &res, nil, nil)
-	if res != out {
-		t.Fatalf("empty-valued env var corrupted result: %q", res)
+	res := &openagent.ToolResult{Content: out}
+	h.OnToolEnd(context.Background(), openagent.FunctionDefinition{}, nil, res, nil)
+	if res.Content != out {
+		t.Fatalf("empty-valued env var corrupted result: %q", res.Content)
 	}
 }
 
@@ -55,50 +54,50 @@ func TestOnToolEnd_EmptyResult_ShortCircuit(t *testing.T) {
 	// Empty result must not enter the redaction loop.
 	withEnv(t, "REDACT_ER", "xsecret1")
 	h := NewHook([]string{"REDACT_ER"})
-	res := ""
-	h.OnToolEnd(context.Background(), openagent.FunctionDefinition{}, nil, &res, nil, nil)
-	if res != "" {
-		t.Fatalf("empty result modified: %q", res)
+	res := &openagent.ToolResult{Content: ""}
+	h.OnToolEnd(context.Background(), openagent.FunctionDefinition{}, nil, res, nil)
+	if res.Content != "" {
+		t.Fatalf("empty result modified: %q", res.Content)
 	}
 }
 
 func TestOnToolEnd_SingleHit_RedactedWithHint(t *testing.T) {
 	withEnv(t, "REDACT_TOKEN", "supersecret")
 	h := NewHook([]string{"REDACT_TOKEN"})
-	res := "the token is supersecret and that is bad"
-	h.OnToolEnd(context.Background(), openagent.FunctionDefinition{}, nil, &res, nil, nil)
-	if strings.Contains(res, "supersecret") {
-		t.Fatalf("secret leaked in result: %q", res)
+	res := &openagent.ToolResult{Content: "the token is supersecret and that is bad"}
+	h.OnToolEnd(context.Background(), openagent.FunctionDefinition{}, nil, res, nil)
+	if strings.Contains(res.Content, "supersecret") {
+		t.Fatalf("secret leaked in result: %q", res.Content)
 	}
-	if !strings.Contains(res, "[REDACTED]") {
-		t.Fatalf("result missing [REDACTED]: %q", res)
+	if !strings.Contains(res.Content, "[REDACTED]") {
+		t.Fatalf("result missing [REDACTED]: %q", res.Content)
 	}
-	if !strings.Contains(res, hint) {
-		t.Fatalf("result missing hint: %q", res)
+	if !strings.Contains(res.Content, hint) {
+		t.Fatalf("result missing hint: %q", res.Content)
 	}
 }
 
 func TestOnToolEnd_MultipleOccurrences_AllReplaced(t *testing.T) {
 	withEnv(t, "REDACT_TOK", "abcdef12")
 	h := NewHook([]string{"REDACT_TOK"})
-	res := "abcdef12 and abcdef12 and again abcdef12"
-	h.OnToolEnd(context.Background(), openagent.FunctionDefinition{}, nil, &res, nil, nil)
+	res := &openagent.ToolResult{Content: "abcdef12 and abcdef12 and again abcdef12"}
+	h.OnToolEnd(context.Background(), openagent.FunctionDefinition{}, nil, res, nil)
 	want := strings.ReplaceAll("abcdef12 and abcdef12 and again abcdef12", "abcdef12", "[REDACTED]") + hint
-	if res != want {
-		t.Fatalf("got %q want %q", res, want)
+	if res.Content != want {
+		t.Fatalf("got %q want %q", res.Content, want)
 	}
 }
 
 func TestOnToolEnd_MultipleSecrets_HintAppendedOnce(t *testing.T) {
 	withEnv(t, "REDACT_A", "AAAAsecret", "REDACT_B", "BBBBsecret")
 	h := NewHook([]string{"REDACT_A", "REDACT_B"})
-	res := "AAAAsecret here, BBBBsecret there, AAAAsecret again"
-	h.OnToolEnd(context.Background(), openagent.FunctionDefinition{}, nil, &res, nil, nil)
-	if strings.Contains(res, "AAAAsecret") || strings.Contains(res, "BBBBsecret") {
-		t.Fatalf("secret leaked: %q", res)
+	res := &openagent.ToolResult{Content: "AAAAsecret here, BBBBsecret there, AAAAsecret again"}
+	h.OnToolEnd(context.Background(), openagent.FunctionDefinition{}, nil, res, nil)
+	if strings.Contains(res.Content, "AAAAsecret") || strings.Contains(res.Content, "BBBBsecret") {
+		t.Fatalf("secret leaked: %q", res.Content)
 	}
-	if c := strings.Count(res, hint); c != 1 {
-		t.Fatalf("hint count = %d, want 1: %q", c, res)
+	if c := strings.Count(res.Content, hint); c != 1 {
+		t.Fatalf("hint count = %d, want 1: %q", c, res.Content)
 	}
 }
 
@@ -106,32 +105,32 @@ func TestOnToolEnd_NoHit_Unchanged(t *testing.T) {
 	withEnv(t, "REDACT_X", "xyzsecret")
 	h := NewHook([]string{"REDACT_X"})
 	out := "completely unrelated output"
-	res := out
-	h.OnToolEnd(context.Background(), openagent.FunctionDefinition{}, nil, &res, nil, nil)
-	if res != out {
-		t.Fatalf("no-hit result modified: %q", res)
+	res := &openagent.ToolResult{Content: out}
+	h.OnToolEnd(context.Background(), openagent.FunctionDefinition{}, nil, res, nil)
+	if res.Content != out {
+		t.Fatalf("no-hit result modified: %q", res.Content)
 	}
 }
 
 func TestOnToolEnd_NilResult_NoPanic(t *testing.T) {
 	withEnv(t, "REDACT_N", "nosecret")
 	h := NewHook([]string{"REDACT_N"})
-	h.OnToolEnd(context.Background(), openagent.FunctionDefinition{}, nil, nil, nil, nil)
+	h.OnToolEnd(context.Background(), openagent.FunctionDefinition{}, nil, nil, nil)
 }
 
 func TestOnToolEnd_ErrorString_Redacted(t *testing.T) {
 	withEnv(t, "REDACT_E", "leaked-in-error")
 	h := NewHook([]string{"REDACT_E"})
-	e := errors.New("tool failed: leaked-in-error")
-	h.OnToolEnd(context.Background(), openagent.FunctionDefinition{}, nil, nil, &e, nil)
-	if e == nil {
-		t.Fatal("err became nil")
+	res := &openagent.ToolResult{Error: &openagent.ToolError{Message: "tool failed: leaked-in-error"}}
+	h.OnToolEnd(context.Background(), openagent.FunctionDefinition{}, nil, res, nil)
+	if res.Error == nil {
+		t.Fatal("error became nil")
 	}
-	if strings.Contains(e.Error(), "leaked-in-error") {
-		t.Fatalf("secret leaked in error: %q", e.Error())
+	if strings.Contains(res.Error.Message, "leaked-in-error") {
+		t.Fatalf("secret leaked in error: %q", res.Error.Message)
 	}
-	if !strings.Contains(e.Error(), "[REDACTED]") {
-		t.Fatalf("error missing [REDACTED]: %q", e.Error())
+	if !strings.Contains(res.Error.Message, "[REDACTED]") {
+		t.Fatalf("error missing [REDACTED]: %q", res.Error.Message)
 	}
 }
 
@@ -141,10 +140,10 @@ func TestOnToolEnd_LazyResolution_EnvSetAfterConstruction(t *testing.T) {
 	t.Setenv("REDACT_LATE", "")
 	h := NewHook([]string{"REDACT_LATE"})
 	t.Setenv("REDACT_LATE", "late-value")
-	res := "contains late-value here"
-	h.OnToolEnd(context.Background(), openagent.FunctionDefinition{}, nil, &res, nil, nil)
-	if strings.Contains(res, "late-value") {
-		t.Fatalf("lazily-resolved secret leaked: %q", res)
+	res := &openagent.ToolResult{Content: "contains late-value here"}
+	h.OnToolEnd(context.Background(), openagent.FunctionDefinition{}, nil, res, nil)
+	if strings.Contains(res.Content, "late-value") {
+		t.Fatalf("lazily-resolved secret leaked: %q", res.Content)
 	}
 }
 
@@ -153,16 +152,16 @@ func TestOnToolEnd_JSONResult_NoTrailingHint(t *testing.T) {
 	// hint appended.
 	withEnv(t, "REDACT_J", "supersecret")
 	h := NewHook([]string{"REDACT_J"})
-	res := `{"token":"supersecret","ok":true}`
-	h.OnToolEnd(context.Background(), openagent.FunctionDefinition{}, nil, &res, nil, nil)
-	if strings.Contains(res, "supersecret") {
-		t.Fatalf("secret leaked: %q", res)
+	res := &openagent.ToolResult{Content: `{"token":"supersecret","ok":true}`}
+	h.OnToolEnd(context.Background(), openagent.FunctionDefinition{}, nil, res, nil)
+	if strings.Contains(res.Content, "supersecret") {
+		t.Fatalf("secret leaked: %q", res.Content)
 	}
-	if !strings.Contains(res, "[REDACTED]") {
-		t.Fatalf("missing [REDACTED]: %q", res)
+	if !strings.Contains(res.Content, "[REDACTED]") {
+		t.Fatalf("missing [REDACTED]: %q", res.Content)
 	}
-	if strings.Contains(res, hint) {
-		t.Fatalf("hint appended to JSON result, breaking validity: %q", res)
+	if strings.Contains(res.Content, hint) {
+		t.Fatalf("hint appended to JSON result, breaking validity: %q", res.Content)
 	}
 }
 
@@ -171,10 +170,10 @@ func TestOnToolEnd_HintIdempotent_AlreadyHinted(t *testing.T) {
 	// stack a second one.
 	withEnv(t, "REDACT_I", "secsecret")
 	h := NewHook([]string{"REDACT_I"})
-	res := "secsecret here" + hint
-	h.OnToolEnd(context.Background(), openagent.FunctionDefinition{}, nil, &res, nil, nil)
-	if c := strings.Count(res, hint); c != 1 {
-		t.Fatalf("hint count = %d, want 1 (idempotent): %q", c, res)
+	res := &openagent.ToolResult{Content: "secsecret here" + hint}
+	h.OnToolEnd(context.Background(), openagent.FunctionDefinition{}, nil, res, nil)
+	if c := strings.Count(res.Content, hint); c != 1 {
+		t.Fatalf("hint count = %d, want 1 (idempotent): %q", c, res.Content)
 	}
 }
 
@@ -182,14 +181,14 @@ func TestNewHook_DedupAndDropEmpty(t *testing.T) {
 	// duplicate and empty names are collapsed.
 	withEnv(t, "REDACT_D", "sensitive-dedup-token")
 	h := NewHook([]string{"REDACT_D", "REDACT_D", "", "REDACT_D"})
-	res := "sensitive-dedup-token"
-	h.OnToolEnd(context.Background(), openagent.FunctionDefinition{}, nil, &res, nil, nil)
-	if strings.Contains(res, "sensitive-dedup-token") {
-		t.Fatalf("secret leaked despite dup/empty names: %q", res)
+	res := &openagent.ToolResult{Content: "sensitive-dedup-token"}
+	h.OnToolEnd(context.Background(), openagent.FunctionDefinition{}, nil, res, nil)
+	if strings.Contains(res.Content, "sensitive-dedup-token") {
+		t.Fatalf("secret leaked despite dup/empty names: %q", res.Content)
 	}
 	// Functional check: envNames deduped to 1, no panic, no double hint.
-	if c := strings.Count(res, hint); c != 1 {
-		t.Fatalf("hint count = %d, want 1: %q", c, res)
+	if c := strings.Count(res.Content, hint); c != 1 {
+		t.Fatalf("hint count = %d, want 1: %q", c, res.Content)
 	}
 }
 
@@ -206,9 +205,9 @@ func TestOnToolEnd_ConcurrentSafe(t *testing.T) {
 	for i := 0; i < n; i++ {
 		go func() {
 			defer wg.Done()
-			res := "prefix concurrent-secret suffix"
-			h.OnToolEnd(context.Background(), openagent.FunctionDefinition{}, nil, &res, nil, nil)
-			if strings.Contains(res, "concurrent-secret") {
+			res := &openagent.ToolResult{Content: "prefix concurrent-secret suffix"}
+			h.OnToolEnd(context.Background(), openagent.FunctionDefinition{}, nil, res, nil)
+			if strings.Contains(res.Content, "concurrent-secret") {
 				t.Errorf("secret leaked under concurrency")
 			}
 		}()
@@ -222,10 +221,10 @@ func TestOnToolEnd_ShortValueSkipped(t *testing.T) {
 	withEnv(t, "REDACT_SHORT", "abc")
 	h := NewHook([]string{"REDACT_SHORT"})
 	out := "the value abc appears here"
-	res := out
-	h.OnToolEnd(context.Background(), openagent.FunctionDefinition{}, nil, &res, nil, nil)
-	if res != out {
-		t.Fatalf("short value was redacted (should be skipped): %q", res)
+	res := &openagent.ToolResult{Content: out}
+	h.OnToolEnd(context.Background(), openagent.FunctionDefinition{}, nil, res, nil)
+	if res.Content != out {
+		t.Fatalf("short value was redacted (should be skipped): %q", res.Content)
 	}
 }
 
@@ -235,14 +234,14 @@ func TestOnToolEnd_LongestFirst_NestedSecrets(t *testing.T) {
 	// the longer match and leak the remainder.
 	withEnv(t, "REDACT_LONG", "abcdef1234", "REDACT_SHORT", "abcdef12")
 	h := NewHook([]string{"REDACT_SHORT", "REDACT_LONG"}) // short listed first on purpose
-	res := "token=abcdef1234 here"
-	h.OnToolEnd(context.Background(), openagent.FunctionDefinition{}, nil, &res, nil, nil)
+	res := &openagent.ToolResult{Content: "token=abcdef1234 here"}
+	h.OnToolEnd(context.Background(), openagent.FunctionDefinition{}, nil, res, nil)
 	// The long value must be fully redacted; "34" must not leak as a
 	// leftover from a partial short-match.
-	if strings.Contains(res, "abcdef1234") || strings.Contains(res, "abcdef12") {
-		t.Fatalf("secret leaked: %q", res)
+	if strings.Contains(res.Content, "abcdef1234") || strings.Contains(res.Content, "abcdef12") {
+		t.Fatalf("secret leaked: %q", res.Content)
 	}
-	if !strings.Contains(res, "[REDACTED]") {
-		t.Fatalf("missing [REDACTED]: %q", res)
+	if !strings.Contains(res.Content, "[REDACTED]") {
+		t.Fatalf("missing [REDACTED]: %q", res.Content)
 	}
 }

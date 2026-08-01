@@ -6,6 +6,8 @@ import (
 	"time"
 
 	openagent "github.com/yusheng-g/openagent-go"
+	"github.com/yusheng-g/openagent-go/agent"
+	"github.com/yusheng-g/openagent-go/kernel"
 )
 
 // Plan orchestrates multi-agent execution through a Planner-generated DAG.
@@ -28,8 +30,8 @@ import (
 //	result, err := plan.Execute(ctx, session, def)
 type Plan struct {
 	planner    Planner
-	agents     map[string]openagent.AgentRunner
-	agentInfos []openagent.AgentInfo
+	agents     map[string]agent.AgentRunner
+	agentInfos []agent.AgentInfo
 	model      openagent.Model // for step output summarisation
 	config     PlanConfig
 	approver   PlanApprover // nil = auto-approve
@@ -46,14 +48,14 @@ func WithPlanner(p Planner) PlanOption {
 // WithAgent adds an AgentRunner to the plan's agent pool.
 // name must be unique. description is shown to the Planner so it can
 // assign appropriate tasks.
-func WithAgent(name, description string, runner openagent.AgentRunner) PlanOption {
+func WithAgent(name, description string, runner agent.AgentRunner) PlanOption {
 	return func(pl *Plan) {
 		pl.agents[name] = runner
-		at := openagent.AgentExternal
-		if _, ok := runner.(*openagent.Agent); ok {
-			at = openagent.AgentInternal
+		at := agent.AgentExternal
+		if _, ok := runner.(*kernel.Runtime); ok {
+			at = agent.AgentInternal
 		}
-		pl.agentInfos = append(pl.agentInfos, openagent.AgentInfo{
+		pl.agentInfos = append(pl.agentInfos, agent.AgentInfo{
 			Name: name, Description: description, Type: at,
 		})
 	}
@@ -99,7 +101,7 @@ func WithPlanApprover(a PlanApprover) PlanOption {
 // At least one agent and a Planner must be configured.
 func NewPlan(opts ...PlanOption) *Plan {
 	p := &Plan{
-		agents: make(map[string]openagent.AgentRunner),
+		agents: make(map[string]agent.AgentRunner),
 		config: DefaultPlanConfig(),
 	}
 	for _, o := range opts {
@@ -156,7 +158,7 @@ func (p *Plan) PlanStream(ctx context.Context, goal string, history []openagent.
 
 	// Use streaming if planner supports it.
 	type streamPlanner interface {
-		PlanStream(ctx context.Context, goal string, agents []openagent.AgentInfo, history []openagent.Message, onChunk func(string)) (*PlanDef, error)
+		PlanStream(ctx context.Context, goal string, agents []agent.AgentInfo, history []openagent.Message, onChunk func(string)) (*PlanDef, error)
 	}
 	if sp, ok := p.planner.(streamPlanner); ok {
 		def, err := sp.PlanStream(ctx, goal, p.agentInfos, history, onChunk)

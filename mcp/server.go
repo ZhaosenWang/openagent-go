@@ -7,8 +7,8 @@ import (
 	"log/slog"
 	"net/http"
 
-	openagent "github.com/yusheng-g/openagent-go"
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
+	openagent "github.com/yusheng-g/openagent-go"
 )
 
 // Server exposes openagent.Tool instances as an MCP server.
@@ -66,18 +66,18 @@ func (s *Server) AddTool(tool openagent.Tool) error {
 	// progress notifications back to the client during long-running calls.
 	handler := func(ctx context.Context, req *mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
 		ctx = withProgress(ctx, req)
-		output, err := tool.Execute(ctx, req.Params.Arguments)
-		if err != nil {
+		output := tool.Execute(ctx, req.Params.Arguments)
+		if output.Error != nil {
 			return &mcpsdk.CallToolResult{
 				IsError: true,
 				Content: []mcpsdk.Content{
-					&mcpsdk.TextContent{Text: err.Error()},
+					&mcpsdk.TextContent{Text: output.Error.Message},
 				},
 			}, nil
 		}
 		return &mcpsdk.CallToolResult{
 			Content: []mcpsdk.Content{
-				&mcpsdk.TextContent{Text: output},
+				&mcpsdk.TextContent{Text: output.Content},
 			},
 		}, nil
 	}
@@ -128,18 +128,18 @@ func (s *Server) AddToolWithSchema(tool openagent.Tool, inputSchema json.RawMess
 
 	handler := func(ctx context.Context, req *mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
 		ctx = withProgress(ctx, req)
-		output, err := tool.Execute(ctx, req.Params.Arguments)
-		if err != nil {
+		output := tool.Execute(ctx, req.Params.Arguments)
+		if output.Error != nil {
 			return &mcpsdk.CallToolResult{
 				IsError: true,
 				Content: []mcpsdk.Content{
-					&mcpsdk.TextContent{Text: err.Error()},
+					&mcpsdk.TextContent{Text: output.Error.Message},
 				},
 			}, nil
 		}
 		return &mcpsdk.CallToolResult{
 			Content: []mcpsdk.Content{
-				&mcpsdk.TextContent{Text: output},
+				&mcpsdk.TextContent{Text: output.Content},
 			},
 		}, nil
 	}

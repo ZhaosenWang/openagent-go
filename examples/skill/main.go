@@ -17,7 +17,10 @@ import (
 	"time"
 
 	openagent "github.com/yusheng-g/openagent-go"
+	"github.com/yusheng-g/openagent-go/agent"
+	"github.com/yusheng-g/openagent-go/kernel"
 	"github.com/yusheng-g/openagent-go/model/openai"
+	"github.com/yusheng-g/openagent-go/provider/skill"
 	"github.com/yusheng-g/openagent-go/skill/fs"
 )
 
@@ -29,26 +32,25 @@ func main() {
 	model := openai.New(apiKey, modelID, baseURL).
 		WithContextWindow(128_000)
 
-	// Skill loader: skills directory is next to the binary
+	// Skill provider: skills directory is next to the binary
 	skillRoot, _ := filepath.Abs("examples/skill/skills")
-	loader := fs.New(skillRoot)
+	loader := skill.NewFSBridge(fs.New(skillRoot))
 
-	agent := openagent.NewAgent("skill-demo",
-		openagent.WithModel(model),
-		openagent.WithSystemPrompts("You are a helpful assistant. Skills are available for loading — use load_skill to load one when you need detailed instructions."),
-		openagent.WithSkillLoader(loader),
+	cfg := agent.New("skill-demo",
+		agent.WithModel(model),
+		agent.WithSystemPrompts("You are a helpful assistant. Skills are available for loading — use load_skill to load one when you need detailed instructions."),
 	)
 
 	session := openagent.Session{
-		ID:        "skill-demo-1",
-		UserID:    "user-1",
+		ID:     "skill-demo-1",
+		UserID: "user-1",
 
 		ModelID:   modelID,
 		CreatedAt: time.Now(),
 	}
 
 	ctx := context.Background()
-	result, err := agent.Run(ctx, session, openagent.UserMessage("请加载 example-skill 并按它的要求执行"))
+	result, err := kernel.New(cfg, kernel.Deps{SkillProvider: loader}).Run(ctx, session, openagent.UserMessage("请加载 example-skill 并按它的要求执行"))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 		os.Exit(1)

@@ -63,19 +63,22 @@ func main() {
 
 type eventPrinter struct{}
 
-func (p *eventPrinter) OnAgentMessage(text string)  { fmt.Print(text) }
-func (p *eventPrinter) OnAgentThought(text string)   { fmt.Printf("[thought] %s\n", text) }
+func (p *eventPrinter) OnAgentMessage(text string) { fmt.Print(text) }
+func (p *eventPrinter) OnAgentThought(text string) { fmt.Printf("[thought] %s\n", text) }
 func (p *eventPrinter) OnToolCall(tc openacp.ToolCallUpdate) {
 	switch tc.Status {
-	case "in_progress": fmt.Printf("[tool] %s(%v)\n", tc.Title, tc.RawInput)
-	case "completed":  fmt.Printf("[tool_result] %v\n", tc.RawOutput)
-	case "failed":     fmt.Printf("[tool_failed] %v\n", tc.RawOutput)
+	case "in_progress":
+		fmt.Printf("[tool] %s(%v)\n", tc.Title, tc.RawInput)
+	case "completed":
+		fmt.Printf("[tool_result] %v\n", tc.RawOutput)
+	case "failed":
+		fmt.Printf("[tool_failed] %v\n", tc.RawOutput)
 	}
 }
-func (p *eventPrinter) OnPlan(plan openacp.Plan)                             {}
+func (p *eventPrinter) OnPlan(plan openacp.Plan)                                  {}
 func (p *eventPrinter) OnAvailableCommandsUpdate(cmds []openacp.AvailableCommand) {}
-func (p *eventPrinter) OnModeUpdate(modeID openacp.SessionModeId)             {}
-func (p *eventPrinter) OnConfigOptionUpdate(opts []openacp.SessionConfigOption)  {}
-func (p *eventPrinter) OnUsageUpdate(used, total int, cost *openacp.Cost)     {}
-func (p *eventPrinter) OnSessionInfo(title string, metadata map[string]any)   {}
-func (p *eventPrinter) OnUserMessage(text string)                                {}
+func (p *eventPrinter) OnModeUpdate(modeID openacp.SessionModeId)                 {}
+func (p *eventPrinter) OnConfigOptionUpdate(opts []openacp.SessionConfigOption)   {}
+func (p *eventPrinter) OnUsageUpdate(used, total int, cost *openacp.Cost)         {}
+func (p *eventPrinter) OnSessionInfo(title string, metadata map[string]any)       {}
+func (p *eventPrinter) OnUserMessage(text string)                                 {}

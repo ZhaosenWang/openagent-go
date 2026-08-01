@@ -25,31 +25,14 @@ func (t *ACPTerminalCreate) Definition() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
 		Name:        "terminal_create",
 		Description: "Create a new terminal on the client's machine and start a command. Returns a terminal ID for use with terminal_output, terminal_wait, terminal_kill, and terminal_release.",
-		Parameters: json.RawMessage(`{
-  "type": "object",
-  "properties": {
-    "command":  { "type": "string", "description": "The command to execute." },
-    "args":     { "type": "array", "items": { "type": "string" }, "description": "Command arguments." },
-    "cwd":      { "type": "string", "description": "Working directory (must be absolute)." },
-    "outputByteLimit": { "type": "integer", "description": "Maximum bytes of output to retain." }
-  },
-  "required": ["command"]
-}`),
+		Parameters:  openagent.SchemaOf[AcpTerminalCreateParams](),
 	}
 }
 
-func (t *ACPTerminalCreate) Execute(ctx context.Context, args json.RawMessage) (string, error) {
-	var params struct {
-		Command         string   `json:"command"`
-		Args            []string `json:"args"`
-		Cwd             *string  `json:"cwd"`
-		OutputByteLimit *int     `json:"outputByteLimit"`
-	}
-	if err := json.Unmarshal(args, &params); err != nil {
-		return "", fmt.Errorf("terminal_create: %w", err)
-	}
-	if params.Command == "" {
-		return "", fmt.Errorf("terminal_create: command is required")
+func (t *ACPTerminalCreate) Execute(ctx context.Context, args json.RawMessage) *openagent.ToolResult {
+	params, err := openagent.ParseArgs[AcpTerminalCreateParams](args)
+	if err != nil {
+		return openagent.ErrorResult(fmt.Errorf("terminal_create: %w", err), false, "")
 	}
 
 	resp, err := t.client.CreateTerminal(ctx, openacp.CreateTerminalRequest{
@@ -60,9 +43,9 @@ func (t *ACPTerminalCreate) Execute(ctx context.Context, args json.RawMessage) (
 		OutputByteLimit: params.OutputByteLimit,
 	})
 	if err != nil {
-		return "", fmt.Errorf("terminal_create: %w", err)
+		return openagent.ErrorResult(fmt.Errorf("terminal_create: %w", err), false, "")
 	}
-	return "Terminal created. ID: " + resp.TerminalID, nil
+	return &openagent.ToolResult{Content: "Terminal created. ID: " + resp.TerminalID}
 }
 
 // ── ACPTerminalOutput ──
@@ -81,22 +64,14 @@ func (t *ACPTerminalOutput) Definition() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
 		Name:        "terminal_output",
 		Description: "Get the current output of a running terminal.",
-		Parameters: json.RawMessage(`{
-  "type": "object",
-  "properties": {
-    "terminalId": { "type": "string", "description": "The terminal ID returned by terminal_create." }
-  },
-  "required": ["terminalId"]
-}`),
+		Parameters:  openagent.SchemaOf[AcpTerminalOutputParams](),
 	}
 }
 
-func (t *ACPTerminalOutput) Execute(ctx context.Context, args json.RawMessage) (string, error) {
-	var params struct {
-		TerminalID string `json:"terminalId"`
-	}
-	if err := json.Unmarshal(args, &params); err != nil {
-		return "", fmt.Errorf("terminal_output: %w", err)
+func (t *ACPTerminalOutput) Execute(ctx context.Context, args json.RawMessage) *openagent.ToolResult {
+	params, err := openagent.ParseArgs[AcpTerminalOutputParams](args)
+	if err != nil {
+		return openagent.ErrorResult(fmt.Errorf("terminal_output: %w", err), false, "")
 	}
 
 	resp, err := t.client.TerminalOutput(ctx, openacp.TerminalOutputRequest{
@@ -104,12 +79,12 @@ func (t *ACPTerminalOutput) Execute(ctx context.Context, args json.RawMessage) (
 		TerminalID: params.TerminalID,
 	})
 	if err != nil {
-		return "", fmt.Errorf("terminal_output: %w", err)
+		return openagent.ErrorResult(fmt.Errorf("terminal_output: %w", err), false, "")
 	}
 	if resp.Truncated {
-		return resp.Output + "\n[output truncated]", nil
+		return &openagent.ToolResult{Content: resp.Output + "\n[output truncated]"}
 	}
-	return resp.Output, nil
+	return &openagent.ToolResult{Content: resp.Output}
 }
 
 // ── ACPTerminalWait ──
@@ -128,22 +103,14 @@ func (t *ACPTerminalWait) Definition() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
 		Name:        "terminal_wait",
 		Description: "Wait for a terminal command to finish and return its exit status.",
-		Parameters: json.RawMessage(`{
-  "type": "object",
-  "properties": {
-    "terminalId": { "type": "string", "description": "The terminal ID returned by terminal_create." }
-  },
-  "required": ["terminalId"]
-}`),
+		Parameters:  openagent.SchemaOf[AcpTerminalWaitParams](),
 	}
 }
 
-func (t *ACPTerminalWait) Execute(ctx context.Context, args json.RawMessage) (string, error) {
-	var params struct {
-		TerminalID string `json:"terminalId"`
-	}
-	if err := json.Unmarshal(args, &params); err != nil {
-		return "", fmt.Errorf("terminal_wait: %w", err)
+func (t *ACPTerminalWait) Execute(ctx context.Context, args json.RawMessage) *openagent.ToolResult {
+	params, err := openagent.ParseArgs[AcpTerminalWaitParams](args)
+	if err != nil {
+		return openagent.ErrorResult(fmt.Errorf("terminal_wait: %w", err), false, "")
 	}
 
 	resp, err := t.client.WaitForTerminalExit(ctx, openacp.WaitForTerminalExitRequest{
@@ -151,15 +118,15 @@ func (t *ACPTerminalWait) Execute(ctx context.Context, args json.RawMessage) (st
 		TerminalID: params.TerminalID,
 	})
 	if err != nil {
-		return "", fmt.Errorf("terminal_wait: %w", err)
+		return openagent.ErrorResult(fmt.Errorf("terminal_wait: %w", err), false, "")
 	}
 	if resp.ExitCode != nil {
-		return fmt.Sprintf("Command exited with code %d.", *resp.ExitCode), nil
+		return &openagent.ToolResult{Content: fmt.Sprintf("Command exited with code %d.", *resp.ExitCode)}
 	}
 	if resp.Signal != nil {
-		return fmt.Sprintf("Command terminated by signal: %s.", *resp.Signal), nil
+		return &openagent.ToolResult{Content: fmt.Sprintf("Command terminated by signal: %s.", *resp.Signal)}
 	}
-	return "Command finished.", nil
+	return &openagent.ToolResult{Content: "Command finished."}
 }
 
 // ── ACPTerminalKill ──
@@ -178,32 +145,24 @@ func (t *ACPTerminalKill) Definition() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
 		Name:        "terminal_kill",
 		Description: "Kill a running terminal command without releasing the terminal. Use terminal_output to get final output, then terminal_release to free resources.",
-		Parameters: json.RawMessage(`{
-  "type": "object",
-  "properties": {
-    "terminalId": { "type": "string", "description": "The terminal ID returned by terminal_create." }
-  },
-  "required": ["terminalId"]
-}`),
+		Parameters:  openagent.SchemaOf[AcpTerminalKillParams](),
 	}
 }
 
-func (t *ACPTerminalKill) Execute(ctx context.Context, args json.RawMessage) (string, error) {
-	var params struct {
-		TerminalID string `json:"terminalId"`
-	}
-	if err := json.Unmarshal(args, &params); err != nil {
-		return "", fmt.Errorf("terminal_kill: %w", err)
+func (t *ACPTerminalKill) Execute(ctx context.Context, args json.RawMessage) *openagent.ToolResult {
+	params, err := openagent.ParseArgs[AcpTerminalKillParams](args)
+	if err != nil {
+		return openagent.ErrorResult(fmt.Errorf("terminal_kill: %w", err), false, "")
 	}
 
-	_, err := t.client.KillTerminal(ctx, openacp.KillTerminalRequest{
+	_, err = t.client.KillTerminal(ctx, openacp.KillTerminalRequest{
 		SessionID:  t.sessionID,
 		TerminalID: params.TerminalID,
 	})
 	if err != nil {
-		return "", fmt.Errorf("terminal_kill: %w", err)
+		return openagent.ErrorResult(fmt.Errorf("terminal_kill: %w", err), false, "")
 	}
-	return "Command killed.", nil
+	return &openagent.ToolResult{Content: "Command killed."}
 }
 
 // ── ACPTerminalRelease ──
@@ -222,30 +181,45 @@ func (t *ACPTerminalRelease) Definition() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
 		Name:        "terminal_release",
 		Description: "Kill the terminal command (if still running) and release all resources. The terminal ID becomes invalid after this call.",
-		Parameters: json.RawMessage(`{
-  "type": "object",
-  "properties": {
-    "terminalId": { "type": "string", "description": "The terminal ID returned by terminal_create." }
-  },
-  "required": ["terminalId"]
-}`),
+		Parameters:  openagent.SchemaOf[AcpTerminalReleaseParams](),
 	}
 }
 
-func (t *ACPTerminalRelease) Execute(ctx context.Context, args json.RawMessage) (string, error) {
-	var params struct {
-		TerminalID string `json:"terminalId"`
-	}
-	if err := json.Unmarshal(args, &params); err != nil {
-		return "", fmt.Errorf("terminal_release: %w", err)
+func (t *ACPTerminalRelease) Execute(ctx context.Context, args json.RawMessage) *openagent.ToolResult {
+	params, err := openagent.ParseArgs[AcpTerminalReleaseParams](args)
+	if err != nil {
+		return openagent.ErrorResult(fmt.Errorf("terminal_release: %w", err), false, "")
 	}
 
-	_, err := t.client.ReleaseTerminal(ctx, openacp.ReleaseTerminalRequest{
+	_, err = t.client.ReleaseTerminal(ctx, openacp.ReleaseTerminalRequest{
 		SessionID:  t.sessionID,
 		TerminalID: params.TerminalID,
 	})
 	if err != nil {
-		return "", fmt.Errorf("terminal_release: %w", err)
+		return openagent.ErrorResult(fmt.Errorf("terminal_release: %w", err), false, "")
 	}
-	return "Terminal released.", nil
+	return &openagent.ToolResult{Content: "Terminal released."}
+}
+
+type AcpTerminalCreateParams struct {
+	Command         string   `json:"command" jsonschema:"description=The command to execute."`
+	Args            []string `json:"args,omitempty" jsonschema:"description=Command arguments."`
+	Cwd             *string  `json:"cwd,omitempty" jsonschema:"description=Working directory (must be absolute)."`
+	OutputByteLimit *int     `json:"outputByteLimit,omitempty" jsonschema:"description=Maximum bytes of output to retain."`
+}
+
+type AcpTerminalOutputParams struct {
+	TerminalID string `json:"terminalId" jsonschema:"description=The terminal ID returned by terminal_create."`
+}
+
+type AcpTerminalWaitParams struct {
+	TerminalID string `json:"terminalId" jsonschema:"description=The terminal ID returned by terminal_create."`
+}
+
+type AcpTerminalKillParams struct {
+	TerminalID string `json:"terminalId" jsonschema:"description=The terminal ID returned by terminal_create."`
+}
+
+type AcpTerminalReleaseParams struct {
+	TerminalID string `json:"terminalId" jsonschema:"description=The terminal ID returned by terminal_create."`
 }

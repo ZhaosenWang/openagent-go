@@ -10,11 +10,8 @@
 package mcp
 
 import (
-	"encoding/json"
-	"fmt"
-
-	openagent "github.com/yusheng-g/openagent-go"
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
+	openagent "github.com/yusheng-g/openagent-go"
 )
 
 // ToMCPTool converts an openagent FunctionDefinition to an MCP Tool.
@@ -28,14 +25,21 @@ func ToMCPTool(def openagent.FunctionDefinition) *mcpsdk.Tool {
 }
 
 // ToFunctionDefinition converts an MCP Tool to an openagent FunctionDefinition.
+// The MCP InputSchema (a JSON Schema map) is normalized into the neutral
+// Parameters model.
 func ToFunctionDefinition(t mcpsdk.Tool) (openagent.FunctionDefinition, error) {
-	params, err := json.Marshal(t.InputSchema)
-	if err != nil {
-		return openagent.FunctionDefinition{}, fmt.Errorf("mcp: marshal tool %q schema: %w", t.Name, err)
-	}
 	return openagent.FunctionDefinition{
 		Name:        t.Name,
 		Description: t.Description,
-		Parameters:  json.RawMessage(params),
+		Parameters:  openagent.ParametersFromMap(toMap(t.InputSchema)),
 	}, nil
+}
+
+// toMap type-asserts an arbitrary schema value (MCP InputSchema is any)
+// to a map; empty map when it isn't one.
+func toMap(v any) map[string]any {
+	if m, ok := v.(map[string]any); ok {
+		return m
+	}
+	return nil
 }

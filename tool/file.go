@@ -17,7 +17,7 @@ import (
 // validatePath resolves p against workDir into a safe absolute path.
 // Accepts both relative paths (joined with workDir) and absolute paths.
 // Resolves symlinks but does NOT enforce workspace boundaries —
-// that policy belongs to the [openagent.Approver].
+// that policy belongs to the sandbox and the governance policy chain.
 func validatePath(workDir, p string) (string, error) {
 	var abs string
 	var err error
@@ -42,12 +42,6 @@ func validatePath(workDir, p string) (string, error) {
 
 // ── ReadFile ──
 
-// isWithinWorkspace reports whether resolved (absolute, symlink-resolved) is
-// within workDir. Returns false if resolved escapes the workspace boundary.
-func isWithinWorkspace(workDir, resolved string) bool {
-	return resolved == workDir || strings.HasPrefix(resolved, workDir+string(os.PathSeparator))
-}
-
 // ReadFile reads a file from the sandbox workspace.
 type ReadFile struct {
 	workDir string
@@ -62,43 +56,14 @@ func (t *ReadFile) Definition() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
 		Name:        "read",
 		Description: "Read a file from the given path. Use line+limit to read a specific line range — combine with grep to locate a line number first, then read the surrounding context.",
-		Parameters: json.RawMessage(`{
-			"type": "object",
-			"properties": {
-				"path":  {"type": "string",  "description": "File path"},
-				"line":  {"type": "integer", "description": "Start line (1-based, default: 1). Use with limit to read a specific range."},
-				"limit": {"type": "integer", "description": "Max lines to read (default: all remaining). Use with line to read a window around a grep hit."}
-			},
-			"required": ["path"]
-		}`),
+		Parameters:  openagent.SchemaOf[ReadFileParams](),
 	}
 }
 
-func (t *ReadFile) CanSelfApprove(args json.RawMessage) bool {
-	var params struct {
-		Path string `json:"path"`
-	}
-	if err := json.Unmarshal(args, &params); err != nil || params.Path == "" {
-		return false
-	}
-	abs, err := validatePath(t.workDir, params.Path)
+func (t *ReadFile) Execute(ctx context.Context, args json.RawMessage) *openagent.ToolResult {
+	params, err := openagent.ParseArgs[ReadFileParams](args)
 	if err != nil {
-		return false
-	}
-	return isWithinWorkspace(t.workDir, abs) || isWithinArtifactDir(abs)
-}
-
-func (t *ReadFile) Execute(ctx context.Context, args json.RawMessage) (string, error) {
-	var params struct {
-		Path  string `json:"path"`
-		Line  int    `json:"line"`  // 1-based, 0 = default (1)
-		Limit int    `json:"limit"` // 0 = default (all)
-	}
-	if err := json.Unmarshal(args, &params); err != nil {
-		return "", fmt.Errorf("read: %w", err)
-	}
-	if params.Path == "" {
-		return "", fmt.Errorf("read: path is required")
+		return openagent.ErrorResult(fmt.Errorf("read: %w", err), false, "")
 	}
 	if params.Line < 0 {
 		params.Line = 0
@@ -109,19 +74,19 @@ func (t *ReadFile) Execute(ctx context.Context, args json.RawMessage) (string, e
 
 	abs, err := validatePath(t.workDir, params.Path)
 	if err != nil {
-		return "", err
+		return openagent.ErrorResult(err, false, "")
 	}
 	info, err := os.Stat(abs)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return "", fmt.Errorf("read: file not found: %s", params.Path)
+			return openagent.ErrorResult(fmt.Errorf("read: file not found: %s", params.Path), false, "")
 		}
-		return "", fmt.Errorf("read: %w", err)
+		return openagent.ErrorResult(fmt.Errorf("read: %w", err), false, "")
 	}
 
 	file, err := os.Open(abs)
 	if err != nil {
-		return "", fmt.Errorf("read: %w", err)
+		return openagent.ErrorResult(fmt.Errorf("read: %w", err), false, "")
 	}
 	defer file.Close()
 
@@ -129,8 +94,8 @@ func (t *ReadFile) Execute(ctx context.Context, args json.RawMessage) (string, e
 	peek := make([]byte, 512)
 	n, _ := file.Read(peek)
 	if n > 0 && isBinary(peek[:n]) {
-		return fmt.Sprintf("[binary file: %s, %d bytes, type: %s]",
-			params.Path, info.Size(), detectType(peek[:n])), nil
+		return &openagent.ToolResult{Content: fmt.Sprintf("[binary file: %s, %d bytes, type: %s]",
+			params.Path, info.Size(), detectType(peek[:n]))}
 	}
 	// Rewind to beginning.
 	file.Seek(0, 0)
@@ -158,11 +123,11 @@ func (t *ReadFile) Execute(ctx context.Context, args json.RawMessage) (string, e
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return "", fmt.Errorf("read: %w", err)
+		return openagent.ErrorResult(fmt.Errorf("read: %w", err), false, "")
 	}
 
 	if !hitOffset {
-		return fmt.Sprintf("[line %d is beyond end of file (%d lines)]", params.Line, lineNum), nil
+		return &openagent.ToolResult{Content: fmt.Sprintf("[line %d is beyond end of file (%d lines)]", params.Line, lineNum)}
 	}
 
 	result := out.String()
@@ -171,7 +136,7 @@ func (t *ReadFile) Execute(ctx context.Context, args json.RawMessage) (string, e
 			params.Line, params.Line+lineCount-1, lineNum, info.Size())
 		result = prefix + result
 	}
-	return result, nil
+	return &openagent.ToolResult{Content: result}
 }
 
 func isBinary(data []byte) bool {
@@ -219,58 +184,31 @@ func (t *WriteFile) Definition() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
 		Name:        "write",
 		Description: "Write content to a file. Creates parent directories as needed.",
-		Parameters: json.RawMessage(`{
-			"type": "object",
-			"properties": {
-				"path":    {"type": "string", "description": "File path"},
-				"content": {"type": "string", "description": "Content to write to the file"}
-			},
-			"required": ["path", "content"]
-		}`),
+		Parameters:  openagent.SchemaOf[WriteFileParams](),
 	}
 }
 
-func (t *WriteFile) CanSelfApprove(args json.RawMessage) bool {
-	var params struct {
-		Path string `json:"path"`
-	}
-	if err := json.Unmarshal(args, &params); err != nil || params.Path == "" {
-		return false
-	}
-	abs, err := validatePath(t.workDir, params.Path)
+func (t *WriteFile) Execute(ctx context.Context, args json.RawMessage) *openagent.ToolResult {
+	params, err := openagent.ParseArgs[WriteFileParams](args)
 	if err != nil {
-		return false
-	}
-	return isWithinWorkspace(t.workDir, abs) || isWithinArtifactDir(abs)
-}
-
-func (t *WriteFile) Execute(ctx context.Context, args json.RawMessage) (string, error) {
-	var params struct {
-		Path    string `json:"path"`
-		Content string `json:"content"`
-	}
-	if err := json.Unmarshal(args, &params); err != nil {
-		return "", fmt.Errorf("write: %w", err)
-	}
-	if params.Path == "" {
-		return "", fmt.Errorf("write: path is required")
+		return openagent.ErrorResult(fmt.Errorf("write: %w", err), false, "")
 	}
 
 	const maxSize = 10 * 1024 * 1024 // 10MB
 	if len(params.Content) > maxSize {
-		return "", fmt.Errorf("write: content too large (%d bytes, max %d)", len(params.Content), maxSize)
+		return openagent.ErrorResult(fmt.Errorf("write: content too large (%d bytes, max %d)", len(params.Content), maxSize), false, "")
 	}
 
 	abs, err := validatePath(t.workDir, params.Path)
 	if err != nil {
-		return "", err
+		return openagent.ErrorResult(err, false, "")
 	}
 
 	if err := os.MkdirAll(filepath.Dir(abs), 0755); err != nil {
-		return "", fmt.Errorf("write: %w", err)
+		return openagent.ErrorResult(fmt.Errorf("write: %w", err), false, "")
 	}
-	if err := os.WriteFile(abs, []byte(params.Content), 0644); err != nil {
-		return "", fmt.Errorf("write: %w", err)
+	if err := writeFilePreservingMode(abs, []byte(params.Content)); err != nil {
+		return openagent.ErrorResult(fmt.Errorf("write: %w", err), false, "")
 	}
 
 	info, _ := os.Stat(abs)
@@ -278,7 +216,7 @@ func (t *WriteFile) Execute(ctx context.Context, args json.RawMessage) (string, 
 	if info != nil {
 		size = info.Size()
 	}
-	return fmt.Sprintf("Wrote %s (%d bytes)", params.Path, size), nil
+	return &openagent.ToolResult{Content: fmt.Sprintf("Wrote %s (%d bytes)", params.Path, size)}
 }
 
 // ── ListDir ──
@@ -297,36 +235,15 @@ func (t *ListDir) Definition() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
 		Name:        "ls",
 		Description: "List files and directories at the given path.",
-		Parameters: json.RawMessage(`{
-			"type": "object",
-			"properties": {
-				"path": {"type": "string", "description": "Directory path"}
-			},
-			"required": ["path"]
-		}`),
+		Parameters:  openagent.SchemaOf[ListDirParams](),
 	}
 }
 
-func (t *ListDir) CanSelfApprove(args json.RawMessage) bool {
-	var params struct {
-		Path string `json:"path"`
-	}
-	json.Unmarshal(args, &params)
-	if params.Path == "" {
-		return true // default to workspace root is safe
-	}
-	abs, err := validatePath(t.workDir, params.Path)
+func (t *ListDir) Execute(ctx context.Context, args json.RawMessage) *openagent.ToolResult {
+	params, err := openagent.ParseArgs[ListDirParams](args)
 	if err != nil {
-		return false
+		return openagent.ErrorResult(fmt.Errorf("ls: %w", err), false, "")
 	}
-	return isWithinWorkspace(t.workDir, abs) || isWithinArtifactDir(abs)
-}
-
-func (t *ListDir) Execute(ctx context.Context, args json.RawMessage) (string, error) {
-	var params struct {
-		Path string `json:"path"`
-	}
-	json.Unmarshal(args, &params)
 
 	dir, err := validatePath(t.workDir, params.Path)
 	if err != nil {
@@ -334,13 +251,13 @@ func (t *ListDir) Execute(ctx context.Context, args json.RawMessage) (string, er
 		if params.Path == "" {
 			dir = t.workDir
 		} else {
-			return "", err
+			return openagent.ErrorResult(err, false, "")
 		}
 	}
 
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return "", fmt.Errorf("ls: %w", err)
+		return openagent.ErrorResult(fmt.Errorf("ls: %w", err), false, "")
 	}
 
 	type fileEntry struct {
@@ -380,7 +297,7 @@ func (t *ListDir) Execute(ctx context.Context, args json.RawMessage) (string, er
 	if len(files) == 0 {
 		b.WriteString("  (empty)\n")
 	}
-	return b.String(), nil
+	return &openagent.ToolResult{Content: b.String()}
 }
 
 // ── EditFile ──
@@ -399,71 +316,36 @@ func (t *EditFile) Definition() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
 		Name:        "edit",
 		Description: "Replace a string in a file. Finds old_text and replaces it with new_text. When replace_all is false (default), only the first match is replaced. Returns an error when old_text is not unique — use replace_all or make old_text more specific.",
-		Parameters: json.RawMessage(`{
-			"type": "object",
-			"properties": {
-				"path":        {"type": "string", "description": "File path"},
-				"old_text":    {"type": "string", "description": "Text to find and replace"},
-				"new_text":    {"type": "string", "description": "Replacement text"},
-				"replace_all": {"type": "boolean", "description": "Replace all occurrences (default: false)"}
-			},
-			"required": ["path", "old_text", "new_text"]
-		}`),
+		Parameters:  openagent.SchemaOf[EditFileParams](),
 	}
 }
 
-func (t *EditFile) CanSelfApprove(args json.RawMessage) bool {
-	var params struct {
-		Path string `json:"path"`
-	}
-	json.Unmarshal(args, &params)
-	if params.Path == "" {
-		return false
-	}
-	abs, err := validatePath(t.workDir, params.Path)
+func (t *EditFile) Execute(ctx context.Context, args json.RawMessage) *openagent.ToolResult {
+	params, err := openagent.ParseArgs[EditFileParams](args)
 	if err != nil {
-		return false
-	}
-	return isWithinWorkspace(t.workDir, abs) || isWithinArtifactDir(abs)
-}
-
-func (t *EditFile) Execute(ctx context.Context, args json.RawMessage) (string, error) {
-	var params struct {
-		Path       string `json:"path"`
-		OldText    string `json:"old_text"`
-		NewText    string `json:"new_text"`
-		ReplaceAll bool   `json:"replace_all"`
-	}
-	if err := json.Unmarshal(args, &params); err != nil {
-		return "", fmt.Errorf("edit: %w", err)
-	}
-	if params.Path == "" {
-		return "", fmt.Errorf("edit: path is required")
-	}
-	if params.OldText == "" {
-		return "", fmt.Errorf("edit: old_text is required")
+		return openagent.ErrorResult(fmt.Errorf("edit: %w", err), false, "")
 	}
 
 	abs, err := validatePath(t.workDir, params.Path)
 	if err != nil {
-		return "", err
+		return openagent.ErrorResult(err, false, "")
 	}
 
 	data, err := os.ReadFile(abs)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return "", fmt.Errorf("edit: file not found: %s", params.Path)
+			return openagent.ErrorResult(fmt.Errorf("edit: file not found: %s", params.Path), false, "")
 		}
-		return "", fmt.Errorf("edit: %w", err)
+		return openagent.ErrorResult(fmt.Errorf("edit: %w", err), false, "")
 	}
 
 	content := string(data)
 	count := strings.Count(content, params.OldText)
 	if count == 0 {
-		return "", fmt.Errorf("edit: old_text not found in %s", params.Path)
+		return openagent.ErrorResult(fmt.Errorf("edit: old_text not found in %s", params.Path), false, "")
 	}
 	if !params.ReplaceAll && count > 1 {
-		return "", fmt.Errorf("edit: old_text found %d times in %s — set replace_all to true or make old_text more specific", count, params.Path)
+		return openagent.ErrorResult(fmt.Errorf("edit: old_text found %d times in %s — set replace_all to true or make old_text more specific", count, params.Path), false, "")
 	}
 
 	n := 1
@@ -471,12 +353,51 @@ func (t *EditFile) Execute(ctx context.Context, args json.RawMessage) (string, e
 		n = count
 	}
 	newContent := strings.Replace(content, params.OldText, params.NewText, n)
-	if err := os.WriteFile(abs, []byte(newContent), 0644); err != nil {
-		return "", fmt.Errorf("edit: %w", err)
+	if err := writeFilePreservingMode(abs, []byte(newContent)); err != nil {
+		return openagent.ErrorResult(fmt.Errorf("edit: %w", err), false, "")
 	}
 
 	if params.ReplaceAll {
-		return fmt.Sprintf("Replaced %d occurrences in %s", count, params.Path), nil
+		return &openagent.ToolResult{Content: fmt.Sprintf("Replaced %d occurrences in %s", count, params.Path)}
 	}
-	return fmt.Sprintf("Replaced in %s", params.Path), nil
+	return &openagent.ToolResult{Content: fmt.Sprintf("Replaced in %s", params.Path)}
+}
+
+// writeFilePreservingMode writes content, keeping the target's existing
+// mode (Claude Code/Codex convention) — a fixed 0644 would strip
+// executable bits and 0600 permissions on edited files. New files use
+// 0644.
+func writeFilePreservingMode(path string, content []byte) error {
+	mode := os.FileMode(0644)
+	if info, err := os.Stat(path); err == nil {
+		mode = info.Mode()
+	}
+	return os.WriteFile(path, content, mode)
+}
+
+// ReadFileParams are the arguments to read.
+type ReadFileParams struct {
+	Path  string `json:"path" jsonschema:"description=File path"`
+	Line  int    `json:"line,omitempty" jsonschema:"description=Start line (1-based, default: 1). Use with limit to read a specific range."`
+	Limit int    `json:"limit,omitempty" jsonschema:"description=Max lines to read (default: all remaining). Use with line to read a window around a grep hit."`
+}
+
+// WriteFileParams are the arguments to write.
+type WriteFileParams struct {
+	Path    string `json:"path" jsonschema:"description=File path"`
+	Content string `json:"content" jsonschema:"description=Content to write to the file"`
+}
+
+// ListDirParams are the arguments to ls. Path is optional — empty lists
+// the workspace root.
+type ListDirParams struct {
+	Path string `json:"path,omitempty" jsonschema:"description=Directory path (default: workspace root)"`
+}
+
+// EditFileParams are the arguments to edit.
+type EditFileParams struct {
+	Path       string `json:"path" jsonschema:"description=File path"`
+	OldText    string `json:"old_text" jsonschema:"description=Text to find and replace"`
+	NewText    string `json:"new_text" jsonschema:"description=Replacement text"`
+	ReplaceAll bool   `json:"replace_all,omitempty" jsonschema:"description=Replace all occurrences (default: false)"`
 }

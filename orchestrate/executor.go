@@ -4,19 +4,21 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"sync"
 	"time"
 
 	openagent "github.com/yusheng-g/openagent-go"
+	"github.com/yusheng-g/openagent-go/agent"
 	"golang.org/x/sync/errgroup"
 )
 
 // executor runs a PlanDef to completion.
 type executor struct {
 	config     PlanConfig
-	agents     map[string]openagent.AgentRunner
-	agentInfos []openagent.AgentInfo
+	agents     map[string]agent.AgentRunner
+	agentInfos []agent.AgentInfo
 	model      openagent.Model // for summarisation
 	sessionID  string          // base session id for step isolation
 }
@@ -274,8 +276,10 @@ func (e *executor) executeStep(ctx context.Context, stepID string, state *PlanSt
 
 	sr := state.Results[stepID]
 	if sr == nil {
-		sr = &StepResult{Status: StepStatusPending}
-		state.Results[stepID] = sr
+		// executeBatches pre-seeds every step's result before the batch
+		// runs. Never write the map from a batch goroutine: concurrent
+		// map writes crash the runtime (fatal: concurrent map writes).
+		return &StepResult{Status: StepStatusFailed, Error: fmt.Sprintf("step %q not pre-seeded", stepID)}
 	}
 
 	maxRetries := step.MaxRetries
@@ -297,7 +301,7 @@ func (e *executor) executeStep(ctx context.Context, stepID string, state *PlanSt
 
 		// Isolated session so this step doesn't see other steps' internal history.
 		stepSession := openagent.Session{
-			ID:        e.sessionID + "/steps/" + stepID,
+			ID: e.sessionID + "/steps/" + stepID,
 
 			CreatedAt: time.Now(),
 		}
@@ -384,7 +388,7 @@ func (e *executor) executeStep(ctx context.Context, stepID string, state *PlanSt
 }
 
 // runStepStreaming forwards agent stream events to the plan event channel.
-func (e *executor) runStepStreaming(ctx context.Context, runner openagent.AgentRunner, session openagent.Session, prefix []openagent.Message, input openagent.Message, stepID string, eventCh chan<- PlanEvent) (*openagent.RunResult, error) {
+func (e *executor) runStepStreaming(ctx context.Context, runner agent.AgentRunner, session openagent.Session, prefix []openagent.Message, input openagent.Message, stepID string, eventCh chan<- PlanEvent) (*openagent.RunResult, error) {
 	ch := runner.RunStreamWithPrefix(ctx, session, prefix, input)
 	var result *openagent.RunResult
 	for evt := range ch {
@@ -606,6 +610,12 @@ func (e *executor) buildResult(def *PlanDef, state *PlanState, usage openagent.U
 }
 
 func (e *executor) replanAfterFailure(ctx context.Context, def *PlanDef, state *PlanState, failedID string) (*PlanDef, error) {
+	if e.model == nil {
+		// Auto-replan needs a model; without one, fail loudly instead of
+		// calling a nil interface (panic).
+		return nil, fmt.Errorf("auto-replan requires a model (configure WithModel)")
+	}
+
 	// Determine the affected subtree: the failed step + all transitive dependents.
 	affected := affectedSteps(def, failedID)
 
@@ -714,15 +724,34 @@ func (e *executor) replanAfterFailure(ctx context.Context, def *PlanDef, state *
 // It mirrors the Runner's retry logic: context cancellation is always permanent,
 // and non-RetryableError is permanent (the model/runner layer already classifies
 // transient errors via openagent.RetryableError).
+// isPermanentError reports whether a step failure should skip retry and go
+// straight to replan. Transient failures — RetryableError (rate-limit/5xx
+// wrapped by the model layer), timeouts, network errors — are retried up
+// to MaxRetries first; only deterministic failures (logic/argument errors)
+// are permanent. Timeouts were previously permanent, so a slow step (the
+// step-level deadline is re-created per retry, giving each attempt a full
+// window) or a flaky network skipped retry and triggered the much more
+// expensive replan instead.
 func isPermanentError(err error) bool {
 	if err == nil {
 		return false // no error is not permanent
 	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	if errors.Is(err, context.Canceled) {
+		// Parent cancelled — retrying cannot help.
 		return true
 	}
 	var re *openagent.RetryableError
-	return !errors.As(err, &re)
+	if errors.As(err, &re) {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return false
+	}
+	return true
 }
 
 // ── DAG helpers ──

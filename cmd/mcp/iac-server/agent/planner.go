@@ -5,7 +5,7 @@
 //   - Query cloud pricing via the BSS API and web search
 //   - Diagnose deployment errors and suggest fixes
 //
-// Skills (SKILL.md guides) are statically loaded via the SkillLoader and
+// Skills (SKILL.md guides) are statically loaded via the SkillProvider and
 // injected directly into each agent's system prompt — no runtime load_skill
 // tool call needed. The LLM browses reference files (examples, API swagger)
 // with standard read/grep/ls tools.
@@ -21,9 +21,14 @@ import (
 	"strings"
 
 	openagent "github.com/yusheng-g/openagent-go"
+	"github.com/yusheng-g/openagent-go/agent"
 	"github.com/yusheng-g/openagent-go/cmd/mcp/iac-server/provider"
+	ctxpkg "github.com/yusheng-g/openagent-go/context"
 	sloghooks "github.com/yusheng-g/openagent-go/hooks/slog"
 	"github.com/yusheng-g/openagent-go/iac"
+	"github.com/yusheng-g/openagent-go/kernel"
+	"github.com/yusheng-g/openagent-go/provider/skill"
+	"github.com/yusheng-g/openagent-go/session"
 	opentool "github.com/yusheng-g/openagent-go/tool"
 )
 
@@ -31,9 +36,10 @@ import (
 type Planner struct {
 	model           openagent.Model
 	cloud           provider.CloudProvider
-	loader          openagent.SkillLoader // loads skills from extracted skills dir
-	memory          openagent.Memory     // shared across calls, scoped by deployment_id
-	workDir         string               // cloud home dir (parent of skills/ and deployments/), workDir for read/grep/ls
+	loader          skill.Provider        // loads skills from extracted skills dir
+	memory          session.SessionStore  // conversation scoped by deployment_id
+	knowledge       ctxpkg.MemoryProvider // durable knowledge
+	workDir         string                // cloud home dir (parent of skills/ and deployments/), workDir for read/grep/ls
 	deploymentsDir  string
 	dryRun          bool
 	binaryMirrors   []string // terraform binary download mirrors
@@ -45,12 +51,13 @@ type Planner struct {
 // memory is shared across all LLM calls and scoped by deployment_id —
 // estimate_cost can see plan_deployment's reasoning, troubleshoot can see
 // prior attempts. nil disables memory (each call is isolated).
-func New(model openagent.Model, cloud provider.CloudProvider, loader openagent.SkillLoader, memory openagent.Memory, workDir, deploymentsDir string, dryRun bool, binaryMirrors, providerMirrors []string) *Planner {
+func New(model openagent.Model, cloud provider.CloudProvider, loader skill.Provider, memory session.SessionStore, knowledge ctxpkg.MemoryProvider, workDir, deploymentsDir string, dryRun bool, binaryMirrors, providerMirrors []string) *Planner {
 	return &Planner{
 		model:           model,
 		cloud:           cloud,
 		loader:          loader,
 		memory:          memory,
+		knowledge:       knowledge,
 		workDir:         workDir,
 		deploymentsDir:  deploymentsDir,
 		dryRun:          dryRun,
@@ -131,12 +138,9 @@ func (p *Planner) ProposeArchitecture(ctx context.Context, request string) (stri
 
 	progress("Loading deployment skill...", 0, 2)
 	skillBody := p.loadSkillBody(ctx, "huaweicloud-deploy")
-	agent := openagent.NewAgent("iac-architect",
-		openagent.WithModel(p.model),
-		openagent.WithTools(p.fileTools()...),
-		openagent.WithMemory(p.memory),
-		openagent.WithRunHooks(sloghooks.New(slog.Default()), newProgressHook()),
-		openagent.WithSystemPrompts(
+	cfg := agent.New("iac-architect",
+		agent.WithModel(p.model),
+		agent.WithSystemPrompts(
 			serverContext,
 			skillBody,
 			`You are a HuaweiCloud architecture expert. Your job is to RECOMMEND an architecture, NOT write .tf files.
@@ -171,12 +175,19 @@ Return JSON:
 }
 `+"```"+`
 If information is incomplete, return questions instead of architecture.`),
-		openagent.WithMaxTurns(5),
+		agent.WithMaxTurns(5),
 	)
+	rt := kernel.New(cfg, kernel.Deps{
+		Tools:          p.fileTools(),
+		SessionStore:   p.memory,
+		Compressor:     ctxpkg.CompressorOf(p.memory),
+		MemoryProvider: p.knowledge,
+		Hooks:          openagent.MultiHooks(sloghooks.New(slog.Default()), newProgressHook()),
+	})
 
 	progress("Analyzing deployment request...", 1, 2)
 	session := openagent.Session{ID: sessionID(depID)}
-	result, err := agent.Run(ctx, session, openagent.UserMessage(request))
+	result, err := rt.Run(ctx, session, openagent.UserMessage(request))
 	if err != nil {
 		os.RemoveAll(dir)
 		return "", fmt.Errorf("propose_architecture: LLM run: %w", err)
@@ -243,12 +254,9 @@ func (p *Planner) SpecifyResources(ctx context.Context, deploymentID, adjustment
 
 	progress("Loading deployment skill...", 0, 3)
 	skillBody := p.loadSkillBody(ctx, "huaweicloud-deploy")
-	agent := openagent.NewAgent("iac-specifier",
-		openagent.WithModel(p.model),
-		openagent.WithTools(p.fileTools()...),
-		openagent.WithMemory(p.memory),
-		openagent.WithRunHooks(sloghooks.New(slog.Default()), newProgressHook()),
-		openagent.WithSystemPrompts(
+	cfg := agent.New("iac-specifier",
+		agent.WithModel(p.model),
+		agent.WithSystemPrompts(
 			serverContext,
 			skillBody,
 			`You are a HuaweiCloud resource specification expert. Your job is to determine concrete resource specs for a proposed architecture.
@@ -278,8 +286,15 @@ Return JSON:
 }
 `+"```"+`
 `),
-		openagent.WithMaxTurns(8),
+		agent.WithMaxTurns(8),
 	)
+	rt := kernel.New(cfg, kernel.Deps{
+		Tools:          p.fileTools(),
+		SessionStore:   p.memory,
+		Compressor:     ctxpkg.CompressorOf(p.memory),
+		MemoryProvider: p.knowledge,
+		Hooks:          openagent.MultiHooks(sloghooks.New(slog.Default()), newProgressHook()),
+	})
 
 	progress("Determining resource specs...", 1, 3)
 	session := openagent.Session{ID: sessionID(deploymentID)}
@@ -289,7 +304,7 @@ Return JSON:
 		userMsg += "\n\nUser adjustments: " + adjustments
 	}
 
-	result, err := agent.Run(ctx, session, openagent.UserMessage(userMsg))
+	result, err := rt.Run(ctx, session, openagent.UserMessage(userMsg))
 	if err != nil {
 		return "", fmt.Errorf("specify_resources: LLM run: %w", err)
 	}
@@ -301,7 +316,7 @@ Return JSON:
 
 	var spec struct {
 		Resources []map[string]any `json:"resources"`
-		Reasoning string          `json:"reasoning"`
+		Reasoning string           `json:"reasoning"`
 	}
 	if err := json.Unmarshal([]byte(raw), &spec); err != nil {
 		return "", fmt.Errorf("specify_resources: parse: %w (raw=%q)", err, raw)
@@ -337,12 +352,9 @@ func (p *Planner) GeneratePlan(ctx context.Context, deploymentID string) (string
 
 	progress("Loading deployment skill...", 0, 4)
 	skillBody := p.loadSkillBody(ctx, "huaweicloud-deploy")
-	agent := openagent.NewAgent("iac-planner",
-		openagent.WithModel(p.model),
-		openagent.WithTools(p.fileTools()...),
-		openagent.WithMemory(p.memory),
-		openagent.WithRunHooks(sloghooks.New(slog.Default()), newProgressHook()),
-		openagent.WithSystemPrompts(
+	cfg := agent.New("iac-planner",
+		agent.WithModel(p.model),
+		agent.WithSystemPrompts(
 			serverContext,
 			skillBody,
 			`You are a HuaweiCloud terraform configuration expert. Generate .tf files based on the architecture and resource specs from the conversation history.
@@ -371,8 +383,15 @@ Return JSON:
   "reasoning": "why these .tf configs were generated"
 }
 `+"```"+``),
-		openagent.WithMaxTurns(10),
+		agent.WithMaxTurns(10),
 	)
+	rt := kernel.New(cfg, kernel.Deps{
+		Tools:          p.fileTools(),
+		SessionStore:   p.memory,
+		Compressor:     ctxpkg.CompressorOf(p.memory),
+		MemoryProvider: p.knowledge,
+		Hooks:          openagent.MultiHooks(sloghooks.New(slog.Default()), newProgressHook()),
+	})
 
 	session := openagent.Session{ID: sessionID(deploymentID)}
 	msg := openagent.UserMessage("Generate terraform .tf files based on the architecture and resource specs from the conversation history.")
@@ -380,7 +399,7 @@ Return JSON:
 	var reasoning string
 	for attempt := 0; attempt < 3; attempt++ {
 		progress(fmt.Sprintf("Generating .tf files (attempt %d/3)...", attempt+1), float64(attempt), 3)
-		result, err := agent.Run(ctx, session, msg)
+		result, err := rt.Run(ctx, session, msg)
 		if err != nil {
 			return "", fmt.Errorf("generate_plan: LLM run (attempt %d): %w", attempt+1, err)
 		}
@@ -540,12 +559,9 @@ func (p *Planner) EstimateCost(ctx context.Context, deploymentID string) (string
 
 	skillBody := p.loadSkillBody(ctx, "huaweicloud-bss")
 	progress("Loading pricing skill...", 1, 3)
-	agent := openagent.NewAgent("iac-pricing",
-		openagent.WithModel(p.model),
-		openagent.WithTools(p.fileTools()...),
-		openagent.WithMemory(p.memory),
-		openagent.WithRunHooks(sloghooks.New(slog.Default()), newProgressHook()),
-		openagent.WithSystemPrompts(
+	cfg := agent.New("iac-pricing",
+		agent.WithModel(p.model),
+		agent.WithSystemPrompts(
 			serverContext,
 			skillBody,
 			"You are a HuaweiCloud pricing expert. "+
@@ -556,8 +572,15 @@ func (p *Planner) EstimateCost(ctx context.Context, deploymentID string) (string
 				"Query the monthly price for each resource. "+
 				"Mark prices that cannot be determined as null — do NOT fabricate. "+
 				"Return {\"items\": [{\"resource\": \"...\", \"spec\": \"...\", \"monthly\": price or null}], \"total_monthly\": ... or null, \"currency\": \"CNY\", \"note\": \"...\"}."),
-		openagent.WithMaxTurns(8),
+		agent.WithMaxTurns(8),
 	)
+	rt := kernel.New(cfg, kernel.Deps{
+		Tools:          p.fileTools(),
+		SessionStore:   p.memory,
+		Compressor:     ctxpkg.CompressorOf(p.memory),
+		MemoryProvider: p.knowledge,
+		Hooks:          openagent.MultiHooks(sloghooks.New(slog.Default()), newProgressHook()),
+	})
 
 	var userMsg string
 	if hasSpecs {
@@ -568,7 +591,7 @@ func (p *Planner) EstimateCost(ctx context.Context, deploymentID string) (string
 
 	session := openagent.Session{ID: sessionID(deploymentID)}
 	progress("Querying cloud pricing...", 2, 3)
-	result, err := agent.Run(ctx, session, openagent.UserMessage(userMsg))
+	result, err := rt.Run(ctx, session, openagent.UserMessage(userMsg))
 	if err != nil {
 		return "", fmt.Errorf("estimate_cost: LLM run: %w", err)
 	}
@@ -576,8 +599,8 @@ func (p *Planner) EstimateCost(ctx context.Context, deploymentID string) (string
 	// Parse the LLM output and add deployment_id.
 	raw := extractJSON(result.FinalOutput)
 	var cost struct {
-		Items        []any `json:"items"`
-		TotalMonthly any   `json:"total_monthly"`
+		Items        []any  `json:"items"`
+		TotalMonthly any    `json:"total_monthly"`
 		Currency     string `json:"currency"`
 		Note         string `json:"note"`
 	}
@@ -614,12 +637,9 @@ func (p *Planner) Troubleshoot(ctx context.Context, deploymentID, errorMsg strin
 
 	skillBody := p.loadSkillBody(ctx, "huaweicloud-troubleshoot")
 	progress("Loading troubleshoot skill...", 0, 2)
-	agent := openagent.NewAgent("iac-troubleshooter",
-		openagent.WithModel(p.model),
-		openagent.WithTools(p.fileTools()...),
-		openagent.WithMemory(p.memory),
-		openagent.WithRunHooks(sloghooks.New(slog.Default()), newProgressHook()),
-		openagent.WithSystemPrompts(
+	cfg := agent.New("iac-troubleshooter",
+		agent.WithModel(p.model),
+		agent.WithSystemPrompts(
 			serverContext,
 			skillBody,
 			"You are a HuaweiCloud infrastructure troubleshooting expert. "+
@@ -628,8 +648,15 @@ func (p *Planner) Troubleshoot(ctx context.Context, deploymentID, errorMsg strin
 				"You are given the error message and the .tf files that failed. "+
 				"Diagnose the root cause and suggest specific fixes. "+
 				"Return {\"diagnosis\": \"...\", \"suggestion\": \"...\", \"alternatives\": [\"...\", ...]}."),
-		openagent.WithMaxTurns(8),
+		agent.WithMaxTurns(8),
 	)
+	rt := kernel.New(cfg, kernel.Deps{
+		Tools:          p.fileTools(),
+		SessionStore:   p.memory,
+		Compressor:     ctxpkg.CompressorOf(p.memory),
+		MemoryProvider: p.knowledge,
+		Hooks:          openagent.MultiHooks(sloghooks.New(slog.Default()), newProgressHook()),
+	})
 
 	// user message = dynamic content (error + .tf file path + .tf files)
 	// Include the deployment directory path (relative to workDir) so the
@@ -643,7 +670,7 @@ func (p *Planner) Troubleshoot(ctx context.Context, deploymentID, errorMsg strin
 
 	session := openagent.Session{ID: sessionID(deploymentID)}
 	progress("Diagnosing error...", 1, 2)
-	result, err := agent.Run(ctx, session, openagent.UserMessage(userMsg))
+	result, err := rt.Run(ctx, session, openagent.UserMessage(userMsg))
 	if err != nil {
 		return "", fmt.Errorf("troubleshoot: LLM run: %w", err)
 	}
@@ -667,19 +694,15 @@ func (p *Planner) Troubleshoot(ctx context.Context, deploymentID, errorMsg strin
 
 // QueryCloud answers read-only queries about existing cloud resources, specs,
 // bills, or quotas. Unlike the other 4 agents, this one uses dynamic skill
-// loading (WithSkillLoader) — the LLM sees the skill catalog and calls
+// loading (SkillProvider) — the LLM sees the skill catalog and calls
 // load_skill to load the relevant cloud-service skill on demand.
 func (p *Planner) QueryCloud(ctx context.Context, query string) (string, error) {
 	progress := openagent.ProgressFromContext(ctx)
 
 	progress("Setting up query agent...", 0, 2)
-	agent := openagent.NewAgent("iac-queryer",
-		openagent.WithModel(p.model),
-		openagent.WithTools(p.fileTools()...),
-		openagent.WithMemory(p.memory),
-		openagent.WithRunHooks(sloghooks.New(slog.Default()), newProgressHook()),
-		openagent.WithSkillLoader(p.loader),
-		openagent.WithSystemPrompts(
+	cfg := agent.New("iac-queryer",
+		agent.WithModel(p.model),
+		agent.WithSystemPrompts(
 			serverContext,
 			"You are a HuaweiCloud cloud query expert. "+
 				"Use load_skill to load the relevant skill for the cloud service being queried "+
@@ -690,12 +713,20 @@ func (p *Planner) QueryCloud(ctx context.Context, query string) (string, error) 
 				"CRITICAL: Only call read-only APIs (List/Show/Get). NEVER call Create/Update/Delete APIs — "+
 				"this tool is for querying existing resources only, not for creating or modifying them. "+
 				"Return {\"results\": [...], \"note\": \"...\"}."),
-		openagent.WithMaxTurns(10),
+		agent.WithMaxTurns(10),
 	)
+	rt := kernel.New(cfg, kernel.Deps{
+		Tools:          p.fileTools(),
+		SessionStore:   p.memory,
+		Compressor:     ctxpkg.CompressorOf(p.memory),
+		MemoryProvider: p.knowledge,
+		SkillProvider:  p.loader,
+		Hooks:          openagent.MultiHooks(sloghooks.New(slog.Default()), newProgressHook()),
+	})
 
 	session := openagent.Session{ID: "query"}
 	progress("Querying cloud resources...", 1, 2)
-	result, err := agent.Run(ctx, session, openagent.UserMessage(query))
+	result, err := rt.Run(ctx, session, openagent.UserMessage(query))
 	if err != nil {
 		return "", fmt.Errorf("query_cloud: LLM run: %w", err)
 	}

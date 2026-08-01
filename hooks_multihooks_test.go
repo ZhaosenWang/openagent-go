@@ -10,8 +10,8 @@ import (
 // hrecord is a minimal RunHooks that records calls and carries a per-start
 // state through to its End so we can assert the MultiHooks state pairing.
 type hrecord struct {
-	name    string
-	ends    []string // states seen by OnToolEnd, "state-i"
+	name      string
+	ends      []string // states seen by OnToolEnd, "state-i"
 	discarded bool
 }
 
@@ -23,7 +23,7 @@ func (h *hrecord) OnAgentEnd(context.Context, ChatCompletionRequest, *ChatComple
 func (h *hrecord) OnToolStart(context.Context, FunctionDefinition, json.RawMessage) (any, error) {
 	return h.name + ":tool-start", nil
 }
-func (h *hrecord) OnToolEnd(_ context.Context, _ FunctionDefinition, _ json.RawMessage, result *string, _ *error, startState any) {
+func (h *hrecord) OnToolEnd(_ context.Context, _ FunctionDefinition, _ json.RawMessage, result *ToolResult, startState any) {
 	if startState == nil {
 		h.discarded = true
 		return
@@ -31,7 +31,7 @@ func (h *hrecord) OnToolEnd(_ context.Context, _ FunctionDefinition, _ json.RawM
 	s, _ := startState.(string)
 	h.ends = append(h.ends, s)
 	if result != nil {
-		*result = *result + "<" + s + ">"
+		result.Content = result.Content + "<" + s + ">"
 	}
 }
 
@@ -54,8 +54,8 @@ func TestMultiHooks_StatePairing(t *testing.T) {
 		t.Fatalf("startState = %T %v, want []any len=2", startState, startState)
 	}
 
-	var result string
-	mh.OnToolEnd(context.Background(), *ss, nil, &result, nil, startState)
+	result := &ToolResult{Content: ""}
+	mh.OnToolEnd(context.Background(), *ss, nil, result, startState)
 
 	if a.discarded || b.discarded {
 		t.Fatal("a hook state was discarded (nil) — MultiHooks dropped state")
@@ -67,8 +67,8 @@ func TestMultiHooks_StatePairing(t *testing.T) {
 		t.Fatalf("hook b ends = %v, want [b:tool-start]", b.ends)
 	}
 	// Each hook saw ITS OWN state, not the sibling's, and in list order.
-	if !strings.Contains(result, "<a:tool-start>") || !strings.Contains(result, "<b:tool-start>") {
-		t.Fatalf("result = %q, expected both a and b states applied", result)
+	if !strings.Contains(result.Content, "<a:tool-start>") || !strings.Contains(result.Content, "<b:tool-start>") {
+		t.Fatalf("result = %q, expected both a and b states applied", result.Content)
 	}
 }
 

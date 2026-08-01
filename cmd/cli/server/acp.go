@@ -9,6 +9,7 @@ import (
 	openagent "github.com/yusheng-g/openagent-go"
 	"github.com/yusheng-g/openagent-go/acp"
 	openacpsdk "github.com/yusheng-g/openagent-go/acp/sdk"
+	"github.com/yusheng-g/openagent-go/agent"
 	"github.com/yusheng-g/openagent-go/keyring"
 	"github.com/yusheng-g/openagent-go/sandbox/native"
 	"github.com/yusheng-g/openagent-go/summarizer"
@@ -18,6 +19,7 @@ import (
 	"github.com/yusheng-g/openagent-go/plugin/wasmhost"
 
 	"github.com/yusheng-g/openagent-go/cmd/cli/config"
+	ctxpkg "github.com/yusheng-g/openagent-go/context"
 )
 
 // RunACP starts the agent in ACP mode over stdio.
@@ -29,9 +31,9 @@ import (
 //  4. Wire summarizer for long-conversation compression.
 //  5. Construct the agent.
 //  6. Wrap in AgentServer, launch ACP protocol mux on stdin/stdout.
-func RunACP(ctx context.Context, cfg *config.Config, caps Capabilities) error {
+func RunACP(ctx context.Context, cfg *config.Config, caps config.Capabilities) error {
 	profilesDir := resolveProfilesDir(cfg.Profiles)
-	mem, sessionStore, cleanup, err := buildMemory(profilesDir)
+	ms, knowledge, sessionStore, cleanup, err := buildMemory(profilesDir, cfg.Embedding, caps.OnEmbedder())
 	if err != nil {
 		return err
 	}
@@ -58,33 +60,65 @@ func RunACP(ctx context.Context, cfg *config.Config, caps Capabilities) error {
 		firstM = modelInfos[0].Model
 	}
 
-	// Tools and sandbox are created per-turn in agentForTurn so they
-	// use the session's cwd rather than the process working directory.
-	opts := []openagent.AgentOption{
-		openagent.WithSystemPrompts(resolveProfiles(cfg.Profiles, "")...),
-		openagent.WithMaxTurns(100),
+	// Tools and sandbox are created once per session (buildRuntimeForSession)
+	// scoped to the session's cwd. Agent configuration is pure (model,
+	// prompts, limits, guards, skills); runtime capabilities live in
+	// kernel.Deps.
+	opts := []agent.Option{
+		agent.WithSystemPrompts(resolveProfiles(cfg.Profiles, "")...),
+		agent.WithMaxTurns(100),
 	}
-	if caps.OnMemory() {
-		opts = append(opts, openagent.WithMemory(mem))
-	}
-	opts = buildOpts(opts, caps, firstM, cfg.Sensitive)
-	agent := openagent.NewAgent("openagent", opts...)
+	opts, skillProvider := buildOpts(opts, caps, firstM)
+	agentCfg := agent.New("openagent", opts...)
 
-	if caps.OnMemory() && caps.OnSummarizer() && firstM != nil {
-		mem.WithSummarizer(summarizer.New(firstM).WithMaxTokens(agent.MaxCompressedTokens))
-	}
-
+	deps := buildRuntimeDeps(caps, cfg.Sensitive)
+	deps.SkillProvider = skillProvider
 	// Pass nil Mem when --memory=off so the AgentServer skips history
 	// replay and memory cleanup (all s.Mem uses are nil-guarded). The
 	// sessionStore (session metadata) is separate and unaffected.
-	var serverMem openagent.Memory = mem
-	if !caps.OnMemory() {
-		serverMem = nil
+	if caps.OnMemory() {
+		deps.SessionStore = ms
+		deps.Compressor = ms
+		deps.MemoryProvider = knowledge
+		// One shared background extractor per server (never per run).
+		if firstM != nil {
+			deps.Extractor = ctxpkg.NewAsyncExtractor(ctxpkg.NewLLMExtractor(firstM, knowledge))
+		}
 	}
-	srv := acp.NewAgentServer(agent, serverMem, sessionStore, modelMap)
+
+	if caps.OnMemory() && caps.OnSummarizer() && firstM != nil {
+		ms.WithSummarizer(summarizer.New(firstM).WithMaxTokens(agentCfg.MaxCompressedTokens))
+	}
+
+	// Plugin manager — loads agent:tools and agent:observers plugins.
+	// Discover before constructing the server so a plugin observer can be
+	// merged into deps.Observer before the AgentServer snapshots it.
+	var pluginMgr *wasm.Manager
+	pluginDir := filepath.Join(profilesDir, "plugins")
+	mgr := wasm.NewManager(pluginDir).WithHostAPI(wasmhost.NewHostAPI(keyring.NewKeyring()))
+	if err := mgr.Discover(ctx); err != nil {
+		slog.Warn("plugin discover failed", "error", err)
+	} else {
+		pluginMgr = mgr
+		if obs := mgr.Observer(); obs != nil {
+			if deps.Observer != nil {
+				deps.Observer = openagent.MultiObserver(deps.Observer, obs)
+			} else {
+				deps.Observer = obs
+			}
+			slog.Info("plugin observer wired", "source", "wasm")
+		}
+	}
+
+	if err := applyContextProviders(cfg, &deps); err != nil {
+		return err
+	}
+	srv := acp.NewAgentServer(agentCfg, deps, sessionStore, modelMap)
 	srv.AgentName = version.Name
 	srv.AgentVersion = version.Version
 	srv.MCPEnabled = caps.OnMCP()
+	srv.DefaultMode = cfg.DefaultMode
+	srv.PluginMgr = pluginMgr
 	srv.ProfileResolver = func(cwd string) []string {
 		return resolveProfiles(cfg.Profiles, cwd)
 	}
@@ -96,23 +130,6 @@ func RunACP(ctx context.Context, cfg *config.Config, caps Capabilities) error {
 			key = mi.Provider + "/" + mi.ID
 		}
 		srv.RegisterModel(key, mi.Provider, mi.ID, mi.APIKey, mi.BaseURL)
-	}
-
-	// Plugin manager — loads agent:tools, agent:observers, agent:sessions.
-	pluginDir := filepath.Join(profilesDir, "plugins")
-	mgr := wasm.NewManager(pluginDir).WithHostAPI(wasmhost.NewHostAPI(keyring.NewKeyring()))
-	if err := mgr.Discover(ctx); err != nil {
-		slog.Warn("plugin discover failed", "error", err)
-	} else {
-		srv.PluginMgr = mgr
-		if obs := mgr.Observer(); obs != nil {
-			if agent.Observer != nil {
-				agent.Observer = openagent.MultiObserver(agent.Observer, obs)
-			} else {
-				agent.Observer = obs
-			}
-			slog.Info("plugin observer wired", "source", "wasm")
-		}
 	}
 
 	policy := sandboxPolicy(cfg.Sandbox)
@@ -128,21 +145,22 @@ func RunACP(ctx context.Context, cfg *config.Config, caps Capabilities) error {
 	server.SetLogger(slog.Default())
 
 	// Channel agent: clone the template and inject a default Model + Tools
-	// so the IM bot can run standalone (ACP path injects Model per-turn in
-	// agentForTurn, but channels call agent.RunStream() directly).
-	channelAgent := agent.Clone()
+	// so the IM bot can run standalone (the ACP path resolves the model per
+	// session, but channels call kernel.New(...).RunStream directly).
+	channelCfg := agentCfg.Clone()
 	for _, mi := range modelInfos {
 		if mi.Model != nil {
-			channelAgent.Model = mi.Model
+			channelCfg.Model = mi.Model
 			break
 		}
 	}
+	channelDeps := deps
 	cwd, _ := os.Getwd()
 	if sb, err := native.NewWithPolicy(cwd, policy); err == nil {
-		channelAgent.Tools = buildTools(sb, cwd, []string{"shell", "read", "write", "ls", "grep", "websearch", "webfetch"})
+		channelDeps.Tools = buildTools(sb, cwd, []string{"shell", "read", "write", "ls", "grep", "websearch", "webfetch"})
 	}
 
-	if err := RunChannels(ctx, channelAgent, cfg.Channels); err != nil {
+	if err := RunChannels(ctx, channelCfg, channelDeps, cfg.Channels); err != nil {
 		slog.Warn("channel error", "error", err)
 	}
 

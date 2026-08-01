@@ -12,8 +12,8 @@ import (
 	"sync"
 	"sync/atomic"
 
-	openagent "github.com/yusheng-g/openagent-go"
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
+	openagent "github.com/yusheng-g/openagent-go"
 )
 
 // Client connects to an external MCP server and imports its tools.
@@ -34,7 +34,7 @@ type Client struct {
 var (
 	progressMu  sync.Mutex
 	progressLog = make(map[string]string) // token → tool name
-	progressCtr int64                  // monotonic token counter
+	progressCtr int64                     // monotonic token counter
 )
 
 // NewClient creates an MCP [Client] with the given implementation identity.
@@ -230,12 +230,12 @@ func (a *mcpToolAdapter) Definition() openagent.FunctionDefinition {
 	return a.def
 }
 
-func (a *mcpToolAdapter) Execute(ctx context.Context, args json.RawMessage) (string, error) {
+func (a *mcpToolAdapter) Execute(ctx context.Context, args json.RawMessage) *openagent.ToolResult {
 	// Unmarshal arguments to map[string]any (MCP CallToolParams expects this).
 	var v map[string]any
 	if len(args) > 0 {
 		if err := json.Unmarshal(args, &v); err != nil {
-			return "", fmt.Errorf("mcp: unmarshal args: %w", err)
+			return openagent.ErrorResult(fmt.Errorf("mcp: unmarshal args: %w", err), false, "")
 		}
 	}
 
@@ -259,15 +259,18 @@ func (a *mcpToolAdapter) Execute(ctx context.Context, args json.RawMessage) (str
 		Meta:      mcpsdk.Meta{"progressToken": token},
 	})
 	if err != nil {
-		return "", fmt.Errorf("mcp call tool %q: %w", a.def.Name, err)
+		return openagent.ErrorResult(fmt.Errorf("mcp call tool %q: %w", a.def.Name, err), false, "")
 	}
 
 	// Extract text content from the result.
 	text := extractText(result.Content)
 	if result.IsError {
-		return text, fmt.Errorf("%s", text)
+		return &openagent.ToolResult{
+			Content: text,
+			Error:   &openagent.ToolError{Message: text, Code: "mcp_error"},
+		}
 	}
-	return text, nil
+	return &openagent.ToolResult{Content: text}
 }
 
 // extractText concatenates all TextContent from an MCP result.
@@ -283,5 +286,3 @@ func extractText(contents []mcpsdk.Content) string {
 	}
 	return out
 }
-
-

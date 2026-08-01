@@ -45,6 +45,9 @@ func (h *HostAPI) RegisterHostModule(ctx context.Context, rt wazero.Runtime) err
 		// ── keyring_get → {"value": "...", "error": ""} ──
 		NewFunctionBuilder().
 		WithFunc(func(ctx context.Context, mod api.Module, svcPtr, svcLen, keyPtr, keyLen uint32) uint64 {
+			if h.denied("keyring_get") {
+				return writeJSON(ctx, mod, map[string]string{"error": "export keyring_get disabled"})
+			}
 			if h.Keyring == nil {
 				return writeJSON(ctx, mod, map[string]string{"error": "keyring not available"})
 			}
@@ -61,6 +64,9 @@ func (h *HostAPI) RegisterHostModule(ctx context.Context, rt wazero.Runtime) err
 		// ── keyring_set → {"error": ""} ──
 		NewFunctionBuilder().
 		WithFunc(func(ctx context.Context, mod api.Module, svcPtr, svcLen, keyPtr, keyLen, valPtr, valLen uint32) uint64 {
+			if h.denied("keyring_set") {
+				return writeJSON(ctx, mod, map[string]string{"error": "export keyring_set disabled"})
+			}
 			if h.Keyring == nil {
 				return writeJSON(ctx, mod, map[string]string{"error": "keyring not available"})
 			}
@@ -77,6 +83,9 @@ func (h *HostAPI) RegisterHostModule(ctx context.Context, rt wazero.Runtime) err
 		// ── keyring_delete → {"error": ""} ──
 		NewFunctionBuilder().
 		WithFunc(func(ctx context.Context, mod api.Module, svcPtr, svcLen, keyPtr, keyLen uint32) uint64 {
+			if h.denied("keyring_delete") {
+				return writeJSON(ctx, mod, map[string]string{"error": "export keyring_delete disabled"})
+			}
 			if h.Keyring == nil {
 				return writeJSON(ctx, mod, map[string]string{"error": "keyring not available"})
 			}
@@ -96,6 +105,9 @@ func (h *HostAPI) RegisterHostModule(ctx context.Context, rt wazero.Runtime) err
 			urlPtr, urlLen uint32,
 			headersPtr, headersLen uint32,
 			bodyPtr, bodyLen uint32) uint64 {
+			if h.denied("http_request") {
+				return writeJSON(ctx, mod, map[string]string{"error": "export http_request disabled"})
+			}
 
 			if h.HTTP == nil {
 				return writeJSON(ctx, mod, map[string]string{"error": "http not available"})
@@ -127,6 +139,9 @@ func (h *HostAPI) RegisterHostModule(ctx context.Context, rt wazero.Runtime) err
 		// ── fs_read → {"data": "<base64>", "error": ""} ──
 		NewFunctionBuilder().
 		WithFunc(func(ctx context.Context, mod api.Module, pathPtr, pathLen uint32) uint64 {
+			if h.denied("fs_read") {
+				return writeJSON(ctx, mod, map[string]string{"error": "export fs_read disabled"})
+			}
 			if h.FS == nil {
 				return writeJSON(ctx, mod, map[string]string{"error": "filesystem not available"})
 			}
@@ -142,6 +157,9 @@ func (h *HostAPI) RegisterHostModule(ctx context.Context, rt wazero.Runtime) err
 		// ── fs_write → {"error": ""} ──
 		NewFunctionBuilder().
 		WithFunc(func(ctx context.Context, mod api.Module, pathPtr, pathLen, dataPtr, dataLen uint32) uint64 {
+			if h.denied("fs_write") {
+				return writeJSON(ctx, mod, map[string]string{"error": "export fs_write disabled"})
+			}
 			if h.FS == nil {
 				return writeJSON(ctx, mod, map[string]string{"error": "filesystem not available"})
 			}
@@ -160,6 +178,9 @@ func (h *HostAPI) RegisterHostModule(ctx context.Context, rt wazero.Runtime) err
 		// ── fs_readdir → {"entries": [{"name":"...","is_dir":true},...], "error": ""} ──
 		NewFunctionBuilder().
 		WithFunc(func(ctx context.Context, mod api.Module, pathPtr, pathLen uint32) uint64 {
+			if h.denied("fs_readdir") {
+				return writeJSON(ctx, mod, map[string]string{"error": "export fs_readdir disabled"})
+			}
 			if h.FS == nil {
 				return writeJSON(ctx, mod, map[string]string{"error": "filesystem not available"})
 			}
@@ -249,6 +270,9 @@ func (h *HostAPI) RegisterHostModule(ctx context.Context, rt wazero.Runtime) err
 		// ── runtime_set_* → {"error":""} ──
 		NewFunctionBuilder().
 		WithFunc(func(ctx context.Context, mod api.Module, keyPtr, keyLen, valPtr, valLen uint32) uint64 {
+			if h.denied("runtime_set_metadata") {
+				return writeJSON(ctx, mod, map[string]string{"error": "export runtime_set_metadata disabled"})
+			}
 			key := read(mod, keyPtr, keyLen)
 			val := read(mod, valPtr, valLen)
 			return h.runtimeSet(ctx, mod, RuntimeKeyMetadataPrefix+key, val)
@@ -256,16 +280,25 @@ func (h *HostAPI) RegisterHostModule(ctx context.Context, rt wazero.Runtime) err
 		Export("runtime_set_metadata").
 		NewFunctionBuilder().
 		WithFunc(func(ctx context.Context, mod api.Module, valPtr, valLen uint32) uint64 {
+			if h.denied("runtime_set_model_config") {
+				return writeJSON(ctx, mod, map[string]string{"error": "export runtime_set_model_config disabled"})
+			}
 			return h.runtimeSetModelConfig(ctx, mod, read(mod, valPtr, valLen))
 		}).
 		Export("runtime_set_model_config").
 		NewFunctionBuilder().
 		WithFunc(func(ctx context.Context, mod api.Module, valPtr, valLen uint32) uint64 {
+			if h.denied("runtime_set_system_prompts") {
+				return writeJSON(ctx, mod, map[string]string{"error": "export runtime_set_system_prompts disabled"})
+			}
 			return h.runtimeSet(ctx, mod, "system_prompts", read(mod, valPtr, valLen))
 		}).
 		Export("runtime_set_system_prompts").
 		NewFunctionBuilder().
 		WithFunc(func(ctx context.Context, mod api.Module, valPtr, valLen uint32) uint64 {
+			if h.denied("runtime_set_max_turns") {
+				return writeJSON(ctx, mod, map[string]string{"error": "export runtime_set_max_turns disabled"})
+			}
 			return h.runtimeSet(ctx, mod, "max_turns", read(mod, valPtr, valLen))
 		}).
 		Export("runtime_set_max_turns").

@@ -31,7 +31,8 @@ const WebTimeout = 30 * time.Second
 // network-boundary checks that is a Server-Side Request Forgery vector:
 // the model could fetch http://169.254.169.254/... (cloud IAM metadata),
 // http://10.0.0.1/admin, http://127.0.0.1:6379, etc., and exfiltrate the
-// response. Because CanSelfApprove=true, no human gates the call.
+// response. WebFetch is classified read-only (no human gates the call),
+// so the SSRF defense is what makes that safe.
 //
 // The defense is layered:
 //   1. ValidateRequestURL: scheme ∈ {http,https}, no userinfo, host non-empty.

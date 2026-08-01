@@ -72,38 +72,19 @@ func (t *Shell) Definition() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
 		Name:        "shell",
 		Description: desc,
-		Parameters: json.RawMessage(`{
-			"type": "object",
-			"properties": {
-				"command": {
-					"type": "string",
-					"description": "The shell command to execute"
-				},
-				"description": {
-					"type": "string",
-					"description": "A short description of what this command does (for audit/logging)"
-				}
-			},
-			"required": ["command"]
-		}`),
+		Parameters:  openagent.SchemaOf[ShellParams](),
 	}
 }
 
-func (t *Shell) Execute(ctx context.Context, args json.RawMessage) (string, error) {
-	var params struct {
-		Command     string `json:"command"`
-		Description string `json:"description"`
-	}
-	if err := json.Unmarshal(args, &params); err != nil {
-		return "", fmt.Errorf("shell: %w", err)
-	}
-	if params.Command == "" {
-		return "", fmt.Errorf("shell: command is required")
+func (t *Shell) Execute(ctx context.Context, args json.RawMessage) *openagent.ToolResult {
+	params, err := openagent.ParseArgs[ShellParams](args)
+	if err != nil {
+		return openagent.ErrorResult(fmt.Errorf("shell: %w", err), false, "")
 	}
 	if t.sandbox == nil {
-		return "", fmt.Errorf("shell: no sandbox configured")
+		return openagent.ErrorResult(fmt.Errorf("shell: no sandbox configured"), false, "")
 	}
-	shellCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	shellCtx, cancel := context.WithTimeout(ctx, shellTimeout(params.Timeout))
 	defer cancel()
 
 	program, flag := platformShell(), platformShellArg()
@@ -119,7 +100,7 @@ func (t *Shell) Execute(ctx context.Context, args json.RawMessage) (string, erro
 	if pm != nil {
 		proc, err := pm.Create(params.Command)
 		if err != nil {
-			return "", fmt.Errorf("shell: %w", err)
+			return openagent.ErrorResult(fmt.Errorf("shell: %w", err), false, "")
 		}
 		cmd.StdoutW = proc.StdoutW()
 		cmd.StderrW = proc.StderrW()
@@ -129,47 +110,44 @@ func (t *Shell) Execute(ctx context.Context, args json.RawMessage) (string, erro
 		if errors.Is(runErr, openagent.ErrProcessRunning) {
 			// Process still running — rename dir to proc-{PID} and return snapshot.
 			proc.SetPID(result.PID)
-			return formatProcessRunning(proc), nil
+			return &openagent.ToolResult{Content: formatProcessRunning(proc)}
 		}
 		// Process finished — clean up and return result.
 		proc.Close()
 		pm.Remove(proc.ID)
 		if runErr != nil {
-			return "", runErr
+			return openagent.ErrorResult(runErr, false, "")
 		}
-		return formatShellResult(result), nil
+		return &openagent.ToolResult{Content: formatShellResult(result)}
 	}
 
 	// No ProcessManager — use sandbox directly (preserves backward compat).
 	result, err := t.sandbox.Run(shellCtx, cmd)
 	if errors.Is(err, openagent.ErrProcessRunning) {
-		return formatProcessRunningNoFiles(result), nil
+		return &openagent.ToolResult{Content: formatProcessRunningNoFiles(result)}
 	}
 	if err != nil {
-		return "", err
+		return openagent.ErrorResult(err, false, "")
 	}
-	return formatShellResult(result), nil
+	return &openagent.ToolResult{Content: formatShellResult(result)}
 }
 
 func (t *Shell) ExecuteStream(ctx context.Context, args json.RawMessage) <-chan openagent.ToolStreamChunk {
-	var params struct {
-		Command     string `json:"command"`
-		Description string `json:"description"`
-	}
-	if err := json.Unmarshal(args, &params); err != nil || params.Command == "" || t.sandbox == nil {
+	params, err := openagent.ParseArgs[ShellParams](args)
+	if err != nil {
 		ch := make(chan openagent.ToolStreamChunk, 1)
-		if err != nil {
-			ch <- openagent.ToolStreamChunk{Error: fmt.Errorf("shell: %w", err)}
-		} else if params.Command == "" {
-			ch <- openagent.ToolStreamChunk{Error: fmt.Errorf("shell: command is required")}
-		} else {
-			ch <- openagent.ToolStreamChunk{Error: fmt.Errorf("shell: no sandbox configured")}
-		}
+		ch <- openagent.ToolStreamChunk{Error: fmt.Errorf("shell: %w", err)}
+		close(ch)
+		return ch
+	}
+	if t.sandbox == nil {
+		ch := make(chan openagent.ToolStreamChunk, 1)
+		ch <- openagent.ToolStreamChunk{Error: fmt.Errorf("shell: no sandbox configured")}
 		close(ch)
 		return ch
 	}
 
-	streamCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	streamCtx, cancel := context.WithTimeout(ctx, shellTimeout(params.Timeout))
 
 	program, flag := platformShell(), platformShellArg()
 	cmd := openagent.Command{
@@ -207,11 +185,11 @@ func (t *Shell) ExecuteStream(ctx context.Context, args json.RawMessage) <-chan 
 		ch := make(chan openagent.ToolStreamChunk, 1)
 		go func() {
 			defer close(ch)
-			output, err := t.Execute(ctx, args)
-			if err != nil {
-				ch <- openagent.ToolStreamChunk{Error: err}
+			output := t.Execute(ctx, args)
+			if output.Error != nil {
+				ch <- openagent.ToolStreamChunk{Error: output.AsError()}
 			} else {
-				ch <- openagent.ToolStreamChunk{Content: output}
+				ch <- openagent.ToolStreamChunk{Content: output.Content}
 			}
 		}()
 		return ch
@@ -242,7 +220,10 @@ func (t *Shell) ExecuteStream(ctx context.Context, args json.RawMessage) <-chan 
 						default:
 						}
 					}
-					go func() { for range src {} }()
+					go func() {
+						for range src {
+						}
+					}()
 					return
 				}
 			case <-streamCtx.Done():
@@ -255,7 +236,10 @@ func (t *Shell) ExecuteStream(ctx context.Context, args json.RawMessage) <-chan 
 					default:
 					}
 				}
-				go func() { for range src {} }()
+				go func() {
+					for range src {
+					}
+				}()
 				return
 			}
 		}
@@ -339,8 +323,34 @@ func formatProcessRunningNoFiles(result openagent.Result) string {
 }
 
 func truncateStr(s string, maxLen int) string {
-	if len(s) <= maxLen {
+	// Truncate by rune: byte-slicing can cut a multi-byte UTF-8 sequence
+	// in half, producing invalid UTF-8 for the model (Chinese output is
+	// 3 bytes per rune, so a byte cut almost always lands mid-rune).
+	runes := []rune(s)
+	if len(runes) <= maxLen {
 		return s
 	}
-	return s[:maxLen] + fmt.Sprintf("\n... [truncated, %d total chars]", len(s))
+	return string(runes[:maxLen]) + fmt.Sprintf("\n... [truncated, %d total chars]", len(runes))
+}
+
+type ShellParams struct {
+	Command     string `json:"command" jsonschema:"description=The shell command to execute"`
+	Description string `json:"description,omitempty" jsonschema:"description=A short description of what this command does (for audit/logging)"`
+	Timeout     int    `json:"timeout,omitempty" jsonschema:"description=Seconds to wait before the command is backgrounded (default: 30, min: 1, max: 600)"`
+}
+
+// shellTimeout resolves the per-call timeout: explicit parameter wins,
+// default 30s, clamped to [1, 600]s.
+func shellTimeout(timeout int) time.Duration {
+	if timeout <= 0 {
+		return 30 * time.Second
+	}
+	d := time.Duration(timeout) * time.Second
+	if d < 1*time.Second {
+		d = 1 * time.Second
+	}
+	if d > 600*time.Second {
+		d = 600 * time.Second
+	}
+	return d
 }
