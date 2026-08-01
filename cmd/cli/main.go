@@ -50,57 +50,19 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	wasmRuntime, err := cliwasm.NewRuntime(ctx)
-	if err != nil {
-		log.Fatalf("wasm runtime: %v", err)
-	}
-	defer wasmRuntime.Close(ctx)
-
 	// 4. Load every .wasm and route capabilities.
 	settings := raw
 	if len(settings) == 0 {
 		settings = []byte("{}")
 	}
-	mgr := plugin.NewManager(pluginPaths)
 	hub := &cliwasm.ObserverHub{}
-	for _, p := range pluginPaths {
-		files, _ := mgr.ResolveWasmFiles(p)
-		for _, f := range files {
-			wasmBytes, err := os.ReadFile(f)
-			if err != nil {
-				log.Printf("plugin: read %s: %v", f, err)
-				continue
-			}
-			mod, meta, err := wasmRuntime.Instantiate(ctx, wasmBytes, f)
-			if err != nil {
-				log.Printf("plugin: load %s: %v", f, err)
-				continue
-			}
 
-			log.Printf("plugin: loaded %s (%s) type=%s", meta.Name, meta.Description, meta.Type)
-
-			if meta.Is("settings") {
-				merged, err := mod.CallInit(ctx, settings)
-				if err != nil {
-					log.Printf("plugin %s init: %v", meta.Name, err)
-					continue
-				}
-				settings = merged
-			}
-
-			if meta.Is("commands") {
-				cmds, err := mod.ReadCommands(ctx)
-				if err != nil {
-					log.Printf("plugin %s commands: %v", meta.Name, err)
-					continue
-				}
-				registerCommands(rootCmd, cmds)
-			}
-
-			if meta.Is("observers") {
-				hub.Add(mod)
-			}
-		}
+	// keyring subcommands don't use plugins; skip loading to avoid
+	// plugin log noise on stdout/stderr.
+	if !isKeyringCmd(os.Args) {
+		var cleanup func()
+		settings, cleanup = loadPlugins(ctx, pluginPaths, settings, hub)
+		defer cleanup()
 	}
 
 	// 5. Parse final merged config.
@@ -387,6 +349,71 @@ func keyringOrFail() plugin.Keyring {
 			"fallback; original error: %v", err)
 	}
 	return sysKr
+}
+
+// isKeyringCmd reports whether the first non-flag argument is "keyring",
+// so plugin loading can be skipped for keyring subcommands.
+func isKeyringCmd(args []string) bool {
+	for _, a := range args[1:] {
+		if strings.HasPrefix(a, "-") {
+			continue
+		}
+		return a == "keyring"
+	}
+	return false
+}
+
+// loadPlugins instantiates the WASM runtime, loads every .wasm under
+// pluginPaths, and routes capabilities (settings merge, command
+// registration, observer wiring). Returns the possibly merged settings
+// and a cleanup func that closes the WASM runtime.
+func loadPlugins(ctx context.Context, pluginPaths []string, settings []byte, hub *cliwasm.ObserverHub) ([]byte, func()) {
+	wasmRuntime, err := cliwasm.NewRuntime(ctx)
+	if err != nil {
+		log.Fatalf("wasm runtime: %v", err)
+	}
+
+	mgr := plugin.NewManager(pluginPaths)
+	for _, p := range pluginPaths {
+		files, _ := mgr.ResolveWasmFiles(p)
+		for _, f := range files {
+			wasmBytes, err := os.ReadFile(f)
+			if err != nil {
+				log.Printf("plugin: read %s: %v", f, err)
+				continue
+			}
+			mod, meta, err := wasmRuntime.Instantiate(ctx, wasmBytes, f)
+			if err != nil {
+				log.Printf("plugin: load %s: %v", f, err)
+				continue
+			}
+
+			log.Printf("plugin: loaded %s (%s) type=%s", meta.Name, meta.Description, meta.Type)
+
+			if meta.Is("settings") {
+				merged, err := mod.CallInit(ctx, settings)
+				if err != nil {
+					log.Printf("plugin %s init: %v", meta.Name, err)
+					continue
+				}
+				settings = merged
+			}
+
+			if meta.Is("commands") {
+				cmds, err := mod.ReadCommands(ctx)
+				if err != nil {
+					log.Printf("plugin %s commands: %v", meta.Name, err)
+					continue
+				}
+				registerCommands(rootCmd, cmds)
+			}
+
+			if meta.Is("observers") {
+				hub.Add(mod)
+			}
+		}
+	}
+	return settings, func() { wasmRuntime.Close(ctx) }
 }
 
 var keyringCmd = &cobra.Command{Use: "keyring", Short: "Manage credentials in the system keyring"}
