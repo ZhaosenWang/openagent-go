@@ -168,7 +168,7 @@ func (t *EnterTool) Definition() openagent.FunctionDefinition {
 		Name: "enter_plan_mode",
 		Description: `Enter plan mode to create a structured execution plan. Use this when the task is complex, involves multiple steps, spans multiple files, or requires careful sequencing.
 
-After entering plan mode, you will have access to plan_create, plan_update, and exit_plan_mode. Your execution tools (shell, file writes, terminal) will be temporarily unavailable — they will be restored when you call exit_plan_mode.
+After entering plan mode, your execution tools (shell, file writes, terminal) are temporarily removed. Your read-only tools (read, ls, grep, webfetch, websearch, recall, load_skill, reload_skills) remain available, and you gain access to plan_create, plan_update, and exit_plan_mode.
 
 Workflow: enter_plan_mode → plan_create → exit_plan_mode → execute`,
 		Parameters: openagent.SchemaOf[struct{}](),
@@ -184,7 +184,7 @@ func (t *EnterTool) Execute(ctx context.Context, args json.RawMessage) *openagen
 	if err := t.onEnter(); err != nil {
 		return openagent.ErrorResult(fmt.Errorf("enter_plan_mode: %w", err), false, "")
 	}
-	return &openagent.ToolResult{Content: "Entered plan mode. You now have access to plan_create and exit_plan_mode. Execution tools are disabled until you call exit_plan_mode. Create a plan with plan_create, then call exit_plan_mode when ready to execute.\n"}
+	return &openagent.ToolResult{Content: "Entered plan mode. Execution tools are disabled. You now have access to read-only tools (read, ls, grep, webfetch, websearch, recall, load_skill, reload_skills) and plan tools (plan_create, plan_update, exit_plan_mode). Create a plan with plan_create, then call exit_plan_mode when ready to execute.\n"}
 }
 
 // ── exit_plan_mode Tool ──

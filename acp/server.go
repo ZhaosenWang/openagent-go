@@ -2113,16 +2113,18 @@ func (s *AgentServer) buildDynamicContext(ss *agentSession) string {
 	// ── Mode instruction ──
 	if mode == "plan" {
 		b.WriteString("## Plan Mode\n")
-		b.WriteString("You are in **plan mode**. You have NO execution tools — you cannot modify files, run shell commands, or create terminals. ")
+		b.WriteString("You are in **plan mode**. You have NO execution tools — you cannot modify files, run shell commands, or create terminals.\n\n")
+		b.WriteString("Your available tools:\n")
+		b.WriteString("- read, ls, grep — read and search workspace files\n")
+		b.WriteString("- webfetch, websearch — fetch web content and search the internet\n")
+		b.WriteString("- recall — search conversation history for details not covered by the summary\n")
+		b.WriteString("- load_skill, reload_skills — load and manage skill definitions\n")
 		if s.clientCanReadFile() {
-			b.WriteString("Your only tools are read-only inspection (read_client_file) and planning (plan_create, plan_update, exit_plan_mode).\n\n")
-			b.WriteString("**Workflow:**\n")
-			b.WriteString("1. Read and analyze relevant files to understand the task\n")
-		} else {
-			b.WriteString("Your only tools are planning (plan_create, plan_update, exit_plan_mode). You have no file-reading tools in this mode — base your plan on the user's description and any context already provided.\n\n")
-			b.WriteString("**Workflow:**\n")
-			b.WriteString("1. Analyze the task from the user's description and available context\n")
+			b.WriteString("- read_client_file — read files from your machine\n")
 		}
+		b.WriteString("- plan_create, plan_update, exit_plan_mode — create, update, and exit an execution plan\n")
+		b.WriteString("\n**Workflow:**\n")
+		b.WriteString("1. Explore — read relevant files, search the web, and recall context to understand the task\n")
 		b.WriteString("2. Call plan_create with concrete, actionable steps\n")
 		b.WriteString("3. Call exit_plan_mode to leave plan mode and begin execution\n\n")
 		b.WriteString("Create a complete plan before calling exit_plan_mode.\n")
