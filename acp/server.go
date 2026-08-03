@@ -1748,18 +1748,16 @@ func subAgentToolNames(cfg *agent.Agent) []string {
 func (s *AgentServer) reconcilePlanTools(ctx context.Context, sid openacp.SessionId, ss *agentSession, rt *kernel.Runtime, sender openacp.SessionEventSender) {
 	rt.RemoveTools("plan_create", "plan_update", "enter_plan_mode", "exit_plan_mode")
 
-	// plan_update is always registered so it can track plan progress.
-	// ApplyPlanUpdates validates-then-mutates under modeMu and runs the
-	// mode-gated notification in the same critical section, so the
-	// notified snapshot is consistent with the mutation and ordered
+	// plan_update is always registered so it can track plan progress in
+	// all modes (plan/auto/manual). ApplyPlanUpdates validates-then-mutates
+	// under modeMu and runs the notification in the same critical section,
+	// so the notified snapshot is consistent with the mutation and ordered
 	// relative to a concurrent exit_plan_mode's empty-plan notification.
 	pu := plan.NewUpdateTool(func(updates []plan.Update) ([]plan.Entry, error) {
 		snap, err := ss.ApplyPlanUpdates(updates, func(snap []plan.Entry) {
 			// Called with modeMu held (ApplyPlanUpdates) — read the field
 			// directly, Mode() would re-lock and self-deadlock.
-			if ss.mode == "plan" {
-				sender.SendPlanUpdate(s.entriesToACP(snap))
-			}
+			sender.SendPlanUpdate(s.entriesToACP(snap))
 		})
 		if err != nil {
 			return nil, err
@@ -1862,9 +1860,9 @@ func (s *AgentServer) executionTools(sid openacp.SessionId, ss *agentSession) []
 
 // makeCreateCallback builds the OnPlan callback shared by the plan-mode
 // plan_create tool and the enter_plan_mode-injected plan_create tool.
-// It atomically swaps ss.planEntries under modeMu, sends a mode-gated
-// notification (only while still in plan mode — see makeExitCallback for
-// why gating here closes the old race), then persists outside the lock.
+// It atomically swaps ss.planEntries under modeMu, sends the plan update
+// notification (so the panel refreshes even in auto/manual mode after an
+// enter_plan_mode-triggered plan_create), then persists outside the lock.
 // Shared by both injection sites so there is one canonical create path.
 func (s *AgentServer) makeCreateCallback(
 	ctx context.Context, sid openacp.SessionId, ss *agentSession,
@@ -1874,9 +1872,7 @@ func (s *AgentServer) makeCreateCallback(
 		ss.modeMu.Lock()
 		ss.planEntries = copyPlanEntries(entries)
 		snap := copyPlanEntries(ss.planEntries)
-		if ss.mode == "plan" {
-			sender.SendPlanUpdate(s.entriesToACP(snap))
-		}
+		sender.SendPlanUpdate(s.entriesToACP(snap))
 		ss.modeMu.Unlock()
 		s.savePlan(ctx, string(sid), snap)
 	}
