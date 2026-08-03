@@ -2325,17 +2325,6 @@ func (a *acpApprover) Ask(ctx context.Context, call openagent.ToolCall, def open
 	}
 }
 
-// isPlanTool reports whether the given tool name is a plan-mode-only tool
-// (plan_create, plan_update, exit_plan_mode) or a read-only inspection tool
-// (read_client_file). These tools are allowed in plan mode.
-func isPlanTool(name string) bool {
-	switch name {
-	case "plan_create", "plan_update", "exit_plan_mode", "read_client_file":
-		return true
-	}
-	return false
-}
-
 // usageCost computes the USD cost of a run's usage from the model's
 // configured per-token pricing. Unconfigured rates are 0 (free): a model
 // without pricing reports cost 0 — an explicit value, not an absent one.
