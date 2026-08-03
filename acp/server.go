@@ -2041,9 +2041,11 @@ func (a *acpApprover) Ask(ctx context.Context, call openagent.ToolCall, def open
 			Status:     "pending",
 			RawInput:   json.RawMessage(call.Function.Arguments),
 		},
+		// The "always" (Allow Always) option is not offered to the client
+		// for now; the backend handling (write-through to approval memory)
+		// stays, so re-enabling later is a one-line option add.
 		Options: []openacp.PermissionOption{
 			{OptionID: "allow", Name: "Allow", Kind: openacp.PermissionAllowOnce},
-			{OptionID: "always", Name: "Always allow", Kind: openacp.PermissionAllowAlways},
 			{OptionID: "reject", Name: "Reject", Kind: openacp.PermissionRejectOnce},
 		},
 	})
