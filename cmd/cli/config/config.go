@@ -8,6 +8,9 @@ import (
 )
 
 type Config struct {
+	// Model is the default model ("<provider>/<modelID>") used when a
+	// session has not selected one — overrides the first-registered
+	// fallback.
 	Model        string                     `json:"model,omitempty"`
 	FastModel    string                     `json:"fast_model,omitempty"`
 	Provider     map[string]ProviderConfig  `json:"provider,omitempty"`

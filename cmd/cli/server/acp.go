@@ -137,6 +137,14 @@ func RunACP(ctx context.Context, cfg *config.Config, caps config.Capabilities) e
 		})
 	}
 
+	// settings "model" ("<provider>/<modelID>") wins as the default;
+	// fall back to the first registered model.
+	if cfg.Model != "" {
+		if !srv.SetDefaultModelID(cfg.Model) {
+			slog.Warn("openagent: settings model not in provider list, using first registered", "model", cfg.Model)
+		}
+	}
+
 	policy := sandboxPolicy(cfg.Sandbox)
 	srv.ToolFactory = func(cwd string) []openagent.Tool {
 		sb, err := native.NewWithPolicy(cwd, policy)

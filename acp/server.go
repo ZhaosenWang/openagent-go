@@ -386,6 +386,19 @@ func (s *AgentServer) SetModel(provider, modelID, apiKey, baseURL string) {
 	s.modelConfigs[key] = ModelConfig{Provider: provider, ModelID: modelID, APIKey: apiKey, BaseURL: baseURL}
 }
 
+// SetDefaultModelID sets the default model used when a session has not
+// selected one (settings "model" wins over the first-registered fallback).
+// Returns false when id is not a registered model.
+func (s *AgentServer) SetDefaultModelID(id string) bool {
+	s.modelsMu.Lock()
+	defer s.modelsMu.Unlock()
+	if _, ok := s.Models[id]; !ok {
+		return false
+	}
+	s.defaultModelID = id
+	return true
+}
+
 // RegisterModel stores a model's original config for SetModel fallback.
 func (s *AgentServer) RegisterModel(key, provider, modelID, apiKey, baseURL string, pricing ModelPricing) {
 	s.modelsMu.Lock()
@@ -1201,6 +1214,10 @@ func (s *AgentServer) OnSetSessionConfigOption(ctx context.Context, req openacp.
 			if v, ok := ss.config["model"].(string); ok {
 				if m, ok := s.Models[v]; ok {
 					ss.rt.SetModel(m)
+				} else {
+					// The requested model is not in the provider list —
+					// keep the current model, but don't stay silent.
+					slog.Warn("openagent: requested model not in provider list, keeping current", "session", req.SessionID, "model", v)
 				}
 			}
 		case "thought_level":
@@ -1555,6 +1572,15 @@ func (s *AgentServer) buildRuntimeForSession(sid openacp.SessionId, ss *agentSes
 		}
 	}
 	if m, ok := s.Models[modelID]; ok {
+		cfg.Model = m
+	} else if m, ok := s.Models[s.defaultModelID]; ok {
+		// The session's saved model is no longer in the provider list
+		// (removed/renamed after the session was saved) — fall back to the
+		// default instead of leaving cfg.Model nil, which would make a
+		// restored session fail every turn with "no model configured".
+		if v, _ := ss.config["model"].(string); v != "" && v != s.defaultModelID {
+			slog.Warn("openagent: session model not in provider list, falling back to default", "session", sid, "model", v, "default", s.defaultModelID)
+		}
 		cfg.Model = m
 	}
 	if v, ok := ss.config["thought_level"]; ok {
