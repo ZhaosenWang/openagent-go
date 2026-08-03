@@ -92,7 +92,11 @@ func parseFrontmatter(path string) (map[string]any, string, error) {
 		return nil, "", err
 	}
 
-	text := string(data)
+	// Normalize CRLF → LF so that SKILL.md files with Windows line
+	// endings are handled identically to Unix ones. This is an in-memory
+	// operation; the file on disk is not modified. LF-only files are
+	// unaffected (no \r\n sequences to replace).
+	text := strings.ReplaceAll(string(data), "\r\n", "\n")
 	if !strings.HasPrefix(text, "---\n") {
 		return nil, "", fmt.Errorf("no frontmatter")
 	}
