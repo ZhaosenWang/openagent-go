@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	openagent "github.com/yusheng-g/openagent-go"
@@ -81,11 +82,21 @@ Do NOT hand off — you are the final gate.`),
 	)
 
 	// Binder: build a fresh Runtime per agent turn from the pure config.
-	// The in-process agents run with no extra runtime deps (no tools, no
-	// memory, no hooks of their own — handoff tools come from the team).
+	// Two things MUST come from the TeamContext:
+	//  1. tc.HandoffTools — the transfer_to_* tools (without them the
+	//     model cannot hand off)
+	//  2. tc.TeamPrompt — the "## Team Context" block (members, handoff
+	//     rules, history); without it the model doesn't know the team.
 	bind := func(cfg *agent.Agent) agent.AgentBinder {
 		return func(tc agent.TeamContext) (agent.AgentRunner, error) {
-			return kernel.New(cfg, kernel.Deps{}), nil
+			sub := cfg.Clone()
+			sub.SystemPrompts = append(sub.SystemPrompts, tc.TeamPrompt)
+
+			// 辅助打印:确认 team 上下文进了系统提示词
+			fmt.Printf("\n── %s system prompts ──\n%s\n", cfg.Name, strings.Join(sub.SystemPrompts, "\n\n"))
+			fmt.Printf("   handoff tools: %d\n", len(tc.HandoffTools))
+
+			return kernel.New(sub, kernel.Deps{Tools: tc.HandoffTools}), nil
 		}
 	}
 

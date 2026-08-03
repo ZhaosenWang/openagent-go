@@ -450,7 +450,13 @@ func (h *TeamHandler) handleAddAgent(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 	binder := func(tc agent.TeamContext) (agent.AgentRunner, error) {
-		return kernel.New(agentCfg, agentDeps), nil
+		// Inject the team's transfer_to_* handoff tools + TeamPrompt
+		// (same as the template binder above).
+		sub := agentCfg.Clone()
+		sub.SystemPrompts = append(sub.SystemPrompts, tc.TeamPrompt)
+		deps := agentDeps
+		deps.Tools = append(deps.Tools, tc.HandoffTools...)
+		return kernel.New(sub, deps), nil
 	}
 	if err := s.team.AddBinderAgent(body.Name, body.Description, binder); err != nil {
 		http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusBadRequest)
@@ -542,7 +548,14 @@ func (h *TeamHandler) newEntry(ctx context.Context, info session.SessionInfo) *t
 			},
 		}
 		binder := func(tc agent.TeamContext) (agent.AgentRunner, error) {
-			return kernel.New(agentCfg, agentDeps), nil
+			// Inject the team's transfer_to_* handoff tools and the
+			// "## Team Context" prompt block — without them the model
+			// cannot hand off nor knows the team.
+			sub := agentCfg.Clone()
+			sub.SystemPrompts = append(sub.SystemPrompts, tc.TeamPrompt)
+			deps := agentDeps
+			deps.Tools = append(deps.Tools, tc.HandoffTools...)
+			return kernel.New(sub, deps), nil
 		}
 		teamOpts = append(teamOpts,
 			agent.WithTeamAgent(t.Name, t.Description, agentCfg, binder),
