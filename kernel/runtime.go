@@ -102,6 +102,17 @@ type Runtime struct {
 	cfg  *agent.Agent
 	deps Deps
 
+	// mu guards the post-construction mutable state: cfg
+	// (SetModel/SetReasoningEffort/SetSystemPrompts/SetMaxTurns),
+	// humanApprover, and runModel. A single run is sequential, but the
+	// acp layer reuses one Runtime across turns and applies session
+	// config/mode changes (SetModel/SetHumanApprover) from the serve
+	// loop and from tool callbacks while a run is in flight, so these
+	// fields are concurrency-shared. Runs snapshot what they need under
+	// the read lock; setters take the write lock.
+	mu            sync.RWMutex
+	humanApprover governance.HumanApprover // mutable — acp plan-mode transitions switch it mid-run
+
 	// tools is the mutable tool set (toolsMu-guarded). Readers use
 	// SnapshotTools; mutators use AppendTools — a tool callback
 	// (exit_plan_mode via the acp layer) can append execution tools to the
@@ -111,7 +122,6 @@ type Runtime struct {
 	toolsMu sync.RWMutex
 
 	// Per-run state (fresh on every New).
-	humanApprover  governance.HumanApprover // mutable — acp exit_plan_mode switches it mid-run
 	approvalMemory governance.ApprovalMemory
 	runModel       openagent.Model
 	builtinTools   []openagent.FunctionDefinition
@@ -178,27 +188,53 @@ func (rt *Runtime) Config() *agent.Agent { return rt.cfg }
 
 // Model returns the resolved model for the current run (session override
 // wins); nil until run() resolves it.
-func (rt *Runtime) Model() openagent.Model { return rt.runModel }
+func (rt *Runtime) Model() openagent.Model {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	return rt.runModel
+}
 
 // SetSystemPrompts overrides the agent's system prompts for this runtime
-// (used by wasm runtime_set host exports).
-func (rt *Runtime) SetSystemPrompts(p []string) { rt.cfg.SystemPrompts = p }
+// (used by wasm runtime_set host exports). Safe to call from any goroutine;
+// prompt building snapshots the value under the lock.
+func (rt *Runtime) SetSystemPrompts(p []string) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	rt.cfg.SystemPrompts = p
+}
 
-// SetMaxTurns overrides the max-turns limit for this runtime.
-func (rt *Runtime) SetMaxTurns(n int) { rt.cfg.MaxTurns = n }
+// SetMaxTurns overrides the max-turns limit for this runtime. Safe to
+// call from any goroutine; the run loop reads it once at run start.
+func (rt *Runtime) SetMaxTurns(n int) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	rt.cfg.MaxTurns = n
+}
 
 // SetModel overrides the agent's model for this runtime (session config
-// model changes).
-func (rt *Runtime) SetModel(m openagent.Model) { rt.cfg.Model = m }
+// model changes). Safe to call from any goroutine; a running turn keeps
+// the model it snapshotted at run start.
+func (rt *Runtime) SetModel(m openagent.Model) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	rt.cfg.Model = m
+}
 
 // SetReasoningEffort overrides the reasoning-effort pass-through for this
-// runtime (session config thought_level changes).
-func (rt *Runtime) SetReasoningEffort(e string) { rt.cfg.ReasoningEffort = e }
+// runtime (session config thought_level changes). Safe to call from any
+// goroutine.
+func (rt *Runtime) SetReasoningEffort(e string) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	rt.cfg.ReasoningEffort = e
+}
 
 // SetHumanApprover replaces the human approval layer mid-run (used by
 // acp plan-mode transitions). Safe to call from tool callbacks; the next
 // executeTools batch reads the new value.
 func (rt *Runtime) SetHumanApprover(ap governance.HumanApprover) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
 	rt.humanApprover = ap
 }
 
@@ -211,7 +247,14 @@ func (rt *Runtime) policy() governance.Policy {
 	if rt.deps.Policy != nil {
 		return rt.deps.Policy
 	}
-	if rt.humanApprover == nil {
+	// Snapshot the mutable human layer + sub-agents under the lock: a
+	// concurrent SetHumanApprover (acp plan-mode transition from the
+	// serve loop or a tool callback) must not tear the read.
+	rt.mu.RLock()
+	humanApprover := rt.humanApprover
+	subAgents := rt.cfg.SubAgents
+	rt.mu.RUnlock()
+	if humanApprover == nil {
 		// No human layer = no approval step = allow all.
 		return allowAllPolicy{}
 	}
@@ -224,7 +267,7 @@ func (rt *Runtime) policy() governance.Policy {
 	// is control flow with no side effects — the child's tool calls are
 	// governed by the inherited policy chain inside (v2.0 §22). Apps that
 	// want to gate a specific sub-agent supply their own Policy via Deps.
-	for _, sa := range rt.cfg.SubAgents {
+	for _, sa := range subAgents {
 		rules = append(rules, governance.Rule{
 			ToolPattern: sa.Name,
 			Action:      governance.Allow,
@@ -235,7 +278,7 @@ func (rt *Runtime) policy() governance.Policy {
 		rules,
 		governance.NewToolClassifier(), // platform-side read-only classification
 		rt.approvalMemory,              // session-scoped approval memory ("allow always")
-		rt.humanApprover,
+		humanApprover,
 	)
 }
 
@@ -289,7 +332,7 @@ func (rt *Runtime) SnapshotTools() []openagent.Tool {
 
 // Run runs one turn to completion.
 func (rt *Runtime) Run(ctx context.Context, session openagent.Session, input openagent.Message) (*openagent.RunResult, error) {
-	if rt.cfg.Model == nil && session.Model == nil {
+	if !rt.hasConfigModel() && session.Model == nil {
 		return nil, errNoModel
 	}
 	return rt.run(ctx, session, nil, input, nil)
@@ -297,7 +340,7 @@ func (rt *Runtime) Run(ctx context.Context, session openagent.Session, input ope
 
 // RunWithPrefix runs one turn with prefix messages (not persisted).
 func (rt *Runtime) RunWithPrefix(ctx context.Context, session openagent.Session, prefix []openagent.Message, input openagent.Message) (*openagent.RunResult, error) {
-	if rt.cfg.Model == nil && session.Model == nil {
+	if !rt.hasConfigModel() && session.Model == nil {
 		return nil, errNoModel
 	}
 	return rt.run(ctx, session, prefix, input, nil)
@@ -313,7 +356,7 @@ func (rt *Runtime) RunStreamWithPrefix(ctx context.Context, session openagent.Se
 	ch := make(chan openagent.StreamEvent, 16)
 	go func() {
 		defer close(ch)
-		if rt.cfg.Model == nil && session.Model == nil {
+		if !rt.hasConfigModel() && session.Model == nil {
 			ch <- openagent.StreamEvent{Type: openagent.StreamError, Error: errNoModel}
 			return
 		}
@@ -324,10 +367,10 @@ func (rt *Runtime) RunStreamWithPrefix(ctx context.Context, session openagent.Se
 
 // RunGoal runs an autonomous goal-mode turn.
 func (rt *Runtime) RunGoal(ctx context.Context, session openagent.Session, goal string) (*openagent.RunResult, error) {
-	if rt.cfg.Model == nil && session.Model == nil {
+	if !rt.hasConfigModel() && session.Model == nil {
 		return nil, errNoModel
 	}
-	cfg := rt.cfg.WithGoalInstructions(goal)
+	cfg := rt.cfgWithGoal(goal)
 	sub := New(cfg, rt.deps)
 	return sub.run(ctx, session, nil, openagent.UserMessage(goal), nil)
 }
@@ -337,13 +380,30 @@ func (rt *Runtime) RunGoalStream(ctx context.Context, session openagent.Session,
 	ch := make(chan openagent.StreamEvent, 16)
 	go func() {
 		defer close(ch)
-		if rt.cfg.Model == nil && session.Model == nil {
+		if !rt.hasConfigModel() && session.Model == nil {
 			ch <- openagent.StreamEvent{Type: openagent.StreamError, Error: errNoModel}
 			return
 		}
-		cfg := rt.cfg.WithGoalInstructions(goal)
+		cfg := rt.cfgWithGoal(goal)
 		sub := New(cfg, rt.deps)
 		sub.run(ctx, session, nil, openagent.UserMessage(goal), ch)
 	}()
 	return ch
+}
+
+// hasConfigModel reports whether the config carries a model, under mu
+// (SetModel runs concurrently from the serve loop / wasm exports).
+func (rt *Runtime) hasConfigModel() bool {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	return rt.cfg.Model != nil
+}
+
+// cfgWithGoal snapshots the config (with goal instructions applied) under
+// mu — WithGoalInstructions clones the whole config, so the mutable fields
+// (Model, SystemPrompts, ...) must be read under the lock.
+func (rt *Runtime) cfgWithGoal(goal string) *agent.Agent {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	return rt.cfg.WithGoalInstructions(goal)
 }

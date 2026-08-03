@@ -183,16 +183,24 @@ func buildTranscript(messages []openagent.Message) string {
 }
 
 // trimTranscript keeps the most recent content within the token budget.
+// The transcript is in chronological order, so walking from the END keeps
+// the latest messages (the oldest overflow is dropped) — matching the
+// "recent messages win" contract at the call site.
 func trimTranscript(s string, budget int) string {
+	lines := strings.Split(s, "\n")
 	var keep []string
 	total := 0
-	for _, line := range strings.Split(s, "\n") {
-		n := openagent.CountTokens("gpt-4", line)
+	for i := len(lines) - 1; i >= 0; i-- {
+		n := openagent.CountTokens("gpt-4", lines[i])
 		if total+n > budget {
-			break
+			break // budget exhausted — drop everything older
 		}
 		total += n
-		keep = append(keep, line)
+		keep = append(keep, lines[i])
+	}
+	// Reverse back to chronological order.
+	for i, j := 0, len(keep)-1; i < j; i, j = i+1, j-1 {
+		keep[i], keep[j] = keep[j], keep[i]
 	}
 	return strings.Join(keep, "\n")
 }

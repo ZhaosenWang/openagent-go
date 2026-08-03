@@ -14,12 +14,6 @@ type PromptInput struct {
 	WorkingMessages []Message
 }
 
-// RetrievalHint tells the model how to retrieve the original context.
-type RetrievalHint struct {
-	Description string `json:"description"`
-	Query       string `json:"query"`
-}
-
 // PromptBuilder assembles the message list for a model call from PromptInput.
 type PromptBuilder func(ctx context.Context, input PromptInput) ([]Message, error)
 

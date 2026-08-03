@@ -144,7 +144,7 @@ func (p *DefaultResultPolicy) Apply(ctx context.Context, session Session, result
 		return result
 	}
 
-	dir := filepath.Join(ArtifactRoot(), "sess-"+sanitizeName(session.ID))
+	dir := filepath.Join(ArtifactRoot(), "sess-"+SanitizeName(session.ID))
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		// Truncation failed: log instead of silently flooding the model
 		// with the raw oversized output.
@@ -170,9 +170,10 @@ func (p *DefaultResultPolicy) Apply(ctx context.Context, session Session, result
 	return result
 }
 
-// sanitizeName replaces path separators (and NUL) with '_' so a hostile or
-// malformed session id cannot escape its session directory.
-func sanitizeName(name string) string {
+// SanitizeName replaces path separators (and NUL) with '_' so a hostile
+// or malformed session id cannot escape its session directory. Export for
+// callers that build session-scoped paths (REST cleanup, artifacts).
+func SanitizeName(name string) string {
 	return strings.Map(func(r rune) rune {
 		if r == '/' || r == '\\' || r == ':' || r == 0 {
 			return '_'

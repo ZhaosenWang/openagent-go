@@ -2,11 +2,44 @@ package governance
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 
 	"github.com/yusheng-g/openagent-go/session"
 )
+
+// loadApprovals reads the approvals map from session meta, tolerating
+// both shapes a store can return: the in-process map[string]Decision
+// (set directly on an in-memory SessionInfo) and the JSON round-trip
+// shape map[string]any (sqlite/file persist meta as JSON, so after any
+// Get the values decode as map[string]any and the direct type assertion
+// would silently fail — Allow-Always must survive restarts, not just
+// in-process use).
+func loadApprovals(info *session.SessionInfo) map[string]Decision {
+	approvals := map[string]Decision{}
+	if info == nil || info.Meta == nil {
+		return approvals
+	}
+	v, ok := info.Meta[approvalsKey]
+	if !ok {
+		return approvals
+	}
+	switch t := v.(type) {
+	case map[string]Decision:
+		return t
+	case map[string]any:
+		b, err := json.Marshal(t)
+		if err != nil {
+			return approvals
+		}
+		if err := json.Unmarshal(b, &approvals); err != nil {
+			return approvals
+		}
+		return approvals
+	}
+	return approvals
+}
 
 // PersistentApprovalMemory persists session-scoped approval decisions
 // ("allow always") in the session metadata store, so decisions survive
@@ -54,10 +87,7 @@ func (m *PersistentApprovalMemory) Remember(ctx context.Context, sessionID, key 
 		info = &session.SessionInfo{ID: sessionID, Meta: map[string]any{}}
 	}
 
-	approvals := map[string]Decision{}
-	if got, ok := session.GetMeta[map[string]Decision](*info, approvalsKey); ok {
-		approvals = got
-	}
+	approvals := loadApprovals(info)
 	approvals[key] = decision
 	info.SetMeta(approvalsKey, approvals)
 
@@ -77,10 +107,7 @@ func (m *PersistentApprovalMemory) Recall(ctx context.Context, sessionID, key st
 	if err != nil || info == nil {
 		return Decision{}, false
 	}
-	approvals, ok := session.GetMeta[map[string]Decision](*info, approvalsKey)
-	if !ok {
-		return Decision{}, false
-	}
+	approvals := loadApprovals(info)
 	d, ok := approvals[key]
 	return d, ok
 }

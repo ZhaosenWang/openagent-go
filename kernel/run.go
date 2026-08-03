@@ -24,16 +24,25 @@ import (
 //	⑥ Policy/Approval + ⑦ Tool execution (concurrent)
 //	⑧ Memory store (Commit)
 func (rt *Runtime) run(ctx context.Context, session openagent.Session, prefix []openagent.Message, input openagent.Message, ch chan<- openagent.StreamEvent) (_ *openagent.RunResult, runErr error) {
+	// Snapshot the mutable config under the lock: SetModel/SetMaxTurns
+	// (session config RPCs, wasm exports) can run concurrently from the
+	// serve loop or tool callbacks. The current turn uses the snapshot;
+	// the next turn picks up any change.
+	rt.mu.RLock()
 	maxTurns := rt.cfg.MaxTurns
+	cfgModel := rt.cfg.Model
+	rt.mu.RUnlock()
 	if maxTurns <= 0 {
 		maxTurns = 20 // agent.New's default; guard for zero-value configs
 	}
 
-	// Resolve model for this run.
-	rt.runModel = rt.cfg.Model
+	// Resolve model for this run (Model() reads it under the same lock).
+	rt.mu.Lock()
+	rt.runModel = cfgModel
 	if session.Model != nil {
 		rt.runModel = session.Model
 	}
+	rt.mu.Unlock()
 
 	// Skill tools (load_skill/reload_skills) mount when a provider exists;
 	// the catalog itself is matched per-goal by the context runtime.
@@ -46,6 +55,13 @@ func (rt *Runtime) run(ctx context.Context, session openagent.Session, prefix []
 
 	result := &openagent.RunResult{}
 	rt.state.SessionID = session.ID
+
+	// Guard.in BEFORE persisting the input: a blocked input must never
+	// reach the store — it would be re-read into the model's context next
+	// turn (same principle as the guard.out comment below).
+	if ok, msg := rt.guardInput(ctx, input); !ok {
+		return nil, msg
+	}
 
 	// Append initial user input to memory.
 	rt.commit(ctx, session, input)
@@ -99,10 +115,6 @@ func (rt *Runtime) run(ctx context.Context, session openagent.Session, prefix []
 			rt.compressed = ci.compressed
 			if ci.err != nil {
 				slog.Error("openagent: compaction failed", "error", ci.err)
-			}
-			// ③ Guard.in — once per run.
-			if ok, msg := rt.guardInput(ctx, input); !ok {
-				return nil, msg
 			}
 			// ② Prompt build (turn 1: prefix + input).
 			promptMsgs := append(append([]openagent.Message{}, prefix...), input)

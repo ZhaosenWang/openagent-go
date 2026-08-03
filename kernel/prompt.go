@@ -19,7 +19,11 @@ import (
 // silently dropped) — an empty prompt must not silently reach the model.
 func (rt *Runtime) buildPrompt(ctx context.Context, session openagent.Session, ac *ctxpkg.AgentContext) ([]openagent.Message, error) {
 	// ── Static context (assembled once per run, never changes) ──
+	// Snapshot under the lock: SetSystemPrompts (wasm runtime_set export)
+	// can run concurrently from a tool callback.
+	rt.mu.RLock()
 	static := strings.Join(rt.cfg.SystemPrompts, "\n\n")
+	rt.mu.RUnlock()
 	if session.ProjectContext != "" {
 		static += "\n\n## Project Context\n\n" + session.ProjectContext
 	}
@@ -65,8 +69,10 @@ Date: %s
 	// the prompt must never carry an oversized summary.
 	if rt.compressed != nil && rt.compressed.Summary != "" {
 		section := buildCompressedSection(rt.compressed)
+		// MaxCompressedTokens is immutable after New, but the summary
+		// section uses rt.runModel which the run snapshots under the lock.
 		if rt.cfg.MaxCompressedTokens > 0 {
-			if n := tokenizer.Count(openagent.TokenizerModelID(rt.runModel), section); n > rt.cfg.MaxCompressedTokens {
+			if n := tokenizer.Count(openagent.TokenizerModelID(rt.Model()), section); n > rt.cfg.MaxCompressedTokens {
 				section = truncateTokens(section, rt.cfg.MaxCompressedTokens) + "\n\n[summary truncated: exceeds MaxCompressedTokens]"
 			}
 		}
@@ -100,13 +106,16 @@ func (rt *Runtime) buildModelRequest(session openagent.Session, messages []opena
 	if len(rt.builtinTools) > 0 {
 		tools = append(tools, rt.builtinTools...)
 	}
+	rt.mu.RLock()
+	reasoningEffort := rt.cfg.ReasoningEffort
+	rt.mu.RUnlock()
 	return openagent.ChatCompletionRequest{
 		Model:           session.ModelID,
 		Messages:        messages,
 		Tools:           tools,
 		Temperature:     session.Temperature,
 		MaxTokens:       session.MaxTokens,
-		ReasoningEffort: rt.cfg.ReasoningEffort,
+		ReasoningEffort: reasoningEffort,
 	}
 }
 
@@ -172,12 +181,6 @@ func buildCompressedSection(cc *openagent.CompressedContext) string {
 	var b strings.Builder
 	b.WriteString("## Conversation Summary\n")
 	b.WriteString(cc.Summary)
-	if len(cc.Hints) > 0 {
-		b.WriteString("\n\n### Retrieval Hints\n")
-		for i, h := range cc.Hints {
-			fmt.Fprintf(&b, "%d. %s (query: %s)\n", i+1, h.Description, h.Query)
-		}
-	}
 	return b.String()
 }
 
@@ -187,7 +190,11 @@ func buildCompressedSection(cc *openagent.CompressedContext) string {
 func (rt *Runtime) estimatePromptOverhead(ctx context.Context, session openagent.Session, modelID string) int {
 	var n int
 
+	// SystemPrompts is mutable (wasm runtime_set exports) — snapshot under
+	// the same lock buildPrompt uses.
+	rt.mu.RLock()
 	static := strings.Join(rt.cfg.SystemPrompts, "\n\n")
+	rt.mu.RUnlock()
 	if session.ProjectContext != "" {
 		static += "\n\n## Project Context\n\n" + session.ProjectContext
 	}

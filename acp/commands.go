@@ -2,6 +2,7 @@ package acp
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/yusheng-g/openagent-go/slash"
 )
@@ -59,9 +60,37 @@ func (s *AgentServer) buildCommandRegistry() *slash.Registry {
 			}
 		})
 
+	r.Register("compact", "Compress session history into a summary", nil,
+		func(ctx slash.Context, _ string) (string, error) {
+			if ctx.Compact == nil {
+				return "Compression unavailable (no summarizer configured).\n", nil
+			}
+			st, err := ctx.Compact()
+			if err != nil {
+				return "", err
+			}
+			if st.Compressed == 0 {
+				return "Nothing to compact — session is empty or no summarizer configured.\n", nil
+			}
+			return fmt.Sprintf("Compacted %d messages → summary (freed ~%d tokens).\n",
+				st.Compressed, st.FreedTokens), nil
+		})
+
 	r.Register("context", "Show context window usage", nil,
 		func(ctx slash.Context, _ string) (string, error) {
-			return "Context window: " + fmt.Sprintf("%d", ctx.TotalTokens) + " total tokens used.\n", nil
+			if ctx.ContextStats == nil {
+				return "Context window: " + fmt.Sprintf("%d", ctx.TotalTokens) + " total tokens used.\n", nil
+			}
+			st, err := ctx.ContextStats()
+			if err != nil {
+				return "", err
+			}
+			var b strings.Builder
+			b.WriteString(fmt.Sprintf("Summary: %d tokens\n", st.SummaryTokens))
+			b.WriteString(fmt.Sprintf("Working: %d tokens\n", st.WorkingTokens))
+			b.WriteString(fmt.Sprintf("Used:    %d tokens\n", st.SummaryTokens+st.WorkingTokens))
+			b.WriteString(fmt.Sprintf("Window:  %d tokens\n", st.Window))
+			return b.String(), nil
 		})
 
 	r.Register("cwd", "Show current working directory", nil,

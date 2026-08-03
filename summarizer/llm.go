@@ -9,7 +9,6 @@ package summarizer
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -20,7 +19,7 @@ import (
 // Model to produce incremental summaries.
 type Compressor struct {
 	model     openagent.Model
-	maxTokens int // 0 = no limit; non-zero = instruct LLM to keep summary under this
+	maxTokens int // 0 = no hint; non-zero = prompt the model to keep the summary under this
 }
 
 // New creates a Compressor backed by m.
@@ -28,8 +27,12 @@ func New(m openagent.Model) *Compressor {
 	return &Compressor{model: m}
 }
 
-// WithMaxTokens sets a hard cap on the summarizer's LLM output via
-// ChatCompletionRequest.MaxTokens. Default is 0 (no cap).
+// WithMaxTokens sets a SOFT target for the summary size: the budget is
+// passed to the model as a prompt hint, NOT as ChatCompletionRequest
+// MaxTokens. A hard output cap truncates the JSON envelope mid-stream,
+// which parseSummary then rejects — the real length limit is enforced
+// when the summary enters the prompt (kernel's MaxCompressedTokens
+// truncation). Default is 0 (no hint).
 func (c *Compressor) WithMaxTokens(n int) *Compressor {
 	c.maxTokens = n
 	return c
@@ -50,8 +53,10 @@ func (c *Compressor) Summarize(ctx context.Context, messages []openagent.Message
 	}
 
 	prompt := c.buildSummarizePrompt(messages, previous)
+	// No MaxTokens on purpose: a hard output cap truncates the JSON
+	// envelope mid-stream and parseSummary rejects it. Length control is
+	// the prompt hint below plus the prompt-side truncation in kernel.
 	resp, err := c.model.ChatCompletion(ctx, openagent.ChatCompletionRequest{
-		MaxTokens: c.maxTokens,
 		Messages: []openagent.Message{
 			{Role: openagent.RoleSystem, Content: summarizeSystemPrompt},
 			{Role: openagent.RoleUser, Content: prompt},
@@ -65,7 +70,11 @@ func (c *Compressor) Summarize(ctx context.Context, messages []openagent.Message
 	if len(resp.Choices) > 0 {
 		content = resp.Choices[0].Message.Content
 	}
-	return parseSummary(content)
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return nil, fmt.Errorf("summarizer: model returned empty summary")
+	}
+	return &openagent.CompressedContext{Summary: content}, nil
 }
 
 // ── Prompt ──
@@ -74,18 +83,35 @@ const summarizeSystemPrompt = `You are a conversation summarizer. Your job is to
 structured summary of a conversation so an AI assistant can resume the
 thread without re-reading every message.
 
-Rules:
-- Capture key facts, decisions, user preferences, and ongoing tasks.
-- Include up to 5 retrieval hints — short keyword queries the assistant
-  could use to find specific details later.
-- Be concise. The summary is injected into a system prompt.
-- Output ONLY a JSON object. No markdown fences, no surrounding text.
+The summary is the assistant's OWN memory of the conversation (it is
+injected back to the same assistant). Refer to the user as "the user";
+narrate your own actions with no third-person subject ("searched memory,
+found...", NOT "the assistant searched memory") — the reader is yourself.
 
-Format:
-{"summary": "<text>", "hints": [{"description": "<what to find>", "query": "<search keywords>"}]}`
+Structure the summary text with exactly these eight sections, in order
+(the Claude Code compaction format; user messages are NOT listed
+verbatim — recent messages stay full-fidelity in the working set, older
+ones are summarized by intent within the sections below):
+1. Primary Request and Intent — what the user originally wanted and the deeper goal
+2. Key Technical Concepts — frameworks, patterns, algorithms, architectures
+3. Files and Code Sections — every relevant file by path and why it matters
+4. Errors and Fixes — errors, how they were resolved, user reactions
+5. Problem Solving — reasoning chains, alternatives, debugging strategies
+6. Pending Tasks — unfinished or deferred work
+7. Current Work — precise description of work in progress at conversation end
+8. Optional Next Step — aligned with the user's most recent explicit requests
+
+Be concise. The summary is injected into a system prompt.
+
+Output your summary as plain text only: the eight numbered sections, no
+intro label, no JSON, no markdown code fences — the text is injected
+directly into a system prompt and JSON escaping would corrupt it.`
 
 func (c *Compressor) buildSummarizePrompt(messages []openagent.Message, prev *openagent.CompressedContext) string {
 	var b strings.Builder
+	if c.maxTokens > 0 {
+		fmt.Fprintf(&b, "Target length: keep the summary under %d tokens.\n\n", c.maxTokens)
+	}
 	if prev != nil && prev.Summary != "" {
 		b.WriteString("## Existing Summary\n")
 		b.WriteString(prev.Summary)
@@ -132,49 +158,3 @@ func truncateContent(s string, n int) string {
 	return string(runes[:n-3]) + "..."
 }
 
-// ── Parsing ──
-
-func parseSummary(raw string) (*openagent.CompressedContext, error) {
-	raw = strings.TrimSpace(raw)
-	// Strip markdown fences.
-	if strings.HasPrefix(raw, "```") {
-		raw = strings.TrimPrefix(raw, "```json")
-		raw = strings.TrimPrefix(raw, "```")
-		if idx := strings.LastIndex(raw, "```"); idx >= 0 {
-			raw = raw[:idx]
-		}
-		raw = strings.TrimSpace(raw)
-	}
-	// Find JSON object bounds.
-	if idx := strings.Index(raw, "{"); idx > 0 {
-		raw = raw[idx:]
-	}
-	if idx := strings.LastIndex(raw, "}"); idx >= 0 && idx < len(raw)-1 {
-		raw = raw[:idx+1]
-	}
-
-	var out struct {
-		Summary string `json:"summary"`
-		Hints   []struct {
-			Description string `json:"description"`
-			Query       string `json:"query"`
-		} `json:"hints"`
-	}
-	if err := json.Unmarshal([]byte(raw), &out); err != nil {
-		return nil, fmt.Errorf("summarizer: parse JSON: %w (raw: %.200s)", err, raw)
-	}
-	if out.Summary == "" {
-		return nil, fmt.Errorf("summarizer: model returned empty summary")
-	}
-
-	cc := &openagent.CompressedContext{Summary: out.Summary}
-	for _, h := range out.Hints {
-		if h.Description != "" && h.Query != "" {
-			cc.Hints = append(cc.Hints, openagent.RetrievalHint{
-				Description: h.Description,
-				Query:       h.Query,
-			})
-		}
-	}
-	return cc, nil
-}

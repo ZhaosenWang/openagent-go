@@ -73,6 +73,24 @@ type Context struct {
 	// Model selection.
 	SetModel   func(modelID string) error // persists + sends config_option_update notification
 	ListModels func() []string            // available model IDs
+
+	// Compaction.
+	Compact      func() (*CompactStats, error)  // compacts all history into a summary
+	ContextStats func() (*ContextStats, error)  // per-layer context usage (nil = unavailable)
+}
+
+// CompactStats reports the outcome of a manual /compact.
+type CompactStats struct {
+	Compressed    int // messages covered by the new summary
+	FreedTokens   int // prompt tokens removed from the working set (approx)
+	SummaryTokens int // tokens the new summary occupies
+}
+
+// ContextStats is the per-layer context usage shown by /context.
+type ContextStats struct {
+	SummaryTokens int // compressed-history summary
+	WorkingTokens int // uncompressed messages in the store
+	Window        int // model context window
 }
 
 // SessionInfo is a summary returned by /sessions.

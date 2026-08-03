@@ -24,7 +24,7 @@ var (
 	}
 	builtinRecallDef = openagent.FunctionDefinition{
 		Name:        "recall",
-		Description: "Search the full message archive for exact details — commands, file names, dates, numbers, or verbatim text — that the conversation summary may have omitted. Do NOT use for general context or preferences; the conversation summary and semantic memory already cover those. Returns ranked results with relevance scores.",
+		Description: "Search the long-term memory store (knowledge extracted from past sessions) for durable facts about the user and the project — preferences, decisions, technical details. It does NOT search this session's raw message history: details omitted by the conversation summary are not retrievable via recall. Returns ranked results with relevance scores.",
 		Parameters:  openagent.SchemaOf[RecallParams](),
 	}
 )

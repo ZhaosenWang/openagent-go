@@ -268,6 +268,11 @@ func (h *TeamHandler) handleChat(w http.ResponseWriter, r *http.Request) {
 	s := h.sm.getOrCreate(r.Context(), id)
 
 	s.mu.Lock()
+	if s.running {
+		s.mu.Unlock()
+		http.Error(w, `{"error":"session busy — a run is in progress"}`, http.StatusConflict)
+		return
+	}
 	s.running = true
 	s.pendingApproval = nil
 	s.mu.Unlock()
@@ -314,6 +319,13 @@ func (h *TeamHandler) handleChat(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 		defer cancel()
 		defer func() {
+			// A panic in the run must not kill the server: log it and let
+			// the subscriber see an error event instead (mirrors
+			// handler.go's run goroutine).
+			if rec := recover(); rec != nil {
+				slog.Error("openagent: team run panicked", "session", id, "panic", rec)
+				h.sm.Bus().Publish(id, SSEEvent{Type: "error", Error: "agent run panicked"})
+			}
 			s.mu.Lock()
 			s.running = false
 			s.pendingApproval = nil

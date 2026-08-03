@@ -81,8 +81,11 @@ func (rt *Runtime) executeTools(ctx context.Context, session openagent.Session, 
 			continue
 		}
 		if err := h.Wait(ctx); err != nil && ctx.Err() != nil {
-			// Run cancelled mid-execution: cancel the rest, keep partial
-			// results (the loop's cancel compensation persists them).
+			// Run cancelled mid-execution: cancel this job and the rest,
+			// keep the (complete) results — Output below waits for the
+			// job to actually finish, so the loop's cancel compensation
+			// sees real tool results, not zero-value messages.
+			h.Cancel()
 			for _, rest := range handles[i+1:] {
 				if rest != nil {
 					rest.Cancel()

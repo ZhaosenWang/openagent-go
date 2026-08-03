@@ -4,6 +4,7 @@ import "strings"
 
 const (
 	Window1M   = 1_000_000
+	Window400K = 400_000
 	Window256K = 256_000
 	Window224K = 224_000
 	Window200K = 200_000
@@ -24,6 +25,15 @@ func ModelContextWindow(modelID string) int {
 	lower := strings.ToLower(modelID)
 
 	switch {
+	// ── OpenAI ──
+	// https://platform.openai.com/docs/models
+	case has(lower, "o1") || has(lower, "o3") || has(lower, "o4"):
+		return Window200K // o-series reasoning: 200K context
+	case has(lower, "gpt-5"):
+		return Window400K // GPT-5 family: 400K context
+	case has(lower, "gpt-4o") || has(lower, "gpt-4"):
+		return Window128K
+
 	// ── DeepSeek ──
 	// https://api-docs.deepseek.com/zh-cn/quick_start/pricing
 	case has(lower, "deepseek"):

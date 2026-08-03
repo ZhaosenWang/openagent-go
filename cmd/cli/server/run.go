@@ -29,8 +29,11 @@ func RunCLI(ctx context.Context, cfg *config.Config, message string) error {
 	}
 
 	// 2. Memory + knowledge (same wiring as RunACP/RunREST).
+	// Capabilities come from settings.json like every other mode — run is
+	// not special-cased to defaults-on.
+	caps := cfg.Capabilities
 	profilesDir := resolveProfilesDir(cfg.Profiles)
-	ms, knowledge, _, cleanup, err := buildMemory(profilesDir, cfg.Embedding, true)
+	ms, knowledge, _, cleanup, err := buildMemory(profilesDir, cfg.Embedding, caps.OnEmbedder())
 	if err != nil {
 		return err
 	}
@@ -51,28 +54,29 @@ func RunCLI(ctx context.Context, cfg *config.Config, message string) error {
 	}
 
 	// 5. Construct agent config (pure) + runtime deps.
-	// Zero-value capabilities = defaults on (memory, skills, summarizer).
 	opts := []agent.Option{
 		agent.WithModel(m),
 		agent.WithSystemPrompts(prompts...),
 		agent.WithMaxTurns(50),
 	}
-	caps := config.Capabilities{}
 	opts, skillProvider := buildOpts(opts, caps, m)
 	agentCfg := agent.New("openagent", opts...)
 
 	deps := buildRuntimeDeps(caps, cfg.Sensitive)
 	deps.Tools = tools
-	deps.SessionStore = ms
-	deps.Compressor = ms
-	deps.MemoryProvider = knowledge
 	deps.SkillProvider = skillProvider
-	if caps.OnSummarizer() && m != nil {
+	if caps.OnMemory() {
+		deps.SessionStore = ms
+		deps.Compressor = ms
+		deps.MemoryProvider = knowledge
+		// One shared background extractor: knowledge from this run is
+		// stored and recalled by later runs (and by the servers sharing
+		// this db).
+		deps.Extractor = ctxpkg.NewAsyncExtractor(ctxpkg.NewLLMExtractor(m, knowledge))
+	}
+	if caps.OnMemory() && caps.OnSummarizer() && m != nil {
 		ms.WithSummarizer(summarizer.New(m).WithMaxTokens(agentCfg.MaxCompressedTokens))
 	}
-	// One shared background extractor: knowledge from this run is stored
-	// and recalled by later runs (and by the servers sharing this db).
-	deps.Extractor = ctxpkg.NewAsyncExtractor(ctxpkg.NewLLMExtractor(m, knowledge))
 
 	// 6. Fresh session per run (no cross-run conversation history, but
 	// durable knowledge is user-level and carries across runs).

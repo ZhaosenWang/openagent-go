@@ -75,7 +75,16 @@ func isRetryable(msg openagent.Message) bool {
 
 func (j *job) ID() string { return j.call.ID }
 
-func (j *job) Output() openagent.Message { return j.output }
+// Output blocks until the job finishes, then returns its final message.
+// Waiting on done (instead of reading j.output directly) gives the
+// happens-before edge: Wait may return early on ctx cancellation while
+// the job goroutine is still writing j.output — an unsynchronized read
+// there is a data race and can hand back a zero-value message that the
+// kernel then commits into the session store.
+func (j *job) Output() openagent.Message {
+	<-j.done
+	return j.output
+}
 
 func (j *job) Wait(ctx context.Context) error {
 	select {

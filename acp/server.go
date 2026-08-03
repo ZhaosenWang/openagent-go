@@ -130,17 +130,23 @@ type agentSession struct {
 	cwd       string
 	createdAt time.Time
 
-	// modeMu guards the session mode state machine and cached plan entries
-	// (mode, previousMode, planEntries, injectedPlanTools). It supersedes
-	// the former planMu. All reads/writes of these four fields go through
-	// the accessors below (Mode/PreviousMode/PlanEntries/SetPlanEntries/
-	// ApplyPlanUpdates/ClearPlanEntries/transitionModeLocked/...), EXCEPT
-	// transitionModeLocked which callers invoke while already holding the
-	// write lock.
+	// modeMu guards ALL mutable session state: the mode state machine
+	// (mode, previousMode, planEntries, injectedPlanTools), config,
+	// cancel, totalTokens, modeTools, subAgentTools, and the session
+	// runtime reference (rt). It supersedes the former planMu. Reads and
+	// writes go through the accessors below
+	// (Mode/PreviousMode/PlanEntries/SetPlanEntries/ConfigValue/
+	// SetConfigValue/ConfigSnapshot/TotalTokens/setCancel/cancelPrompt/
+	// getRuntime/setRuntime/setSubAgentTools/ApplyPlanUpdates/
+	// ClearPlanEntries/transitionModeLocked/...), EXCEPT
+	// transitionModeLocked and applyModeTools which callers invoke while
+	// already holding the write lock.
 	//
-	// The runner runs tool calls in parallel goroutines (runner.go
-	// executeTools), and plan_create/plan_update/enter_plan_mode/
-	// exit_plan_mode closures all touch this state, so it MUST be guarded.
+	// Three execution flows touch this state and MUST be guarded: the
+	// serve loop (RPCs), the per-session prompt goroutine (serialized by
+	// acp/sdk/server.go), and tool callbacks running in parallel
+	// goroutines (executeTools) — plan_create/plan_update/
+	// enter_plan_mode/exit_plan_mode closures, wasm runtime_set exports.
 	// Notifications are sent to the ACP single-writer queue (non-blocking,
 	// FIFO — see acp/sdk/server.go writeQueue), so holding modeMu across
 	// SendPlanUpdate is safe and preserves wire ordering
@@ -149,7 +155,10 @@ type agentSession struct {
 	// Lock-order: modeMu is acquired on its own. getSession takes s.mu
 	// and returns, releasing it before any modeMu use. modeMu is never
 	// held across saveMode/savePlan SessionStore I/O (those run after
-	// unlock; the snapshot is captured under the lock).
+	// unlock; the snapshot is captured under the lock). kernel.Runtime
+	// locks (rt.mu, rt.toolsMu) may be acquired while holding modeMu
+	// (applyModeTools); Runtime never calls back into agentSession, so
+	// there is no inversion.
 	modeMu       sync.RWMutex
 	mode         string                          // "auto", "manual", or "plan"
 	previousMode string                          // mode saved when plan was entered; used by exit_plan_mode
@@ -209,8 +218,108 @@ type agentSession struct {
 	// for plan, execution set for auto/manual). applyModeTools removes
 	// these by name (tracking the actual injected instances, not a
 	// hard-coded whitelist) and re-injects for the new mode. Guarded by
-	// the caller (mode transitions are serialized on the session).
+	// modeMu (applyModeTools holds the write lock for its whole body).
 	modeTools []openagent.Tool
+}
+
+// ── agentSession config/cancel/tokens/runtime accessors (modeMu-guarded) ──
+
+// ConfigValue returns a session config option (nil when absent). Safe
+// for concurrent hot-path readers.
+func (ss *agentSession) ConfigValue(key openacp.SessionConfigId) any {
+	ss.modeMu.RLock()
+	defer ss.modeMu.RUnlock()
+	return ss.config[key]
+}
+
+// ConfigString returns a config option's string value; ok is true only
+// when the option exists AND holds a string.
+func (ss *agentSession) ConfigString(key openacp.SessionConfigId) (string, bool) {
+	v, ok := ss.ConfigValue(key).(string)
+	return v, ok
+}
+
+// SetConfigValue stores a config option.
+func (ss *agentSession) SetConfigValue(key openacp.SessionConfigId, val any) {
+	ss.modeMu.Lock()
+	defer ss.modeMu.Unlock()
+	ss.config[key] = val
+}
+
+// ConfigSnapshot returns a copy of the config map for persistence. A
+// copy is required: the live map is mutated by SetConfigValue while
+// SessionStore.Save JSON-marshals the stored value.
+func (ss *agentSession) ConfigSnapshot() map[openacp.SessionConfigId]any {
+	ss.modeMu.RLock()
+	defer ss.modeMu.RUnlock()
+	out := make(map[openacp.SessionConfigId]any, len(ss.config))
+	for k, v := range ss.config {
+		out[k] = v
+	}
+	return out
+}
+
+// TotalTokens returns the accumulated token count.
+func (ss *agentSession) TotalTokens() int {
+	ss.modeMu.RLock()
+	defer ss.modeMu.RUnlock()
+	return ss.totalTokens
+}
+
+// setTotalTokens replaces the accumulated token count.
+func (ss *agentSession) setTotalTokens(n int) {
+	ss.modeMu.Lock()
+	defer ss.modeMu.Unlock()
+	ss.totalTokens = n
+}
+
+// addTotalTokens adds to the accumulated token count and returns the new
+// total (the caller persists it to the store).
+func (ss *agentSession) addTotalTokens(n int) int {
+	ss.modeMu.Lock()
+	defer ss.modeMu.Unlock()
+	ss.totalTokens += n
+	return ss.totalTokens
+}
+
+// setCancel stores the per-prompt cancel function (nil clears it).
+func (ss *agentSession) setCancel(f context.CancelFunc) {
+	ss.modeMu.Lock()
+	defer ss.modeMu.Unlock()
+	ss.cancel = f
+}
+
+// cancelPrompt invokes the current per-prompt cancel function, if any.
+func (ss *agentSession) cancelPrompt() {
+	ss.modeMu.RLock()
+	f := ss.cancel
+	ss.modeMu.RUnlock()
+	if f != nil {
+		f()
+	}
+}
+
+// getRuntime returns the session-scoped Runtime (nil before first build).
+func (ss *agentSession) getRuntime() *kernel.Runtime {
+	ss.modeMu.RLock()
+	defer ss.modeMu.RUnlock()
+	return ss.rt
+}
+
+// setRuntime stores the session-scoped Runtime.
+func (ss *agentSession) setRuntime(rt *kernel.Runtime) {
+	ss.modeMu.Lock()
+	defer ss.modeMu.Unlock()
+	ss.rt = rt
+}
+
+// setSubAgentTools caches the delegation tool instances (kernel.New
+// registers cfg.SubAgents as tools) for re-injection after plan mode.
+// Guarded by modeMu: applyModeTools reads the slice.
+func (ss *agentSession) setSubAgentTools(tools []openagent.Tool) {
+	ss.modeMu.Lock()
+	defer ss.modeMu.Unlock()
+	ss.subAgentTools = tools
 }
 
 // ── agentSession plan/mode state accessors (modeMu-guarded) ──
@@ -407,6 +516,27 @@ func (s *AgentServer) SetModel(provider, modelID, apiKey, baseURL string, maxInp
 	}
 }
 
+// modelIDs returns the registered model ids under modelsMu. SetModel
+// (wasm runtime_set_model_config) can insert concurrently from a tool
+// goroutine, so all iterations must go through this helper.
+func (s *AgentServer) modelIDs() []string {
+	s.modelsMu.Lock()
+	defer s.modelsMu.Unlock()
+	ids := make([]string, 0, len(s.Models))
+	for id := range s.Models {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+// lookupModel returns the model registered under id, under modelsMu.
+func (s *AgentServer) lookupModel(id string) (openagent.Model, bool) {
+	s.modelsMu.Lock()
+	defer s.modelsMu.Unlock()
+	m, ok := s.Models[id]
+	return m, ok
+}
+
 // SetDefaultModelID sets the default model used when a session has not
 // selected one (settings "model" wins over the first-registered fallback).
 // Returns false when id is not a registered model.
@@ -418,6 +548,14 @@ func (s *AgentServer) SetDefaultModelID(id string) bool {
 	}
 	s.defaultModelID = id
 	return true
+}
+
+// getDefaultModelID returns the default model id under modelsMu
+// (SetDefaultModelID runs concurrently from the serve loop).
+func (s *AgentServer) getDefaultModelID() string {
+	s.modelsMu.Lock()
+	defer s.modelsMu.Unlock()
+	return s.defaultModelID
 }
 
 // RegisterModel stores a model's original config for SetModel fallback.
@@ -448,14 +586,12 @@ type ModelPricing struct {
 // they can be set on session.Provider / session.ModelID for runtime_* host
 // exports and buildModelRequest.
 func (s *AgentServer) resolveModelConfig(ss *agentSession) (provider, modelID string) {
-	key := s.defaultModelID
-	if v, ok := ss.config["model"]; ok {
-		if val, ok := v.(string); ok {
-			key = val
-		}
-	}
 	s.modelsMu.Lock()
 	defer s.modelsMu.Unlock()
+	key := s.defaultModelID
+	if val, ok := ss.ConfigString("model"); ok {
+		key = val
+	}
 	if mc, ok := s.modelConfigs[key]; ok {
 		return mc.Provider, mc.ModelID
 	}
@@ -600,9 +736,9 @@ func (s *AgentServer) saveConfig(ctx context.Context, sessionID string) {
 	if err != nil || info == nil {
 		return
 	}
-	ss.modeMu.RLock()
-	info.SetMeta("config", ss.config)
-	ss.modeMu.RUnlock()
+	// Snapshot under the lock: the live map mutates on every
+	// SetConfigValue while Save marshals the stored value.
+	info.SetMeta("config", ss.ConfigSnapshot())
 	if err := s.Runtime.Save(ctx, *info); err != nil {
 		slog.Warn("openagent: session config save failed", "error", err)
 	}
@@ -711,8 +847,8 @@ func (s *AgentServer) removeSession(id openacp.SessionId) {
 	ss := s.sessions[id]
 	delete(s.sessions, id)
 	s.mu.Unlock()
-	if ss != nil && ss.cancel != nil {
-		ss.cancel()
+	if ss != nil {
+		ss.cancelPrompt()
 	}
 }
 
@@ -799,7 +935,7 @@ func (s *AgentServer) OnNewSession(ctx context.Context, req openacp.NewSessionRe
 		}
 	}
 	// Build the session-scoped Runtime once; reused for every prompt.
-	ss.rt = s.buildRuntimeForSession(id, ss)
+	ss.setRuntime(s.buildRuntimeForSession(id, ss))
 	s.putSession(id, ss)
 	s.saveMeta(ctx, string(id), cwd, "acp", req.Meta)
 
@@ -851,12 +987,12 @@ func (s *AgentServer) OnLoadSession(ctx context.Context, req openacp.LoadSession
 			}
 		}
 		// Build the session-scoped Runtime once; reused for every prompt.
-		ss.rt = s.buildRuntimeForSession(req.SessionID, ss)
+		ss.setRuntime(s.buildRuntimeForSession(req.SessionID, ss))
 		s.putSession(req.SessionID, ss)
 	}
 
 	// Restore accumulated token count so /context survives server restarts.
-	ss.totalTokens = s.loadTotalTokens(ctx, string(req.SessionID))
+	ss.setTotalTokens(s.loadTotalTokens(ctx, string(req.SessionID)))
 
 	// Replay history from Memory if available.
 	if s.Mem != nil {
@@ -998,11 +1134,11 @@ func (s *AgentServer) OnResumeSession(ctx context.Context, req openacp.ResumeSes
 			}
 		}
 		// Build the session-scoped Runtime once; reused for every prompt.
-		ss.rt = s.buildRuntimeForSession(req.SessionID, ss)
+		ss.setRuntime(s.buildRuntimeForSession(req.SessionID, ss))
 		s.putSession(req.SessionID, ss)
 	}
 	// Restore accumulated token count so /context survives server restarts.
-	ss.totalTokens = s.loadTotalTokens(ctx, string(req.SessionID))
+	ss.setTotalTokens(s.loadTotalTokens(ctx, string(req.SessionID)))
 	// Load persisted plan into memory (no replay per ACP spec:
 	// session/resume MUST NOT replay history).
 	if ss.PlanEntries() == nil {
@@ -1067,18 +1203,14 @@ func (s *AgentServer) buildConfigOptions(sid openacp.SessionId) []openacp.Sessio
 	ss := s.getSession(sid)
 	mode := "auto"
 	thoughtLevel := "medium"
-	modelID := s.defaultModelID
+	modelID := s.getDefaultModelID()
 	if ss != nil {
 		mode = ss.Mode()
-		if v, ok := ss.config["thought_level"]; ok {
-			if val, ok := v.(string); ok {
-				thoughtLevel = val
-			}
+		if val, ok := ss.ConfigString("thought_level"); ok {
+			thoughtLevel = val
 		}
-		if v, ok := ss.config["model"]; ok {
-			if val, ok := v.(string); ok {
-				modelID = val
-			}
+		if val, ok := ss.ConfigString("model"); ok {
+			modelID = val
 		}
 	}
 
@@ -1112,9 +1244,9 @@ func (s *AgentServer) buildConfigOptions(sid openacp.SessionId) []openacp.Sessio
 	}
 
 	// Model selector.
-	if len(s.Models) > 0 {
-		modelOpts := make([]openacp.SessionConfigOptValue, 0, len(s.Models))
-		for id := range s.Models {
+	if ids := s.modelIDs(); len(ids) > 0 {
+		modelOpts := make([]openacp.SessionConfigOptValue, 0, len(ids))
+		for _, id := range ids {
 			modelOpts = append(modelOpts, openacp.SessionConfigOptValue{Value: id, Name: id})
 		}
 		opts = append(opts, openacp.SessionConfigOption{
@@ -1191,7 +1323,7 @@ func (s *AgentServer) setSessionMode(ctx context.Context, sid openacp.SessionId,
 
 	// Swap the permanent tool set + approver on the session runtime
 	// (plan ⇄ auto/manual). The skill cache and sandbox state survive.
-	s.applyModeTools(sid, ss, ss.rt)
+	s.applyModeTools(sid, ss, ss.getRuntime())
 	return nil
 }
 
@@ -1244,11 +1376,11 @@ func (s *AgentServer) OnSetSessionConfigOption(ctx context.Context, req openacp.
 	switch req.Type {
 	case "boolean":
 		if b, ok := req.Value.(bool); ok {
-			ss.config[req.ConfigID] = b
+			ss.SetConfigValue(req.ConfigID, b)
 		}
 	default:
 		if val, ok := req.Value.(string); ok {
-			ss.config[req.ConfigID] = val
+			ss.SetConfigValue(req.ConfigID, val)
 		}
 	}
 
@@ -1261,7 +1393,7 @@ func (s *AgentServer) OnSetSessionConfigOption(ctx context.Context, req openacp.
 	// config_option_update, so skip the duplicate notification below.
 	needsConfigUpdate := true
 	if req.ConfigID == "mode" {
-		if v, ok := ss.config["mode"].(string); ok {
+		if v, ok := ss.ConfigString("mode"); ok {
 			_ = s.setSessionMode(ctx, req.SessionID, v)
 			needsConfigUpdate = false // already sent by setSessionMode
 		}
@@ -1269,12 +1401,12 @@ func (s *AgentServer) OnSetSessionConfigOption(ctx context.Context, req openacp.
 
 	// Live-sync model / reasoning-effort onto the session runtime so the
 	// next prompt uses the new config without a runtime rebuild.
-	if ss.rt != nil {
+	if rt := ss.getRuntime(); rt != nil {
 		switch req.ConfigID {
 		case "model":
-			if v, ok := ss.config["model"].(string); ok {
-				if m, ok := s.Models[v]; ok {
-					ss.rt.SetModel(m)
+			if v, ok := ss.ConfigString("model"); ok {
+				if m, ok := s.lookupModel(v); ok {
+					rt.SetModel(m)
 				} else {
 					// The requested model is not in the provider list —
 					// keep the current model, but don't stay silent.
@@ -1282,8 +1414,8 @@ func (s *AgentServer) OnSetSessionConfigOption(ctx context.Context, req openacp.
 				}
 			}
 		case "thought_level":
-			if v, ok := ss.config["thought_level"].(string); ok && v != "" {
-				ss.rt.SetReasoningEffort(v)
+			if v, ok := ss.ConfigString("thought_level"); ok && v != "" {
+				rt.SetReasoningEffort(v)
 			}
 		}
 	}
@@ -1329,9 +1461,9 @@ func (s *AgentServer) OnPrompt(ctx context.Context, req openacp.PromptRequest, s
 	// can inject plan_create + exit_plan_mode again this turn.
 	ss.ResetPlanToolsInjected()
 	ctx, cancel := context.WithCancel(ctx)
-	ss.cancel = cancel
+	ss.setCancel(cancel)
 	defer func() {
-		ss.cancel = nil
+		ss.setCancel(nil)
 		cancel()
 	}()
 
@@ -1361,10 +1493,10 @@ func (s *AgentServer) OnPrompt(ctx context.Context, req openacp.PromptRequest, s
 	// Built once at session creation; per-turn changes are incremental
 	// (plan tools rebinding below, mode transitions via applyModeTools).
 	// The skill cache, sandbox state, and tool set survive across turns.
-	agent := ss.rt
+	agent := ss.getRuntime()
 	if agent == nil {
 		agent = s.buildRuntimeForSession(req.SessionID, ss)
-		ss.rt = agent
+		ss.setRuntime(agent)
 	}
 
 	providerID, modelID := s.resolveModelConfig(ss)
@@ -1481,8 +1613,8 @@ func (s *AgentServer) OnPrompt(ctx context.Context, req openacp.PromptRequest, s
 		}
 	}
 
-	ss.totalTokens += usage.TotalTokens
-	s.saveTotalTokens(ctx, string(req.SessionID), ss.totalTokens)
+	total := ss.addTotalTokens(usage.TotalTokens)
+	s.saveTotalTokens(ctx, string(req.SessionID), total)
 
 	// Report *current* context usage (this turn's PromptTokens), not
 	// accumulated total. Per ACP spec, `used` means "tokens currently
@@ -1572,8 +1704,8 @@ func (s *AgentServer) contentBlocksToMessage(blocks []openacp.ContentBlock) (ope
 
 func (s *AgentServer) OnCancel(ctx context.Context, sid openacp.SessionId) error {
 	ss := s.getSession(sid)
-	if ss != nil && ss.cancel != nil {
-		ss.cancel()
+	if ss != nil {
+		ss.cancelPrompt()
 	}
 	return nil
 }
@@ -1631,28 +1763,24 @@ func (s *AgentServer) buildRuntimeForSession(sid openacp.SessionId, ss *agentSes
 	deps.ApprovalMemory = s.approvalMemory
 
 	// Resolve model from the session config registry.
-	modelID := s.defaultModelID
-	if v, ok := ss.config["model"]; ok {
-		if val, ok := v.(string); ok {
-			modelID = val
-		}
+	modelID := s.getDefaultModelID()
+	if val, ok := ss.ConfigString("model"); ok {
+		modelID = val
 	}
-	if m, ok := s.Models[modelID]; ok {
+	if m, ok := s.lookupModel(modelID); ok {
 		cfg.Model = m
-	} else if m, ok := s.Models[s.defaultModelID]; ok {
+	} else if m, ok := s.lookupModel(s.getDefaultModelID()); ok {
 		// The session's saved model is no longer in the provider list
 		// (removed/renamed after the session was saved) — fall back to the
 		// default instead of leaving cfg.Model nil, which would make a
 		// restored session fail every turn with "no model configured".
-		if v, _ := ss.config["model"].(string); v != "" && v != s.defaultModelID {
-			slog.Warn("openagent: session model not in provider list, falling back to default", "session", sid, "model", v, "default", s.defaultModelID)
+		if v, _ := ss.ConfigString("model"); v != "" && v != s.getDefaultModelID() {
+			slog.Warn("openagent: session model not in provider list, falling back to default", "session", sid, "model", v, "default", s.getDefaultModelID())
 		}
 		cfg.Model = m
 	}
-	if v, ok := ss.config["thought_level"]; ok {
-		if val, ok := v.(string); ok && val != "" {
-			cfg.ReasoningEffort = val
-		}
+	if v, ok := ss.ConfigString("thought_level"); ok && v != "" {
+		cfg.ReasoningEffort = v
 	}
 
 	// Override system prompts with session-cwd-aware profiles so each
@@ -1671,15 +1799,19 @@ func (s *AgentServer) buildRuntimeForSession(sid openacp.SessionId, ss *agentSes
 	rt := kernel.New(cfg, deps)
 
 	// Cache delegation tools for re-injection after plan mode.
+	// Guarded by modeMu: applyModeTools reads the slice during a
+	// concurrent mode transition.
 	if len(cfg.SubAgents) > 0 {
 		want := subAgentToolNames(cfg)
+		var cached []openagent.Tool
 		for _, t := range rt.SnapshotTools() {
 			for _, n := range want {
 				if t.Definition().Name == n {
-					ss.subAgentTools = append(ss.subAgentTools, t)
+					cached = append(cached, t)
 				}
 			}
 		}
+		ss.setSubAgentTools(cached)
 	}
 
 	// Initial mode tool set + approver.
@@ -1698,6 +1830,17 @@ func (s *AgentServer) buildRuntimeForSession(sid openacp.SessionId, ss *agentSes
 // NOT touched here — they close over the per-prompt sender and are
 // rebound each prompt by reconcilePlanTools.
 func (s *AgentServer) applyModeTools(sid openacp.SessionId, ss *agentSession, rt *kernel.Runtime) {
+	// Hold modeMu for the whole body: applyModeTools runs from the serve
+	// loop (set_mode / set_config_option "mode"), the prompt goroutine
+	// (slash /mode), and tool callbacks (enter/exit_plan_mode), all of
+	// which can interleave with a concurrent mode transition. modeTools
+	// and subAgentTools are read/written under the lock; ss.mode is read
+	// directly (Mode() would re-lock and self-deadlock). No I/O happens
+	// under the lock — rt.RemoveTools/AppendTools/SetHumanApprover are
+	// in-memory, so the lock-order comment on modeMu holds.
+	ss.modeMu.Lock()
+	defer ss.modeMu.Unlock()
+
 	// Drop the previous mode's tools by the names we actually injected.
 	drop := toolNames(ss.modeTools)
 	drop = append(drop, subAgentToolNames(rt.Config())...)
@@ -1705,7 +1848,7 @@ func (s *AgentServer) applyModeTools(sid openacp.SessionId, ss *agentSession, rt
 	ss.modeTools = nil
 
 	var add []openagent.Tool
-	switch ss.Mode() {
+	switch ss.mode {
 	case "plan":
 		// Read-only tools only — local read/ls/grep plus client
 		// read_client_file, so the model can inspect the workspace while
@@ -1736,7 +1879,7 @@ func (s *AgentServer) applyModeTools(sid openacp.SessionId, ss *agentSession, rt
 		add = append(add, s.executionTools(sid, ss)...)
 		add = append(add, ss.subAgentTools...)
 
-		if ss.Mode() == "manual" && s.clientRPC != nil {
+		if ss.mode == "manual" && s.clientRPC != nil {
 			rt.SetHumanApprover(&acpApprover{client: s.clientRPC, sessionID: sid, memory: s.approvalMemory})
 		} else {
 			rt.SetHumanApprover(nil)
@@ -1940,7 +2083,7 @@ func (s *AgentServer) makeExitCallback(
 		// Swap the permanent tool set + approver for subsequent model calls
 		// THIS turn. Safe: rt.AppendTools/RemoveTools are lock-guarded, and
 		// the next executeTools batch reads the updated tool set.
-		s.applyModeTools(sid, ss, ss.rt)
+		s.applyModeTools(sid, ss, ss.getRuntime())
 		return nil
 	}
 }
@@ -1998,7 +2141,7 @@ func (s *AgentServer) buildSlashContext(ctx context.Context, sid openacp.Session
 		SessionID:   string(sid),
 		Cwd:         ss.cwd,
 		Mode:        ss.Mode(),
-		TotalTokens: ss.totalTokens,
+		TotalTokens: ss.TotalTokens(),
 		CreatedAt:   ss.createdAt,
 		SetMode: func(mode string) error {
 			return s.setSessionMode(ctx, sid, mode)
@@ -2012,7 +2155,7 @@ func (s *AgentServer) buildSlashContext(ctx context.Context, sid openacp.Session
 					return err
 				}
 			}
-			ss.totalTokens = 0
+			ss.setTotalTokens(0)
 			s.saveTotalTokens(ctx, string(sid), 0)
 			ss.ClearPlanEntries()
 			s.savePlan(ctx, string(sid), nil)
@@ -2035,13 +2178,13 @@ func (s *AgentServer) buildSlashContext(ctx context.Context, sid openacp.Session
 			return out, nil
 		},
 		SetModel: func(modelID string) error {
-			m, ok := s.Models[modelID]
+			m, ok := s.lookupModel(modelID)
 			if !ok {
 				return fmt.Errorf("unknown model: %s", modelID)
 			}
-			ss.config["model"] = modelID
-			if ss.rt != nil {
-				ss.rt.SetModel(m)
+			ss.SetConfigValue("model", modelID)
+			if rt := ss.getRuntime(); rt != nil {
+				rt.SetModel(m)
 			}
 			s.saveConfig(ctx, string(sid))
 			if s.updateSender != nil {
@@ -2054,11 +2197,45 @@ func (s *AgentServer) buildSlashContext(ctx context.Context, sid openacp.Session
 			return nil
 		},
 		ListModels: func() []string {
-			ids := make([]string, 0, len(s.Models))
-			for id := range s.Models {
-				ids = append(ids, id)
+			return s.modelIDs()
+		},
+		// Both callbacks touch the session runtime, which is built lazily
+		// on the first prompt (slash dispatch runs BEFORE that build). Build
+		// on demand so /compact and /context work on a fresh session too.
+		Compact: func() (*slash.CompactStats, error) {
+			rt := ss.getRuntime()
+			if rt == nil {
+				rt = s.buildRuntimeForSession(sid, ss)
+				ss.setRuntime(rt)
 			}
-			return ids
+			st, err := rt.CompressAll(ctx, string(sid))
+			if err != nil {
+				return nil, err
+			}
+			if st == nil {
+				return &slash.CompactStats{}, nil // no compressor configured
+			}
+			return &slash.CompactStats{
+				Compressed:    st.Compressed,
+				FreedTokens:   st.FreedTokens,
+				SummaryTokens: st.SummaryTokens,
+			}, nil
+		},
+		ContextStats: func() (*slash.ContextStats, error) {
+			rt := ss.getRuntime()
+			if rt == nil {
+				rt = s.buildRuntimeForSession(sid, ss)
+				ss.setRuntime(rt)
+			}
+			summary, working, window, err := rt.ContextUsage(ctx, string(sid))
+			if err != nil {
+				return nil, err
+			}
+			return &slash.ContextStats{
+				SummaryTokens: summary,
+				WorkingTokens: working,
+				Window:        window,
+			}, nil
 		},
 	}
 }
@@ -2163,13 +2340,11 @@ func isPlanTool(name string) bool {
 // configured per-token pricing. Unconfigured rates are 0 (free): a model
 // without pricing reports cost 0 — an explicit value, not an absent one.
 func (s *AgentServer) usageCost(ss *agentSession, usage openagent.Usage) *openacp.Cost {
-	key := s.defaultModelID
-	if v, ok := ss.config["model"]; ok {
-		if val, ok := v.(string); ok {
-			key = val
-		}
-	}
 	s.modelsMu.Lock()
+	key := s.defaultModelID
+	if val, ok := ss.ConfigString("model"); ok {
+		key = val
+	}
 	mc := s.modelConfigs[key]
 	s.modelsMu.Unlock()
 	cached := usage.CacheReadTokens

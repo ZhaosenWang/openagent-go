@@ -69,8 +69,6 @@ func RunREST(ctx context.Context, cfg *config.Config, caps config.Capabilities) 
 		deps.SessionStore = ms
 		deps.Compressor = ms
 		deps.MemoryProvider = knowledge
-		// One shared background extractor per server (never per run).
-		deps.Extractor = ctxpkg.NewAsyncExtractor(ctxpkg.NewLLMExtractor(m, knowledge))
 	}
 
 	if caps.OnSummarizer() && m != nil && caps.OnMemory() {
@@ -80,6 +78,13 @@ func RunREST(ctx context.Context, cfg *config.Config, caps config.Capabilities) 
 	if err := applyContextProviders(cfg, &deps); err != nil {
 		return err
 	}
+	// The extractor captures the MemoryProvider it writes to — build it
+	// AFTER applyContextProviders so the effective provider is used.
+	// Building it earlier would fork writes to the local sqlite store
+	// while Recall reads the OpenViking index (silent knowledge loss).
+	if caps.OnMemory() && m != nil && deps.MemoryProvider != nil {
+		deps.Extractor = ctxpkg.NewAsyncExtractor(ctxpkg.NewLLMExtractor(m, deps.MemoryProvider))
+	}
 	handler := rest.NewHandler(agentCfg, deps).
 		WithSessionStore(store).
 		WithCleanupDir(func(sessionID string) {
@@ -87,7 +92,9 @@ func RunREST(ctx context.Context, cfg *config.Config, caps config.Capabilities) 
 			// (<ArtifactRoot()>/sess-<sessionID>/) and the REST
 			// handler's process dir layout (sess-<id>), so a single
 			// call cleans both artifacts and process output.
-			dir := filepath.Join(opentool.ArtifactRoot(), "sess-"+sessionID)
+			// Sanitized like the artifact writer (result.go): a hostile
+			// session id must not escape the /tmp/openagent tree.
+			dir := filepath.Join(opentool.ArtifactRoot(), "sess-"+openagent.SanitizeName(sessionID))
 			_ = os.RemoveAll(dir)
 		}).
 		WithApproverEnabled(caps.OnApprover()).

@@ -80,10 +80,6 @@ func RunACP(ctx context.Context, cfg *config.Config, caps config.Capabilities) e
 		deps.SessionStore = ms
 		deps.Compressor = ms
 		deps.MemoryProvider = knowledge
-		// One shared background extractor per server (never per run).
-		if firstM != nil {
-			deps.Extractor = ctxpkg.NewAsyncExtractor(ctxpkg.NewLLMExtractor(firstM, knowledge))
-		}
 	}
 
 	if caps.OnMemory() && caps.OnSummarizer() && firstM != nil {
@@ -112,6 +108,13 @@ func RunACP(ctx context.Context, cfg *config.Config, caps config.Capabilities) e
 
 	if err := applyContextProviders(cfg, &deps); err != nil {
 		return err
+	}
+	// The extractor captures the MemoryProvider it writes to — build it
+	// AFTER applyContextProviders so the effective provider is used.
+	// Building it earlier would fork writes to the local sqlite store
+	// while Recall reads the OpenViking index (silent knowledge loss).
+	if caps.OnMemory() && firstM != nil && deps.MemoryProvider != nil {
+		deps.Extractor = ctxpkg.NewAsyncExtractor(ctxpkg.NewLLMExtractor(firstM, deps.MemoryProvider))
 	}
 	srv := acp.NewAgentServer(agentCfg, deps, sessionStore, modelMap)
 	srv.AgentName = version.Name

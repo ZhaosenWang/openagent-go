@@ -40,6 +40,25 @@ func (rt *Runtime) prepareMemory(ctx context.Context, session openagent.Session)
 		return nil, ci, nil
 	}
 
+	// ── Load any existing summary unconditionally ──
+	// Manual compaction (/compact) can leave a session whose remaining
+	// messages fit the budget — without this load the summary would not
+	// be injected and history would silently vanish from the prompt.
+	// Auto-compaction below overwrites ci.compressed with the new summary.
+	if rt.deps.Compressor != nil {
+		if cc, err := rt.deps.Compressor.Compressed(ctx, session.ID); err == nil && cc != nil && cc.Summary != "" {
+			ci.compressed = cc
+		}
+	}
+	// Make the summary visible to the prompt-overhead estimate below
+	// (estimatePromptOverhead reads rt.compressed, which the loop assigns
+	// only AFTER prepareMemory returns). A freshly loaded summary must
+	// count against this turn's budget, or a small-window model plus a big
+	// summary overflows and hard-fails every run after /compact.
+	if ci.compressed != nil {
+		rt.compressed = ci.compressed
+	}
+
 	budget := rt.workingTokenBudget()
 
 	// ── Subtract fixed overhead that the prompt adds ──
@@ -72,9 +91,19 @@ func (rt *Runtime) prepareMemory(ctx context.Context, session openagent.Session)
 	globalOffset := totalCount - len(msgs)
 
 	// ── Compaction pass: compress overflow messages ──
+	// The token scan starts past the summary's coverage: already-compressed
+	// messages stay in the store but must not consume the working budget —
+	// counting them makes the overflow boundary drift into compressed
+	// territory, where Compact no-ops and the summary stalls.
 	overflow := len(msgs)
 	tokens := 0
-	for i := len(msgs) - 1; i >= 0; i-- {
+	startIdx := 0
+	if ci.compressed != nil {
+		if ti := ci.compressed.ThroughIndex - globalOffset; ti > startIdx {
+			startIdx = ti
+		}
+	}
+	for i := len(msgs) - 1; i >= startIdx; i-- {
 		tokens += openagent.CountMessageTokens(openagent.TokenizerModelID(rt.runModel), msgs[i])
 		if tokens > budget {
 			overflow = i + 1
@@ -91,7 +120,13 @@ func (rt *Runtime) prepareMemory(ctx context.Context, session openagent.Session)
 		}
 		globalCutoff := globalOffset + overflow
 		if rt.deps.Compressor != nil {
-			ci.err = rt.deps.Compressor.Compact(ctx, session.ID, globalCutoff, msgs)
+			// messages=nil: the backend re-fetches from the session head.
+			// globalCutoff is a GLOBAL message index, but msgs is the recent
+			// window — the backend's prefetch branch only trusts a slice
+			// that starts at the session head, so passing msgs here would
+			// misalign (cut the wrong range, and the head would silently
+			// vanish from both summary and working set).
+			ci.err = rt.deps.Compressor.Compact(ctx, session.ID, globalCutoff, nil)
 		}
 		if ci.err == nil && rt.deps.Compressor != nil {
 			if cc, err := rt.deps.Compressor.Compressed(ctx, session.ID); err == nil && cc != nil {
@@ -105,9 +140,33 @@ func (rt *Runtime) prepareMemory(ctx context.Context, session openagent.Session)
 		}
 	}
 
-	// ── Working set: trim to token budget ──
-	if overflow >= len(msgs) {
+	// ── Working set: trim to token budget and past the summary ──
+	// No compressor = trimming drops the head with no way to recover it
+	// (fail-loud philosophy: the prompt hard window check errors instead
+	// of silently forgetting). With a compressor, the start advances past
+	// both the overflow point and the summary's coverage — otherwise a
+	// session whose history fits the budget after /compact would inject
+	// the full transcript AND a summary of the same transcript.
+	if rt.deps.Compressor == nil {
 		return msgs, ci, nil
 	}
-	return msgs[overflow:], ci, nil
+	start := overflow
+	if start == len(msgs) {
+		// No token trim this turn — start from the summary boundary
+		// instead of the (meaningless) full-slice overflow point.
+		start = 0
+	}
+	if ci.compressed != nil {
+		if ti := ci.compressed.ThroughIndex - globalOffset; ti > start {
+			start = ti
+		}
+	}
+	// start must never overshoot: with an existing summary AND no overflow
+	// this turn (history fits the budget), start advances only to the
+	// summary's coverage — messages after it are NOT summarized and must
+	// stay in the working set.
+	if start > len(msgs) {
+		start = len(msgs)
+	}
+	return msgs[start:], ci, nil
 }

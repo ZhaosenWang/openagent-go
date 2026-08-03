@@ -6,11 +6,10 @@ package openagent
 // and durable knowledge in provider/memory.MemoryProvider. The root
 // package keeps only the shared types below.
 
-// CompressedContext bundles a summary with retrieval hints for the model.
+// CompressedContext bundles a summary with its coverage marker.
 type CompressedContext struct {
-	Summary      string          `json:"summary"`
-	Hints        []RetrievalHint `json:"hints"`
-	ThroughIndex int             `json:"through_index"`
+	Summary      string `json:"summary"`
+	ThroughIndex int    `json:"through_index"`
 	// ThroughIndex marks how many messages have been covered by this summary.
 	// The next compression pass only compresses messages after this index.
 	// 0 means no compression has occurred (or the summary was produced by

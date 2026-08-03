@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -32,15 +34,22 @@ type Model struct {
 // New creates a Model with the given API key, model ID, and base URL.
 // The context window is automatically detected from the model ID. Call
 // WithContextWindow to override.
+//
+// baseURL may be empty (the SDK default — api.openai.com — is used):
+// option.WithBaseURL("") would shadow the SDK default with an unusable
+// empty URL, so it is only applied when non-empty.
 func New(apiKey, modelID, baseURL string) *Model {
+	opts := []option.RequestOption{
+		option.WithAPIKey(apiKey),
+		option.WithHTTPClient(&http.Client{
+			Timeout: 5 * time.Minute,
+		}),
+	}
+	if baseURL != "" {
+		opts = append(opts, option.WithBaseURL(baseURL))
+	}
 	return &Model{
-		client: openaisdk.NewClient(
-			option.WithAPIKey(apiKey),
-			option.WithBaseURL(baseURL),
-			option.WithHTTPClient(&http.Client{
-				Timeout: 5 * time.Minute,
-			}),
-		),
+		client:        openaisdk.NewClient(opts...),
 		modelID:       modelID,
 		contextWindow: modelContextWindow(modelID),
 	}
@@ -53,7 +62,11 @@ func (m *Model) ContextWindow() int                  { return m.contextWindow }
 // o1/o3 reasoning models use the o200k encoding; everything else uses
 // cl100k.
 func (m *Model) TokenizerModel() string {
-	if strings.HasPrefix(m.modelID, "o1") || strings.HasPrefix(m.modelID, "o3") {
+	// o1/o3/gpt-4o use the o200k encoding; everything else maps to
+	// cl100k. cl100k overcounts CJK by ~60%, so gpt-4o sessions would
+	// compact prematurely without this branch.
+	if strings.HasPrefix(m.modelID, "o1") || strings.HasPrefix(m.modelID, "o3") ||
+		strings.HasPrefix(m.modelID, "gpt-4o") {
 		return "gpt-4o"
 	}
 	return "gpt-4"
@@ -344,10 +357,20 @@ func (s *streamReader) Next() bool {
 func (s *streamReader) Current() openagent.StreamChunk { return s.current }
 func (s *streamReader) Err() error {
 	err := s.stream.Err()
-	// Wrap 429/503 errors so the Runner can retry mid-stream failures.
+	// Wrap transient failures so the runner can retry mid-stream:
+	//   - 429/503 API errors (backpressure / overload)
+	//   - io.ErrUnexpectedEOF / net.Error (connection cut mid-chunk —
+	//     local model servers and flaky gateways truncate streams)
 	// Non-retryable errors are returned as-is to preserve error semantics.
 	var apiErr *openaisdk.Error
 	if errors.As(err, &apiErr) && (apiErr.StatusCode == 429 || apiErr.StatusCode == 503) {
+		return &openagent.RetryableError{Err: err}
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		return &openagent.RetryableError{Err: err}
+	}
+	var ne net.Error
+	if errors.As(err, &ne) {
 		return &openagent.RetryableError{Err: err}
 	}
 	return err
