@@ -11,6 +11,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 
 	openagent "github.com/yusheng-g/openagent-go"
 )
@@ -18,6 +19,7 @@ import (
 // Compressor implements openagent.Summarizer by calling the configured
 // Model to produce incremental summaries.
 type Compressor struct {
+	mu        sync.RWMutex
 	model     openagent.Model
 	maxTokens int // 0 = no hint; non-zero = prompt the model to keep the summary under this
 }
@@ -25,6 +27,14 @@ type Compressor struct {
 // New creates a Compressor backed by m.
 func New(m openagent.Model) *Compressor {
 	return &Compressor{model: m}
+}
+
+// SetModel updates the model used for summarization. Safe to call
+// concurrently with Summarize; the next call uses the new model.
+func (c *Compressor) SetModel(m openagent.Model) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.model = m
 }
 
 // WithMaxTokens sets a SOFT target for the summary size: the budget is
@@ -45,7 +55,10 @@ func (c *Compressor) WithMaxTokens(n int) *Compressor {
 // existing summary, producing an updated CompressedContext whose
 // ThroughIndex is left at zero (the caller sets it).
 func (c *Compressor) Summarize(ctx context.Context, messages []openagent.Message, previous *openagent.CompressedContext) (*openagent.CompressedContext, error) {
-	if c.model == nil {
+	c.mu.RLock()
+	model := c.model
+	c.mu.RUnlock()
+	if model == nil {
 		return nil, fmt.Errorf("summarizer: no model configured")
 	}
 	if len(messages) == 0 {
@@ -56,7 +69,7 @@ func (c *Compressor) Summarize(ctx context.Context, messages []openagent.Message
 	// No MaxTokens on purpose: a hard output cap truncates the JSON
 	// envelope mid-stream and parseSummary rejects it. Length control is
 	// the prompt hint below plus the prompt-side truncation in kernel.
-	resp, err := c.model.ChatCompletion(ctx, openagent.ChatCompletionRequest{
+	resp, err := model.ChatCompletion(ctx, openagent.ChatCompletionRequest{
 		Messages: []openagent.Message{
 			{Role: openagent.RoleSystem, Content: summarizeSystemPrompt},
 			{Role: openagent.RoleUser, Content: prompt},

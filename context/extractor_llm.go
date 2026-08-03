@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 
 	openagent "github.com/yusheng-g/openagent-go"
 )
@@ -68,6 +69,7 @@ const maxKnowledgeItems = 10
 
 // LLMExtractor extracts knowledge with the runtime model.
 type LLMExtractor struct {
+	mu sync.RWMutex
 	// Model is the model used for extraction (the runtime's resolved model).
 	Model openagent.Model
 	// Provider stores extracted knowledge.
@@ -81,9 +83,20 @@ func NewLLMExtractor(model openagent.Model, p MemoryProvider) *LLMExtractor {
 	return &LLMExtractor{Model: model, Provider: p, MaxItems: maxKnowledgeItems}
 }
 
+// SetModel updates the model used for extraction. Safe to call
+// concurrently with Extract; the next call uses the new model.
+func (e *LLMExtractor) SetModel(m openagent.Model) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.Model = m
+}
+
 // Extract implements Extractor.
 func (e *LLMExtractor) Extract(ctx context.Context, scope ContextScope, messages []openagent.Message) {
-	if e == nil || e.Model == nil || e.Provider == nil || len(messages) == 0 {
+	e.mu.RLock()
+	model := e.Model
+	e.mu.RUnlock()
+	if e == nil || model == nil || e.Provider == nil || len(messages) == 0 {
 		return
 	}
 	max := e.MaxItems
@@ -114,7 +127,7 @@ func (e *LLMExtractor) Extract(ctx context.Context, scope ContextScope, messages
 	input := "Conversation:\n" + transcript +
 		"\n\nExisting knowledge:\n" + existingText.String()
 
-	resp, err := e.Model.ChatCompletion(ctx, openagent.ChatCompletionRequest{
+	resp, err := model.ChatCompletion(ctx, openagent.ChatCompletionRequest{
 		Messages: []openagent.Message{
 			{Role: openagent.RoleSystem, Content: extractionPrompt},
 			{Role: openagent.RoleUser, Content: input},

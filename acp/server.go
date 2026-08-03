@@ -30,6 +30,7 @@ import (
 	"github.com/yusheng-g/openagent-go/process"
 	"github.com/yusheng-g/openagent-go/session"
 	"github.com/yusheng-g/openagent-go/slash"
+	"github.com/yusheng-g/openagent-go/summarizer"
 	opentool "github.com/yusheng-g/openagent-go/tool"
 	"github.com/yusheng-g/openagent-go/utils"
 )
@@ -85,6 +86,13 @@ type AgentServer struct {
 	// Plugin manager and model config backup for runtime_set_model_config.
 	PluginMgr    *wasm.Manager
 	modelConfigs map[string]ModelConfig // "provider/modelID" → original config
+
+	// Summarizer and extractor are updated alongside the session runtime
+	// when the user switches models, so background compression and
+	// knowledge extraction use the current provider instead of the
+	// first-configured one.
+	Summarizer *summarizer.Compressor
+	Extractor  *ctxpkg.AsyncExtractor
 
 	// approvalMemory persists session-scoped "allow always" decisions.
 	approvalMemory governance.ApprovalMemory
@@ -596,6 +604,37 @@ func (s *AgentServer) resolveModelConfig(ss *agentSession) (provider, modelID st
 		return mc.Provider, mc.ModelID
 	}
 	return "", key
+}
+
+// resolveSessionModel returns the model for the session's current config
+// (session "model" config value wins over the server default). Unlike
+// Runtime.Model() which returns the previous run's snapshot (runModel),
+// this reads from the registry so it reflects SetModel updates —
+// critical for oaSession.Model in OnPrompt so run()'s session.Model
+// override does not defeat a mid-session model switch.
+func (s *AgentServer) resolveSessionModel(ss *agentSession) openagent.Model {
+	key := s.getDefaultModelID()
+	if val, ok := ss.ConfigString("model"); ok {
+		key = val
+	}
+	m, _ := s.lookupModel(key)
+	return m
+}
+
+// switchSessionModel updates the session runtime, summarizer, and
+// extractor to the new model. Called from all model-switch entry points
+// (set_config_option "model", slash /model) so background components
+// stay in sync with the conversation model.
+func (s *AgentServer) switchSessionModel(ss *agentSession, m openagent.Model) {
+	if rt := ss.getRuntime(); rt != nil {
+		rt.SetModel(m)
+	}
+	if s.Summarizer != nil {
+		s.Summarizer.SetModel(m)
+	}
+	if s.Extractor != nil {
+		s.Extractor.SetModel(m)
+	}
 }
 
 // ── Client capability helpers ──
@@ -1406,7 +1445,7 @@ func (s *AgentServer) OnSetSessionConfigOption(ctx context.Context, req openacp.
 		case "model":
 			if v, ok := ss.ConfigString("model"); ok {
 				if m, ok := s.lookupModel(v); ok {
-					rt.SetModel(m)
+					s.switchSessionModel(ss, m)
 				} else {
 					// The requested model is not in the provider list —
 					// keep the current model, but don't stay silent.
@@ -1508,8 +1547,11 @@ func (s *AgentServer) OnPrompt(ctx context.Context, req openacp.PromptRequest, s
 		// (RunHooks via SessionFromContext, e.g. the artifact hook's
 		// context-window threshold) can read ContextWindow() without
 		// depending on every call site to re-resolve from ModelID.
-		// buildRuntimeForSession already set clone.Model to the selected model.
-		Model:     agent.Model(),
+		// Use resolveSessionModel (reads the registry) instead of
+		// agent.Model() (returns the previous run's runModel snapshot)
+		// so run()'s session.Model override does not defeat a
+		// mid-session SetModel update.
+		Model:     s.resolveSessionModel(ss),
 		CreatedAt: ss.createdAt,
 		Metadata: map[string]any{
 			"cwd":                   ss.cwd,
@@ -2183,9 +2225,7 @@ func (s *AgentServer) buildSlashContext(ctx context.Context, sid openacp.Session
 				return fmt.Errorf("unknown model: %s", modelID)
 			}
 			ss.SetConfigValue("model", modelID)
-			if rt := ss.getRuntime(); rt != nil {
-				rt.SetModel(m)
-			}
+			s.switchSessionModel(ss, m)
 			s.saveConfig(ctx, string(sid))
 			if s.updateSender != nil {
 				opts := s.buildConfigOptions(sid)
