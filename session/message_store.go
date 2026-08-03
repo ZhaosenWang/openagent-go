@@ -28,6 +28,14 @@ type SessionStore interface {
 	// offset messages from the end. offset=0 returns the latest n.
 	Recent(ctx context.Context, sessionID string, n int, offset int) ([]openagent.Message, error)
 
+	// RecentAfter returns up to n messages after the throughIndex-th
+	// message (0 = from the start), oldest first. Messages are never
+	// deleted, so the post-summary increment is the only part the model
+	// sees — the summary covers up to throughIndex. throughIndex is the
+	// session-relative position (Compressed.ThroughIndex semantics), not
+	// a backend row id.
+	RecentAfter(ctx context.Context, sessionID string, throughIndex, n int) ([]openagent.Message, error)
+
 	// Count returns the total number of stored messages for a session.
 	Count(ctx context.Context, sessionID string) (int, error)
 

@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"strings"
 
+	_ "modernc.org/sqlite" // driver registration — this package opens "sqlite" DSNs itself
+
 	openagent "github.com/yusheng-g/openagent-go"
 	"github.com/yusheng-g/openagent-go/session"
 )
@@ -198,6 +200,29 @@ func (m *MessageStore) Recent(ctx context.Context, sessionID string, n int, offs
 	}
 
 	return msgs, nil
+}
+
+// RecentAfter returns up to n messages after the throughIndex-th message
+// (0 = from the start), oldest first. OFFSET is linear in SQLite but the
+// win is skipping the JSON deserialization of already-summarized history.
+func (m *MessageStore) RecentAfter(ctx context.Context, sessionID string, throughIndex, n int) ([]openagent.Message, error) {
+	if throughIndex < 0 {
+		throughIndex = 0
+	}
+	if n <= 0 {
+		return nil, nil
+	}
+	rows, err := m.db.QueryContext(ctx,
+		`SELECT id, role, name, content, content_parts, tool_calls, tool_call_id, reasoning_content
+		 FROM messages WHERE session_id = ?
+		 ORDER BY id ASC LIMIT ? OFFSET ?`,
+		sessionID, n, throughIndex,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite recent_after: %w", err)
+	}
+	defer rows.Close()
+	return scanMessages(rows)
 }
 
 // ── session.Compressor ──

@@ -59,6 +59,17 @@ func (f *fakeMessages) Recent(_ context.Context, sid string, n, offset int) ([]o
 	}
 	return msgs[start:], nil
 }
+func (f *fakeMessages) RecentAfter(_ context.Context, sid string, throughIndex, n int) ([]openagent.Message, error) {
+	msgs := f.bySession[sid]
+	if throughIndex >= len(msgs) || n <= 0 {
+		return nil, nil
+	}
+	end := throughIndex + n
+	if end > len(msgs) {
+		end = len(msgs)
+	}
+	return msgs[throughIndex:end], nil
+}
 func (f *fakeMessages) Count(_ context.Context, sid string) (int, error) {
 	return len(f.bySession[sid]), nil
 }

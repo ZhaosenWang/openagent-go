@@ -138,6 +138,36 @@ func (m *MessageStore) Recent(ctx context.Context, sessionID string, n int, offs
 	return all[len(all)-n:], nil
 }
 
+// RecentAfter returns up to n messages after the throughIndex-th message
+// (0 = from the start), oldest first.
+func (m *MessageStore) RecentAfter(ctx context.Context, sessionID string, throughIndex, n int) ([]openagent.Message, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if throughIndex < 0 {
+		throughIndex = 0
+	}
+	if n <= 0 {
+		return nil, nil
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	all, err := m.readAllLocked(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	if throughIndex >= len(all) {
+		return nil, nil
+	}
+	end := throughIndex + n
+	if end > len(all) {
+		end = len(all)
+	}
+	return all[throughIndex:end], nil
+}
+
 // ── session.Compressor ──
 
 var _ session.Compressor = (*MessageStore)(nil)

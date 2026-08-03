@@ -125,8 +125,10 @@ func (rt *Runtime) ContextUsage(ctx context.Context, sessionID string) (summary,
 		model = cfgModel
 	}
 	modelID := openagent.TokenizerModelID(model)
+	var throughIndex int
 	if rt.deps.Compressor != nil {
 		if cc, err := rt.deps.Compressor.Compressed(ctx, sessionID); err == nil && cc != nil {
+			throughIndex = cc.ThroughIndex
 			summary = openagent.CountMessageTokens(modelID, openagent.Message{
 				Role:    openagent.RoleSystem,
 				Content: cc.Summary,
@@ -138,7 +140,10 @@ func (rt *Runtime) ContextUsage(ctx context.Context, sessionID string) (summary,
 		if err != nil {
 			return 0, 0, window, err
 		}
-		msgs, err := rt.deps.SessionStore.Recent(ctx, sessionID, total, 0)
+		// Post-summary increment only — messages never deleted, and the
+		// summary covers up to throughIndex, so fetching all would
+		// double-count summarized history.
+		msgs, err := rt.deps.SessionStore.RecentAfter(ctx, sessionID, throughIndex, total-throughIndex)
 		if err == nil {
 			working = openagent.CountMessages(modelID, msgs)
 		}

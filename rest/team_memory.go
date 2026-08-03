@@ -96,6 +96,26 @@ func (m *teamAgentMemory) Count(ctx context.Context, sessionID string) (int, err
 	return sharedN + privN, nil
 }
 
+// RecentAfter returns the post-summary increment. The summary only ever
+// covers the SHARED partition (team Compact routes to the shared key), so
+// the private partition starts from 0 — its history is never summarized.
+// Like Recent, the two partitions are concatenated with an approximation
+// of the merged index.
+func (m *teamAgentMemory) RecentAfter(ctx context.Context, sessionID string, throughIndex, n int) ([]openagent.Message, error) {
+	shared, err := m.shared.RecentAfter(ctx, sessionID, throughIndex, n)
+	if err != nil {
+		slog.Warn("openagent: shared memory read failed", "session", sessionID, "error", err)
+	}
+	priv, err := m.private.RecentAfter(ctx, m.privateKey(sessionID), 0, n)
+	if err != nil {
+		slog.Warn("openagent: private memory read failed", "session", sessionID, "error", err)
+	}
+	out := make([]openagent.Message, 0, len(shared)+len(priv))
+	out = append(out, shared...)
+	out = append(out, priv...)
+	return out, nil
+}
+
 func (m *teamAgentMemory) DeleteSession(ctx context.Context, sessionID string) error {
 	return m.private.DeleteSession(ctx, m.privateKey(sessionID))
 }

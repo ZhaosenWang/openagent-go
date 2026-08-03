@@ -1470,11 +1470,11 @@ func (s *AgentServer) OnPrompt(ctx context.Context, req openacp.PromptRequest, s
 	// ── Intercept server-side slash commands ──
 	// Must run BEFORE auto-title so slash commands don't get used as
 	// the session title (e.g. "/mode plan" would become the title).
+	// The command round-trip NEVER enters the conversation store: slash
+	// commands are control operations (industry: Claude Code keeps
+	// /context-style commands out of the context budget), so they must
+	// not consume working tokens nor leak into the compressed summary.
 	if resp, handled := s.cmdRegistry.Handle(s.buildSlashContext(ctx, req.SessionID, ss), input.Content); handled {
-		if s.Mem != nil {
-			_ = s.Mem.Append(ctx, string(req.SessionID), input)
-			_ = s.Mem.Append(ctx, string(req.SessionID), openagent.Message{Role: openagent.RoleAssistant, Content: resp})
-		}
 		sender.SendAgentMessage(resp)
 		return &openacp.PromptResponse{StopReason: openacp.StopReasonEndTurn}, nil
 	}
