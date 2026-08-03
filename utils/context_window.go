@@ -87,6 +87,9 @@ func ModelContextWindow(modelID string) int {
 		if has(lower, "4v") || has(lower, "4-v") {
 			return Window8K
 		}
+		if has(lower, "glm-5") || has(lower, "glm5") {
+			return Window1M // GLM-5 / 5.1 / 5.2 series are 1M context
+		}
 		return Window128K // GLM-4, GLM-4-Flash, GLM-3-Turbo all 128K
 
 	// ── Kimi / Moonshot ──
