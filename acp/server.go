@@ -2118,8 +2118,9 @@ func firstLine(s string, maxLen int) string {
 	if idx := strings.IndexByte(s, '\n'); idx >= 0 {
 		s = s[:idx]
 	}
-	if len(s) > maxLen {
-		return s[:maxLen] + "..."
+	runes := []rune(s)
+	if len(runes) > maxLen {
+		return string(runes[:maxLen]) + "..."
 	}
 	return s
 }
