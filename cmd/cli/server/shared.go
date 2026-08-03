@@ -82,25 +82,45 @@ func buildModels(providers map[string]config.ProviderConfig) ([]openagent.Model,
 	var models []openagent.Model
 	var infos []modelReg
 	for pid, p := range providers {
-		for _, mid := range p.Models {
+		for _, mc := range p.Models {
 			apiKey := p.APIKey
 			if apiKey == "" {
 				apiKey = os.Getenv(strings.ToUpper(pid) + "_API_KEY")
 			}
-			m := openai.New(apiKey, mid, p.BaseURL)
+			m := openai.New(apiKey, mc.ID, p.BaseURL)
+			// Explicit max_input_tokens overrides the built-in vendor
+			// lookup (quantized/shrunk custom models may declare 1M but
+			// serve 128K).
+			if mc.MaxInputTokens > 0 {
+				m = m.WithContextWindow(mc.MaxInputTokens)
+			}
 			models = append(models, m)
-			infos = append(infos, modelReg{ID: mid, Provider: pid, Model: m, APIKey: apiKey, BaseURL: p.BaseURL})
+			infos = append(infos, modelReg{
+				ID:                      mc.ID,
+				Provider:                pid,
+				Model:                   m,
+				APIKey:                  apiKey,
+				BaseURL:                 p.BaseURL,
+				MaxOutputTokens:         mc.MaxOutputTokens,
+				InputCostPerToken:       mc.InputCostPerToken,
+				InputCacheCostPerToken:  mc.InputCacheCostPerToken,
+				OutputCostPerToken:      mc.OutputCostPerToken,
+			})
 		}
 	}
 	return models, infos
 }
 
 type modelReg struct {
-	ID       string
-	Provider string
-	Model    openagent.Model
-	APIKey   string
-	BaseURL  string
+	ID                      string
+	Provider                string
+	Model                   openagent.Model
+	APIKey                  string
+	BaseURL                 string
+	MaxOutputTokens         int
+	InputCostPerToken       float64
+	InputCacheCostPerToken  float64
+	OutputCostPerToken      float64
 }
 
 func firstModel(models []openagent.Model) openagent.Model {

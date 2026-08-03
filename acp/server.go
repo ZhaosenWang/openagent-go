@@ -114,10 +114,14 @@ func (s *AgentServer) defaultMode() string {
 // ModelConfig stores the original apiKey/baseURL for a registered model,
 // so SetModel can preserve values when only model_id changes.
 type ModelConfig struct {
-	Provider string
-	ModelID  string
-	APIKey   string
-	BaseURL  string
+	Provider                string
+	ModelID                 string
+	APIKey                  string
+	BaseURL                 string
+	MaxOutputTokens         int
+	InputCostPerToken       float64
+	InputCacheCostPerToken  float64
+	OutputCostPerToken      float64
 }
 
 // agentSession holds per-session runtime state.
@@ -383,10 +387,25 @@ func (s *AgentServer) SetModel(provider, modelID, apiKey, baseURL string) {
 }
 
 // RegisterModel stores a model's original config for SetModel fallback.
-func (s *AgentServer) RegisterModel(key, provider, modelID, apiKey, baseURL string) {
+func (s *AgentServer) RegisterModel(key, provider, modelID, apiKey, baseURL string, pricing ModelPricing) {
 	s.modelsMu.Lock()
 	defer s.modelsMu.Unlock()
-	s.modelConfigs[key] = ModelConfig{Provider: provider, ModelID: modelID, APIKey: apiKey, BaseURL: baseURL}
+	s.modelConfigs[key] = ModelConfig{
+		Provider: provider, ModelID: modelID, APIKey: apiKey, BaseURL: baseURL,
+		MaxOutputTokens:        pricing.MaxOutputTokens,
+		InputCostPerToken:      pricing.InputCostPerToken,
+		InputCacheCostPerToken: pricing.InputCacheCostPerToken,
+		OutputCostPerToken:     pricing.OutputCostPerToken,
+	}
+}
+
+// ModelPricing carries the per-model capability/cost metadata (from the
+// settings models config) used for usage reporting.
+type ModelPricing struct {
+	MaxOutputTokens        int
+	InputCostPerToken      float64
+	InputCacheCostPerToken float64
+	OutputCostPerToken     float64
 }
 
 // resolveModelConfig returns the provider and bare model ID for the current
@@ -1390,7 +1409,7 @@ func (s *AgentServer) OnPrompt(ctx context.Context, req openacp.PromptRequest, s
 		if m := agent.Model(); m != nil {
 			cw = m.ContextWindow()
 		}
-		sender.SendUsageUpdate(usage.PromptTokens, cw, nil)
+		sender.SendUsageUpdate(usage.PromptTokens, cw, s.usageCost(ss, usage))
 	}
 
 	if ctx.Err() != nil {
@@ -2042,6 +2061,30 @@ func isPlanTool(name string) bool {
 		return true
 	}
 	return false
+}
+
+// usageCost computes the USD cost of a run's usage from the model's
+// configured per-token pricing. Unconfigured rates are 0 (free): a model
+// without pricing reports cost 0 — an explicit value, not an absent one.
+func (s *AgentServer) usageCost(ss *agentSession, usage openagent.Usage) *openacp.Cost {
+	key := s.defaultModelID
+	if v, ok := ss.config["model"]; ok {
+		if val, ok := v.(string); ok {
+			key = val
+		}
+	}
+	s.modelsMu.Lock()
+	mc := s.modelConfigs[key]
+	s.modelsMu.Unlock()
+	cached := usage.CacheReadTokens
+	if cached > usage.PromptTokens {
+		cached = usage.PromptTokens
+	}
+	uncached := usage.PromptTokens - cached
+	amount := float64(uncached)*mc.InputCostPerToken +
+		float64(cached)*mc.InputCacheCostPerToken +
+		float64(usage.CompletionTokens)*mc.OutputCostPerToken
+	return &openacp.Cost{Amount: amount, Currency: "USD"}
 }
 
 // firstLine truncates s to the first line, up to maxLen characters.

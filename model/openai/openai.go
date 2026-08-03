@@ -314,6 +314,7 @@ func toResponse(c *openaisdk.ChatCompletion) *openagent.ChatCompletionResponse {
 			PromptTokens:     int(c.Usage.PromptTokens),
 			CompletionTokens: int(c.Usage.CompletionTokens),
 			TotalTokens:      int(c.Usage.TotalTokens),
+			CacheReadTokens:  int(c.Usage.PromptTokensDetails.CachedTokens),
 		}
 	}
 	return resp
@@ -360,6 +361,7 @@ func toStreamChunk(c openaisdk.ChatCompletionChunk) openagent.StreamChunk {
 			PromptTokens:     int(c.Usage.PromptTokens),
 			CompletionTokens: int(c.Usage.CompletionTokens),
 			TotalTokens:      int(c.Usage.TotalTokens),
+			CacheReadTokens:  int(c.Usage.PromptTokensDetails.CachedTokens),
 		}
 	}
 	for _, choice := range c.Choices {

@@ -83,9 +83,51 @@ type SensitiveConfig struct {
 }
 
 type ProviderConfig struct {
-	APIKey  string   `json:"api_key"`
-	BaseURL string   `json:"base_url"`
-	Models  []string `json:"models,omitempty"`
+	APIKey  string        `json:"api_key"`
+	BaseURL string        `json:"base_url"`
+	Models  []ModelConfig `json:"models,omitempty"`
+}
+
+// ModelConfig is one entry of a provider's models array. Accepts either a
+// plain string ("gpt-4o") or an object with per-model capabilities and
+// pricing (litellm-shaped fields):
+//
+//	"models": ["gpt-4o", {
+//	  "id": "qwen-128k",
+//	  "max_input_tokens": 128000,
+//	  "max_output_tokens": 8192,
+//	  "input_cost_per_token": 0.000001,
+//	  "input_cache_cost_per_token": 0.0000001,
+//	  "output_cost_per_token": 0.000002
+//	}]
+//
+// max_input_tokens overrides the built-in vendor lookup — required for
+// custom providers serving quantized/shrunk models whose real window is
+// smaller than the table (a declared 1M with an actual 128K would fail
+// requests past 128K with no diagnostics). The cost fields feed usage
+// reporting (ACP usage_update cost). 0/absent = built-in lookup / no cost.
+type ModelConfig struct {
+	ID                      string  `json:"id"`
+	MaxInputTokens          int     `json:"max_input_tokens,omitempty"`
+	MaxOutputTokens         int     `json:"max_output_tokens,omitempty"`
+	InputCostPerToken       float64 `json:"input_cost_per_token,omitempty"`
+	InputCacheCostPerToken  float64 `json:"input_cache_cost_per_token,omitempty"`
+	OutputCostPerToken      float64 `json:"output_cost_per_token,omitempty"`
+}
+
+// UnmarshalJSON accepts both the legacy string form ("gpt-4o") and the
+// object form ({"id": ..., "context_window": ...}).
+func (m *ModelConfig) UnmarshalJSON(b []byte) error {
+	if len(b) > 0 && b[0] == '"' {
+		return json.Unmarshal(b, &m.ID)
+	}
+	type alias ModelConfig
+	var a alias
+	if err := json.Unmarshal(b, &a); err != nil {
+		return err
+	}
+	*m = ModelConfig(a)
+	return nil
 }
 
 type ServerConfig struct {

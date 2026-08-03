@@ -37,6 +37,10 @@ type Usage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
+	// CacheReadTokens is the number of input tokens served from the
+	// provider's prompt cache (billed at the cache-read rate, not the
+	// input rate). 0 when the provider reports no caching.
+	CacheReadTokens int `json:"cache_read_tokens,omitempty"`
 }
 
 // Model is the interface for LLM providers. Implementations handle API-specific

@@ -129,7 +129,12 @@ func RunACP(ctx context.Context, cfg *config.Config, caps config.Capabilities) e
 		if mi.Provider != "" {
 			key = mi.Provider + "/" + mi.ID
 		}
-		srv.RegisterModel(key, mi.Provider, mi.ID, mi.APIKey, mi.BaseURL)
+		srv.RegisterModel(key, mi.Provider, mi.ID, mi.APIKey, mi.BaseURL, acp.ModelPricing{
+			MaxOutputTokens:        mi.MaxOutputTokens,
+			InputCostPerToken:      mi.InputCostPerToken,
+			InputCacheCostPerToken: mi.InputCacheCostPerToken,
+			OutputCostPerToken:     mi.OutputCostPerToken,
+		})
 	}
 
 	policy := sandboxPolicy(cfg.Sandbox)
