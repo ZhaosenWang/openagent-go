@@ -106,7 +106,7 @@ const (
 // Agent config and Session. The Get/Set closures directly read/write
 // Agent and Session fields. setModel is called by runtime_set_model_config
 // to replace a model in the global registry; it may be nil.
-func BuildAgentRuntime(rt *kernel.Runtime, session *openagent.Session, setModel func(provider, modelID, apiKey, baseURL string)) *wasmhost.AgentRuntime {
+func BuildAgentRuntime(rt *kernel.Runtime, session *openagent.Session, setModel func(provider, modelID, apiKey, baseURL string, maxInputTokens, maxOutputTokens int)) *wasmhost.AgentRuntime {
 	return &wasmhost.AgentRuntime{
 		SetModel: setModel,
 		Get: func(key string) (string, bool) {
