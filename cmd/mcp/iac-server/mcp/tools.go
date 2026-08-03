@@ -1,7 +1,7 @@
 // Package mcp defines the deployment tools exposed by iac-server over MCP.
 //
 // Tools are split into two groups:
-//   - LLM tools (propose_architecture, specify_resources, generate_plan,
+//   - LLM tools (propose_architecture, specify_resources, generate_terraform_plan,
 //     estimate_cost, troubleshoot_deployment, query_cloud): delegate to agent.Planner
 //   - Execution tools (apply, destroy, get_status, list): call iac.Client
 //     directly
@@ -40,7 +40,7 @@ func NewTools(cfg Config) []openagent.Tool {
 	return []openagent.Tool{
 		&proposeArchitectureTool{cfg: cfg},
 		&specifyResourcesTool{cfg: cfg},
-		&generatePlanTool{cfg: cfg},
+		&generateTerraformPlanTool{cfg: cfg},
 		&estimateCostTool{cfg: cfg},
 		&troubleshootDeploymentTool{cfg: cfg},
 		&applyDeploymentTool{cfg: cfg},
@@ -116,7 +116,7 @@ type specifyResourcesTool struct{ cfg Config }
 func (t *specifyResourcesTool) Definition() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
 		Name:        "specify_resources",
-		Description: "Step 2 of deployment: Determine concrete resource specs (flavor, image, disk, CIDR, etc.) for a proposed architecture. Reads the architecture from the prior propose_architecture call. Optional adjustments let the user modify specs. The user should confirm the resources before calling generate_plan.",
+		Description: "Step 2 of deployment: Determine concrete resource specs (flavor, image, disk, CIDR, etc.) for each node of the DAG from propose_architecture. Queries available specs via cloud APIs. If too many choices or missing info, returns status need_input with questions — call again with answers filled in. Optional adjustments let the user modify specs. The user should confirm the resources before calling generate_terraform_plan.",
 		Parameters:  openagent.SchemaOf[SpecifyResourcesParams](),
 	}
 }
@@ -129,34 +129,34 @@ func (t *specifyResourcesTool) Execute(ctx context.Context, args json.RawMessage
 	if !validDeploymentID(params.DeploymentID) {
 		return openagent.ErrorResult(fmt.Errorf("specify_resources: invalid deployment_id %q", params.DeploymentID), false, "")
 	}
-	out, err := t.cfg.Planner.SpecifyResources(ctx, params.DeploymentID, params.Adjustments)
+	out, err := t.cfg.Planner.SpecifyResources(ctx, params.DeploymentID, params.Answers, params.Adjustments)
 	if err != nil {
 		return openagent.ErrorResult(err, false, "")
 	}
 	return &openagent.ToolResult{Content: out}
 }
 
-// ── generate_plan ──
+// ── generate_terraform_plan ──
 
-type generatePlanTool struct{ cfg Config }
+type generateTerraformPlanTool struct{ cfg Config }
 
-func (t *generatePlanTool) Definition() openagent.FunctionDefinition {
+func (t *generateTerraformPlanTool) Definition() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
-		Name:        "generate_plan",
-		Description: "Step 3 of deployment: Write .tf files based on the confirmed architecture and resource specs, then run terraform init + plan. Returns the .tf files and a plan preview. The user should review the plan before calling estimate_cost.",
-		Parameters:  openagent.SchemaOf[GeneratePlanParams](),
+		Name:        "generate_terraform_plan",
+		Description: "Step 3 of deployment: Write .tf files from the deployment DAG (nodes = resources with confirmed specs, edges = dependencies), then run terraform init + plan. Returns the .tf files and a plan preview. Requires specify_resources to have completed. The user should review the plan before calling estimate_cost.",
+		Parameters:  openagent.SchemaOf[GenerateTerraformPlanParams](),
 	}
 }
 
-func (t *generatePlanTool) Execute(ctx context.Context, args json.RawMessage) *openagent.ToolResult {
-	params, err := openagent.ParseArgs[GeneratePlanParams](args)
+func (t *generateTerraformPlanTool) Execute(ctx context.Context, args json.RawMessage) *openagent.ToolResult {
+	params, err := openagent.ParseArgs[GenerateTerraformPlanParams](args)
 	if err != nil {
-		return openagent.ErrorResult(fmt.Errorf("generate_plan: %w", err), false, "")
+		return openagent.ErrorResult(fmt.Errorf("generate_terraform_plan: %w", err), false, "")
 	}
 	if !validDeploymentID(params.DeploymentID) {
-		return openagent.ErrorResult(fmt.Errorf("generate_plan: invalid deployment_id %q", params.DeploymentID), false, "")
+		return openagent.ErrorResult(fmt.Errorf("generate_terraform_plan: invalid deployment_id %q", params.DeploymentID), false, "")
 	}
-	out, err := t.cfg.Planner.GeneratePlan(ctx, params.DeploymentID)
+	out, err := t.cfg.Planner.GenerateTerraformPlan(ctx, params.DeploymentID)
 	if err != nil {
 		return openagent.ErrorResult(err, false, "")
 	}
@@ -170,7 +170,7 @@ type updateDeploymentTool struct{ cfg Config }
 func (t *updateDeploymentTool) Definition() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
 		Name:        "update_deployment",
-		Description: "Modify an existing deployment. Re-runs specify_resources (with user adjustments) and generate_plan. Use this when the user wants to adjust an existing deployment (e.g. \"change ECS flavor to s6.xlarge.2\"). Returns the updated plan with the same deployment_id. After updating, call estimate_cost again to see the new pricing before apply_deployment.",
+		Description: "Modify an existing deployment. Re-runs specify_resources (with user answers/adjustments) and generate_terraform_plan. Use this when the user wants to adjust an existing deployment (e.g. \"change ECS flavor to s6.xlarge.2\"). Returns the updated plan with the same deployment_id. The previous cost estimate is invalidated — call estimate_cost again before apply_deployment.",
 		Parameters:  openagent.SchemaOf[UpdateDeploymentParams](),
 	}
 }
@@ -183,7 +183,7 @@ func (t *updateDeploymentTool) Execute(ctx context.Context, args json.RawMessage
 	if !validDeploymentID(params.DeploymentID) {
 		return openagent.ErrorResult(fmt.Errorf("update_deployment: invalid deployment_id %q", params.DeploymentID), false, "")
 	}
-	out, err := t.cfg.Planner.UpdateDeployment(ctx, params.DeploymentID, params.ChangeRequest)
+	out, err := t.cfg.Planner.UpdateDeployment(ctx, params.DeploymentID, params.Answers, params.ChangeRequest)
 	if err != nil {
 		return openagent.ErrorResult(err, false, "")
 	}
@@ -197,7 +197,7 @@ type estimateCostTool struct{ cfg Config }
 func (t *estimateCostTool) Definition() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
 		Name:        "estimate_cost",
-		Description: "Step 4 of deployment: Estimate the monthly cost of a PLANNED deployment (resources not yet created). MUST be called after generate_plan and before apply_deployment. This forecasts future costs based on the terraform plan — it does NOT query past billing. For existing bills/costs, use query_cloud.",
+		Description: "Step 4 of deployment: Estimate the cost of a PLANNED deployment (resources not yet created) from the deployment DAG. MUST be called after generate_terraform_plan (and after any update_deployment) and before apply_deployment — apply is rejected without it. pricing_mode: \"on-demand\" (按需) or \"monthly\" (包月); if the user did not state a preference, omit it. This forecasts FUTURE costs — it does NOT query past billing. For existing bills/costs, use query_cloud.",
 		Parameters:  openagent.SchemaOf[EstimateCostParams](),
 	}
 }
@@ -210,7 +210,7 @@ func (t *estimateCostTool) Execute(ctx context.Context, args json.RawMessage) *o
 	if !validDeploymentID(params.DeploymentID) {
 		return openagent.ErrorResult(fmt.Errorf("estimate_cost: invalid deployment_id %q", params.DeploymentID), false, "")
 	}
-	out, err := t.cfg.Planner.EstimateCost(ctx, params.DeploymentID)
+	out, err := t.cfg.Planner.EstimateCost(ctx, params.DeploymentID, params.PricingMode)
 	if err != nil {
 		return openagent.ErrorResult(err, false, "")
 	}
@@ -251,7 +251,7 @@ type applyDeploymentTool struct{ cfg Config }
 func (t *applyDeploymentTool) Definition() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
 		Name:        "apply_deployment",
-		Description: "Step 5 of deployment: Apply a saved terraform plan. This creates/modifies real cloud resources. The deployment must have been planned first (generate_plan succeeded). Call estimate_cost first so the user sees pricing.",
+		Description: "Step 5 of deployment: Apply a saved terraform plan. This creates/modifies real cloud resources. The deployment must have been planned (generate_terraform_plan succeeded) AND cost-estimated (estimate_cost succeeded) first — apply is rejected with an error if the deployment has no current cost estimate.",
 		Parameters:  openagent.SchemaOf[ApplyDeploymentParams](),
 	}
 }
@@ -266,6 +266,13 @@ func (t *applyDeploymentTool) Execute(ctx context.Context, args json.RawMessage)
 	}
 
 	dir := workDir(t.cfg.DeploymentsDir, params.DeploymentID)
+
+	// Cost gate: apply is only allowed after estimate_cost ran for the
+	// current deployment state (any DAG/.tf mutation invalidates the marker).
+	if !agent.HasCost(dir) {
+		return openagent.ErrorResult(fmt.Errorf("apply_deployment: deployment %s has not been cost-estimated for its current state — call estimate_cost first", params.DeploymentID), false, "")
+	}
+
 	client, err := iac.NewClient(ctx, dir, iacConfig(t.cfg.Cloud, t.cfg.DryRun, t.cfg.BinaryMirrors, t.cfg.ProviderMirrors))
 	if err != nil {
 		return openagent.ErrorResult(fmt.Errorf("apply_deployment: %w", err), false, "")
@@ -478,24 +485,27 @@ type ProposeArchitectureParams struct {
 
 // SpecifyResourcesParams are the arguments to specify_resources.
 type SpecifyResourcesParams struct {
-	DeploymentID string `json:"deployment_id" jsonschema:"description=Deployment ID from propose_architecture"`
-	Adjustments  string `json:"adjustments,omitempty" jsonschema:"description=Optional free-text adjustments, e.g. use s6.xlarge.2 instead or add a 100GB data disk"`
+	DeploymentID string   `json:"deployment_id" jsonschema:"description=Deployment ID from propose_architecture"`
+	Answers      []string `json:"answers,omitempty" jsonschema:"description=Answers to the questions returned by a previous specify_resources call, one per question in order"`
+	Adjustments  string   `json:"adjustments,omitempty" jsonschema:"description=Optional free-text adjustments, e.g. use s6.xlarge.2 instead or add a 100GB data disk"`
 }
 
-// GeneratePlanParams are the arguments to generate_plan.
-type GeneratePlanParams struct {
+// GenerateTerraformPlanParams are the arguments to generate_terraform_plan.
+type GenerateTerraformPlanParams struct {
 	DeploymentID string `json:"deployment_id" jsonschema:"description=Deployment ID from propose_architecture"`
 }
 
 // UpdateDeploymentParams are the arguments to update_deployment.
 type UpdateDeploymentParams struct {
-	DeploymentID  string `json:"deployment_id" jsonschema:"description=Deployment ID to update"`
-	ChangeRequest string `json:"change_request" jsonschema:"description=Free-text change request, e.g. change ECS flavor to s6.xlarge.2 or rename vpc.test to vpc.main"`
+	DeploymentID  string   `json:"deployment_id" jsonschema:"description=Deployment ID to update"`
+	Answers       []string `json:"answers,omitempty" jsonschema:"description=Answers to the questions returned by a previous specify_resources call, one per question in order"`
+	ChangeRequest string   `json:"change_request" jsonschema:"description=Free-text change request, e.g. change ECS flavor to s6.xlarge.2 or rename vpc.test to vpc.main"`
 }
 
 // EstimateCostParams are the arguments to estimate_cost.
 type EstimateCostParams struct {
-	DeploymentID string `json:"deployment_id" jsonschema:"description=Deployment ID from generate_plan"`
+	DeploymentID string `json:"deployment_id" jsonschema:"description=Deployment ID from generate_terraform_plan"`
+	PricingMode  string `json:"pricing_mode,omitempty" jsonschema:"description=Billing mode the user asked for: \"on-demand\" (按需/pay-as-you-go) or \"monthly\" (包月). Omit to default to on-demand. Pass the user's stated preference verbatim."`
 }
 
 // TroubleshootParams are the arguments to troubleshoot_deployment.

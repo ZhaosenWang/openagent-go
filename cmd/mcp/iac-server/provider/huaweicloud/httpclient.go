@@ -1,6 +1,7 @@
 package huaweicloud
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -225,16 +226,23 @@ func (t *HTTPRequest) Execute(ctx context.Context, args json.RawMessage) *openag
 
 	// Small body: return inline. Large body: save to artifact file and
 	// return a path so the LLM can use read/grep to inspect on demand.
+	// JSON bodies are parsed into nested structures (with number precision
+	// preserved via UseNumber) so the final result marshals as readable
+	// multi-line JSON — a raw string would be escaped to one long line.
 	if len(respBody) <= maxInlineBody {
-		result["body"] = string(respBody)
+		result["body"] = parseBody(respBody)
 	} else {
 		dir := filepath.Join(opentool.ArtifactRoot(), "iac-server")
 		_ = os.MkdirAll(dir, 0755)
 		name := fmt.Sprintf("http_%d.json", time.Now().UnixNano())
 		path := filepath.Join(dir, name)
-		if err := os.WriteFile(path, respBody, 0644); err != nil {
+		formatted, err := json.MarshalIndent(parseBody(respBody), "", "  ")
+		if err != nil {
+			return openagent.ErrorResult(fmt.Errorf("http_request: format body: %w", err), false, "")
+		}
+		if err := os.WriteFile(path, formatted, 0644); err != nil {
 			// Fallback: return inline truncated.
-			result["body"] = string(respBody[:maxInlineBody])
+			result["body"] = parseBody(respBody[:maxInlineBody])
 			result["truncated"] = true
 		} else {
 			sizeKB := (len(respBody) + 1023) / 1024
@@ -243,11 +251,32 @@ func (t *HTTPRequest) Execute(ctx context.Context, args json.RawMessage) *openag
 		}
 	}
 
-	data, err := json.Marshal(result)
+	data, err := json.MarshalIndent(result, "", "  ")
 	if err != nil {
 		return openagent.ErrorResult(fmt.Errorf("http_request: marshal result: %w", err), false, "")
 	}
 	return &openagent.ToolResult{Content: string(data)}
+}
+
+// parseBody decodes a JSON response body into a nested structure so it can
+// be marshaled as readable multi-line JSON. Numbers are kept as json.Number
+// (raw text) to avoid float64 precision loss on long cloud IDs. Non-JSON
+// bodies (XML, plain text, ...) are returned as-is.
+func parseBody(b []byte) any {
+	if len(b) == 0 {
+		return ""
+	}
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return string(b)
+	}
+	// Reject trailing garbage after the first JSON value.
+	if _, err := dec.Token(); err != io.EOF {
+		return string(b)
+	}
+	return v
 }
 
 // HwParams are the arguments to http_request. URL is required; method

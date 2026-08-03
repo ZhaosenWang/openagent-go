@@ -6,9 +6,10 @@
 //   - Diagnose deployment errors and suggest fixes
 //
 // Skills (SKILL.md guides) are statically loaded via the SkillProvider and
-// injected directly into each agent's system prompt — no runtime load_skill
-// tool call needed. The LLM browses reference files (examples, API swagger)
-// with standard read/grep/ls tools.
+// injected directly into each agent's system prompt. Agents that need
+// per-service API knowledge on demand (query_cloud, specify_resources) also
+// get the SkillProvider so they can load_skill at runtime. The LLM browses
+// reference files (examples, API swagger) with standard read/grep/ls tools.
 package agent
 
 import (
@@ -19,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	openagent "github.com/yusheng-g/openagent-go"
 	"github.com/yusheng-g/openagent-go/agent"
@@ -49,7 +51,7 @@ type Planner struct {
 // New creates a Planner. workDir should be the cloud home directory
 // (parent of skills/ and deployments/) so read/grep/ls can access both.
 // memory is shared across all LLM calls and scoped by deployment_id —
-// estimate_cost can see plan_deployment's reasoning, troubleshoot can see
+// estimate_cost can see specify_resources' reasoning, troubleshoot can see
 // prior attempts. nil disables memory (each call is isolated).
 func New(model openagent.Model, cloud provider.CloudProvider, loader skill.Provider, memory session.SessionStore, knowledge ctxpkg.MemoryProvider, workDir, deploymentsDir string, dryRun bool, binaryMirrors, providerMirrors []string) *Planner {
 	return &Planner{
@@ -71,7 +73,7 @@ func sessionID(deploymentID string) string {
 	return "dep-" + deploymentID
 }
 
-// planResult is the JSON returned by plan_deployment.
+// planResult is the JSON returned by propose/specify need_input flows.
 type planResult struct {
 	Status         string   `json:"status"` // "need_input" or "ready"
 	Questions      []string `json:"questions,omitempty"`
@@ -93,14 +95,14 @@ const serverContext = `You are the server-side LLM of an MCP server (iac-server)
 - You do NOT need user approval for any action — approval is the client's concern, not yours.
 
 ## Deployment workflow (6 steps, user confirms between each)
-  1. propose_architecture  — recommend a cloud architecture (services + reasoning), no .tf files
-  2. specify_resources     — determine concrete resource specs (flavor, image, CIDR, etc.)
-  3. generate_plan         — write .tf files + run terraform plan, return preview
-  4. estimate_cost         — query cloud pricing for the planned resources
+  1. propose_architecture  — recommend a cloud architecture as a DAG (nodes = resources, depends_on = edges), no .tf files
+  2. specify_resources     — determine concrete resource specs (flavor, image, CIDR, etc.), enrich the DAG
+  3. generate_terraform_plan — write .tf files + run terraform plan from the DAG, return preview
+  4. estimate_cost         — query cloud pricing for the planned resources (required before apply)
   5. apply_deployment       — terraform apply (executed by the server, not you)
   6. troubleshoot_deployment — diagnose errors if any step fails
 
-update_deployment re-runs specify_resources + generate_plan with user adjustments. destroy_deployment, get_deployment_status, and list_deployments do not involve you. query_cloud is for read-only queries about existing resources/bills.
+The deployment DAG (dag.json) is the contract between steps: each step reads it from your input message, and your output must respect existing node ids. update_deployment re-runs specify_resources + generate_terraform_plan with user answers/adjustments. destroy_deployment, get_deployment_status, and list_deployments do not involve you. query_cloud is for read-only queries about existing resources/bills.
 
 ## Credentials
 Cloud credentials (e.g. HW_ACCESS_KEY, HW_SECRET_KEY, HW_REGION) are injected by the server into the terraform subprocess environment. NEVER hardcode credentials in .tf files, NEVER ask for them, NEVER put them in variables or tfvars.
@@ -109,11 +111,11 @@ Cloud credentials (e.g. HW_ACCESS_KEY, HW_SECRET_KEY, HW_REGION) are injected by
 - read / grep / ls — browse the workspace: skills/ (references, guides) and deployments/ (.tf files)
 - http_request — send authenticated HTTP requests to cloud APIs (signing is automatic, do NOT pass credentials). Use ONLY for read-only queries (List/Show/Get APIs). NEVER call Create/Update/Delete/Post/Put APIs to create or modify cloud resources directly — resource provisioning is done through terraform, not through API calls.
 - WebSearch / WebFetch — query official cloud docs and pricing pages
-- load_skill / reload_skills — (query_cloud only) dynamically load cloud-service skills on demand
+- load_skill / reload_skills — (query_cloud, specify_resources) dynamically load cloud-service skills on demand
 
 ## Skills
 For propose/specify/generate/estimate/troubleshoot: the relevant skill guide (SKILL.md) is already loaded into your system prompt — you do not need to call any tool to load it. Use read/grep/ls to browse the skill's references/ directory for detailed examples and API definitions.
-For query_cloud: use the load_skill tool to load the relevant cloud-service skill on demand (the skill catalog is in your system prompt).
+For query_cloud and specify_resources: use the load_skill tool to load the relevant cloud-service skill on demand (the skill catalog is in your system prompt). specify_resources loads per-service skills to find API endpoints for spec queries (e.g. load_skill("huaweicloud-ecs") for ListFlavors).
 
 ## Output contract
 Return ONLY valid JSON as specified by each tool's instructions. Do not wrap in markdown fences. Do not add conversational text outside the JSON. The server parses your output programmatically — any non-JSON text will cause a parse failure.`
@@ -143,18 +145,19 @@ func (p *Planner) ProposeArchitecture(ctx context.Context, request string) (stri
 		agent.WithSystemPrompts(
 			serverContext,
 			skillBody,
-			`You are a HuaweiCloud architecture expert. Your job is to RECOMMEND an architecture, NOT write .tf files.
+			`You are a HuaweiCloud architecture expert. Your job is to RECOMMEND an architecture as a DAG (directed acyclic graph), NOT write .tf files.
 
 ## What to do
 1. Parse the user's deployment goal (what to deploy, region, HA, budget, etc.)
 2. Run `+"`ls skills/huaweicloud-deploy/references/`"+` to see available service categories
 3. Match the request to a known architecture pattern (see patterns below)
-4. Return the architecture recommendation
+4. Return the architecture recommendation as a DAG: one node per resource, depends_on lists the node ids this resource depends on (e.g. an ECS depends on the VPC, subnet, and security group it uses)
 
 ## What NOT to do
-- Do NOT read individual .tf files — that happens in generate_plan
+- Do NOT read individual .tf files — that happens in generate_terraform_plan
 - Do NOT browse deep into reference directories
 - Do NOT generate .tf configuration
+- Do NOT fill resource specs (flavor, image, disk, CIDR) — that happens in specify_resources
 
 ## Common architecture patterns
 - **Single web server**: ECS + VPC + Subnet + Security Group + EIP
@@ -171,10 +174,17 @@ Return JSON:
   "architecture": "short name, e.g. \"single ECS + VPC + EIP\"",
   "services": ["ecs", "vpc", "eip"],
   "reasoning": "why this architecture was chosen",
-  "questions": ["..."]  // only if information is incomplete
+  "questions": ["..."],  // only if information is incomplete
+  "dag": {
+    "nodes": [
+      {"id": "vpc-main", "type": "huaweicloud_vpc", "name": "main", "depends_on": []},
+      {"id": "ecs-web", "type": "huaweicloud_compute_instance", "name": "web", "depends_on": ["vpc-main", "subnet-main"]}
+    ]
+  }
 }
 `+"```"+`
-If information is incomplete, return questions instead of architecture.`),
+- Node ids are short stable ids (e.g. "ecs-web"), unique across the DAG. type must be a huaweicloud terraform resource type; name is the terraform resource label.
+- If information is incomplete, return questions instead of the DAG.`),
 		agent.WithMaxTurns(5),
 	)
 	rt := kernel.New(cfg, kernel.Deps{
@@ -204,6 +214,7 @@ If information is incomplete, return questions instead of architecture.`),
 		Services     []string `json:"services"`
 		Reasoning    string   `json:"reasoning"`
 		Questions    []string `json:"questions"`
+		Dag          Dag      `json:"dag"`
 	}
 	if err := json.Unmarshal([]byte(raw), &arch); err != nil {
 		os.RemoveAll(dir)
@@ -224,10 +235,40 @@ If information is incomplete, return questions instead of architecture.`),
 		})
 	}
 
+	// Persist the DAG — it is the contract for every subsequent step.
+	arch.Dag.Version = DagVersion
+	arch.Dag.DeploymentID = depID
+	arch.Dag.Architecture = arch.Architecture
+	arch.Dag.Status = DagProposed
+	if err := validateDag(&arch.Dag); err != nil {
+		os.RemoveAll(dir)
+		return marshalResult(planResult{
+			Status: "need_input",
+			Questions: []string{
+				"Could not build a valid resource DAG from the request: " + err.Error(),
+			},
+		})
+	}
+	if err := saveDag(dir, &arch.Dag); err != nil {
+		os.RemoveAll(dir)
+		return "", fmt.Errorf("propose_architecture: save dag: %w", err)
+	}
+
+	// Summarize nodes for the client LLM (id + type + name).
+	nodes := make([]map[string]any, 0, len(arch.Dag.Nodes))
+	for _, n := range arch.Dag.Nodes {
+		nodes = append(nodes, map[string]any{
+			"id":   n.ID,
+			"type": n.Type,
+			"name": n.Name,
+		})
+	}
+
 	out := map[string]any{
 		"deployment_id": depID,
 		"architecture":  arch.Architecture,
 		"services":      arch.Services,
+		"nodes":         nodes,
 		"reasoning":     arch.Reasoning,
 		"next_step":     "Call specify_resources with this deployment_id to determine resource specs. User should confirm the architecture first.",
 	}
@@ -238,18 +279,21 @@ If information is incomplete, return questions instead of architecture.`),
 	return string(data), nil
 }
 
-// SpecifyResources determines concrete resource specs for a proposed architecture
-// (step 2 of the 6-step deployment flow). Reads the architecture from Memory
-// (stored by propose_architecture), queries cloud APIs for available specs
-// (flavors, images, etc.), and returns a detailed resource list.
+// SpecifyResources determines concrete resource specs for a proposed
+// architecture (step 2 of the 6-step deployment flow). It reads the DAG
+// persisted by propose_architecture, queries cloud APIs for available specs
+// (flavors, images, etc.) via dynamic skill loading + http_request, and
+// returns the enriched DAG. If choices are too many or information is
+// insufficient, it returns questions and the client re-calls with answers.
 //
-// The user confirms the resources before calling generate_plan.
-func (p *Planner) SpecifyResources(ctx context.Context, deploymentID, adjustments string) (string, error) {
+// The user confirms the resources before calling generate_terraform_plan.
+func (p *Planner) SpecifyResources(ctx context.Context, deploymentID string, answers []string, adjustments string) (string, error) {
 	progress := openagent.ProgressFromContext(ctx)
 
 	dir := filepath.Join(p.deploymentsDir, deploymentID)
-	if _, err := os.Stat(dir); err != nil {
-		return "", fmt.Errorf("specify_resources: deployment %s not found — call propose_architecture first", deploymentID)
+	dag, err := loadDag(dir)
+	if err != nil {
+		return "", fmt.Errorf("specify_resources: %w", err)
 	}
 
 	progress("Loading deployment skill...", 0, 3)
@@ -259,47 +303,58 @@ func (p *Planner) SpecifyResources(ctx context.Context, deploymentID, adjustment
 		agent.WithSystemPrompts(
 			serverContext,
 			skillBody,
-			`You are a HuaweiCloud resource specification expert. Your job is to determine concrete resource specs for a proposed architecture.
+			`You are a HuaweiCloud resource specification expert. Your job is to determine concrete resource specs for each node of a deployment DAG.
 
 ## What to do
-1. Read the architecture recommendation from the conversation history (propose_architecture output)
-2. Use http_request to query available specs if needed (e.g. ListFlavors for ECS, ListImages for OS images)
-3. Determine concrete specs for each resource: flavor, image, disk size, CIDR, etc.
-4. Apply any user adjustments to the specs
+1. Read the DAG from your input message — it is the read-only contract: preserve node ids, do not drop nodes
+2. To find API endpoints for spec queries, use load_skill on the matching service skill (e.g. load_skill("huaweicloud-ecs") for ListFlavors/ListImages, load_skill("huaweicloud-vpc") for CIDR rules). The skill body arrives as a tool result; browse its references/ with read/grep/ls for request schemas
+3. Use http_request to query available specs (read-only List/Show/Get only — NEVER create or modify resources)
+4. Determine a concrete spec for EVERY node: flavor, image, disk size, CIDR, etc.
+5. If the choice is too broad (e.g. many candidate resource types or flavors) or information is insufficient, ask the user instead of guessing
 
 ## What NOT to do
-- Do NOT write .tf files — that happens in generate_plan
-- Do NOT browse reference directories
+- Do NOT write .tf files — that happens in generate_terraform_plan
 - Do NOT create or modify any cloud resources — only read-only API calls (List/Show/Get)
+- Do NOT invent specs you cannot verify — if undeterminable, ask the user
 
 ## Output
 Return JSON:
 `+"```json"+`
-{
-  "resources": [
-    {"type": "huaweicloud_compute_instance", "name": "web", "spec": {"flavor": "s6.large.2", "image": "Ubuntu 22.04", "disk": 40}},
-    {"type": "huaweicloud_vpc", "name": "main", "spec": {"cidr": "192.168.0.0/16"}},
-    {"type": "huaweicloud_vpc_subnet", "name": "subnet", "spec": {"cidr": "192.168.0.0/24"}},
-    {"type": "huaweicloud_vpc_eip", "name": "eip", "spec": {"bandwidth": 5, "type": "5_bgp"}}
-  ],
-  "reasoning": "why these specs were chosen"
-}
+{"status": "ready",
+ "resources": [
+   {"id": "ecs-web", "type": "huaweicloud_compute_instance", "name": "web", "spec": {"flavor": "s6.large.2", "image": "Ubuntu 22.04", "disk": 40}},
+   {"id": "vpc-main", "type": "huaweicloud_vpc", "name": "main", "spec": {"cidr": "192.168.0.0/16"}}
+ ],
+ "reasoning": "why these specs were chosen"}
 `+"```"+`
+or, when you need more input:
+`+"```json"+`
+{"status": "need_input", "questions": ["...", "..."]}
+`+"```"+`
+- Every node id from the input DAG must appear in "resources" with a filled spec. You may add new nodes with new ids.
 `),
-		agent.WithMaxTurns(8),
-	)
+			agent.WithMaxTurns(12),
+		)
 	rt := kernel.New(cfg, kernel.Deps{
 		Tools:          p.fileTools(),
 		SessionStore:   p.memory,
 		Compressor:     ctxpkg.CompressorOf(p.memory),
 		MemoryProvider: p.knowledge,
+		SkillProvider:  p.loader,
 		Hooks:          openagent.MultiHooks(sloghooks.New(slog.Default()), newProgressHook()),
 	})
 
 	progress("Determining resource specs...", 1, 3)
 	session := openagent.Session{ID: sessionID(deploymentID)}
 
-	userMsg := "Determine concrete resource specs for this deployment based on the architecture from the previous step (propose_architecture). Return JSON with the resources array."
+	dagStr, err := dagInput(dag)
+	if err != nil {
+		return "", fmt.Errorf("specify_resources: %w", err)
+	}
+	userMsg := "Here is the deployment DAG (read-only contract — preserve node ids, fill specs for every node):\n\n" + dagStr + "\n\nDetermine concrete specs for every node. Return JSON with the resources array."
+	if len(answers) > 0 {
+		userMsg += "\n\nUser answers to your previous questions:\n- " + strings.Join(answers, "\n- ")
+	}
 	if adjustments != "" {
 		userMsg += "\n\nUser adjustments: " + adjustments
 	}
@@ -315,18 +370,105 @@ Return JSON:
 	}
 
 	var spec struct {
-		Resources []map[string]any `json:"resources"`
-		Reasoning string           `json:"reasoning"`
+		Status    string `json:"status"`
+		Resources []struct {
+			ID        string         `json:"id"`
+			Type      string         `json:"type"`
+			Name      string         `json:"name"`
+			Spec      map[string]any `json:"spec"`
+			DependsOn []string       `json:"depends_on"`
+		} `json:"resources"`
+		Questions []string `json:"questions"`
+		Reasoning string   `json:"reasoning"`
 	}
 	if err := json.Unmarshal([]byte(raw), &spec); err != nil {
 		return "", fmt.Errorf("specify_resources: parse: %w (raw=%q)", err, raw)
 	}
 
+	// Need more input — ask the client, keep the DAG at last-good state.
+	if spec.Status == "need_input" || (spec.Status == "" && len(spec.Questions) > 0) {
+		progress("Done", 3, 3)
+		return marshalResult(planResult{
+			Status:    "need_input",
+			Questions: spec.Questions,
+		})
+	}
+	if len(spec.Resources) == 0 {
+		return "", fmt.Errorf("specify_resources: no resources returned")
+	}
+
+	// Merge the LLM output back onto the DAG by node id.
+	type llmNode struct {
+		ID        string
+		Type      string
+		Name      string
+		Spec      map[string]any
+		DependsOn []string
+	}
+	byID := make(map[string]llmNode, len(spec.Resources))
+	for _, r := range spec.Resources {
+		if r.ID == "" {
+			return "", fmt.Errorf("specify_resources: resource without id in LLM output")
+		}
+		byID[r.ID] = llmNode{ID: r.ID, Type: r.Type, Name: r.Name, Spec: r.Spec, DependsOn: r.DependsOn}
+	}
+	existing := make(map[string]bool, len(dag.Nodes))
+	for i := range dag.Nodes {
+		n := &dag.Nodes[i]
+		existing[n.ID] = true
+		r, ok := byID[n.ID]
+		if !ok {
+			return "", fmt.Errorf("specify_resources: LLM output missing node %q — every DAG node must get a spec", n.ID)
+		}
+		if r.Type != "" && r.Type != n.Type {
+			return "", fmt.Errorf("specify_resources: node %q type changed %q -> %q — keep the DAG contract", n.ID, n.Type, r.Type)
+		}
+		if r.Name != "" && r.Name != n.Name {
+			return "", fmt.Errorf("specify_resources: node %q name changed %q -> %q — keep the DAG contract", n.ID, n.Name, r.Name)
+		}
+		if len(r.Spec) == 0 {
+			return "", fmt.Errorf("specify_resources: node %q has no spec — every DAG node must get a concrete spec", n.ID)
+		}
+		n.Spec = r.Spec
+	}
+	// New nodes the LLM added (with new ids) are appended.
+	for _, r := range byID {
+		if existing[r.ID] {
+			continue
+		}
+		if r.Type == "" || r.Name == "" {
+			return "", fmt.Errorf("specify_resources: new node %q missing type or name", r.ID)
+		}
+		dag.Nodes = append(dag.Nodes, DagNode{
+			ID:        r.ID,
+			Type:      r.Type,
+			Name:      r.Name,
+			Spec:      r.Spec,
+			DependsOn: r.DependsOn,
+		})
+	}
+	dag.Status = DagSpecified
+	if err := saveDag(dir, dag); err != nil {
+		return "", fmt.Errorf("specify_resources: save dag: %w", err)
+	}
+	if err := invalidateCost(dir); err != nil {
+		return "", fmt.Errorf("specify_resources: %w", err)
+	}
+
+	resources := make([]map[string]any, 0, len(dag.Nodes))
+	for _, n := range dag.Nodes {
+		resources = append(resources, map[string]any{
+			"id":   n.ID,
+			"type": n.Type,
+			"name": n.Name,
+			"spec": n.Spec,
+		})
+	}
 	out := map[string]any{
 		"deployment_id": deploymentID,
-		"resources":     spec.Resources,
+		"resources":     resources,
 		"reasoning":     spec.Reasoning,
-		"next_step":     "Call generate_plan with this deployment_id to write .tf files and run terraform plan. User should confirm the resources first.",
+		"next_step":     "Call generate_terraform_plan with this deployment_id to write .tf files and run terraform plan. User should confirm the resources first.",
 	}
 	data, err := json.Marshal(out)
 	if err != nil {
@@ -336,18 +478,24 @@ Return JSON:
 	return string(data), nil
 }
 
-// GeneratePlan writes .tf files and runs terraform plan (step 3 of the 6-step
-// deployment flow). Reads the architecture + resource specs from Memory, browses
-// ONLY the relevant reference examples, generates .tf files, and runs terraform
-// init + plan. Retries up to 3 times on plan failure.
+// GenerateTerraformPlan writes .tf files and runs terraform plan (step 3 of
+// the 6-step deployment flow). Reads the fully-specified DAG persisted by
+// specify_resources, browses ONLY the relevant reference examples, generates
+// .tf files, and runs terraform init + plan. Retries up to 3 times on plan
+// failure. On success marks the DAG as planned and invalidates any previous
+// cost estimate.
 //
 // The user reviews the plan preview before calling estimate_cost.
-func (p *Planner) GeneratePlan(ctx context.Context, deploymentID string) (string, error) {
+func (p *Planner) GenerateTerraformPlan(ctx context.Context, deploymentID string) (string, error) {
 	progress := openagent.ProgressFromContext(ctx)
 
 	dir := filepath.Join(p.deploymentsDir, deploymentID)
-	if _, err := os.Stat(dir); err != nil {
-		return "", fmt.Errorf("generate_plan: deployment %s not found — call propose_architecture first", deploymentID)
+	dag, err := loadDag(dir)
+	if err != nil {
+		return "", fmt.Errorf("generate_terraform_plan: %w", err)
+	}
+	if !nodeSpecsFilled(dag) {
+		return "", fmt.Errorf("generate_terraform_plan: deployment %s is not fully specified — call specify_resources first", deploymentID)
 	}
 
 	progress("Loading deployment skill...", 0, 4)
@@ -357,18 +505,20 @@ func (p *Planner) GeneratePlan(ctx context.Context, deploymentID string) (string
 		agent.WithSystemPrompts(
 			serverContext,
 			skillBody,
-			`You are a HuaweiCloud terraform configuration expert. Generate .tf files based on the architecture and resource specs from the conversation history.
+			`You are a HuaweiCloud terraform configuration expert. Generate .tf files from the deployment DAG.
 
 ## What to do
-1. Read the architecture + resource specs from the conversation history (propose_architecture + specify_resources output)
+1. Read the DAG from your input message — it is the authoritative contract: one resource block per node (address = type.name), wire dependencies per the dag depends_on edges (references or depends_on), and do NOT deviate from the DAG
 2. Browse ONLY the relevant reference examples — e.g. if deploying ECS, look at references/ecs/, NOT all directories
 3. Generate .tf files: providers.tf, variables.tf, main.tf, terraform.tfvars
 4. Follow the credential rules, naming conventions, and variable design from the skill guide
+5. Use the node spec values (flavor, image, cidr, ...) from the DAG for variables and terraform.tfvars
 
 ## What NOT to do
 - Do NOT browse all reference directories — only the ones relevant to your resources
 - Do NOT hardcode credentials
-- Do NOT ask questions — use the specs from history
+- Do NOT ask questions — use the DAG from your input message
+- Do NOT add resources that are not in the DAG
 
 ## Output
 Return JSON:
@@ -394,14 +544,18 @@ Return JSON:
 	})
 
 	session := openagent.Session{ID: sessionID(deploymentID)}
-	msg := openagent.UserMessage("Generate terraform .tf files based on the architecture and resource specs from the conversation history.")
+	dagStr, err := dagInput(dag)
+	if err != nil {
+		return "", fmt.Errorf("generate_terraform_plan: %w", err)
+	}
+	msg := openagent.UserMessage("Generate terraform .tf files from this deployment DAG (one resource block per node, address = type.name, dependencies per depends_on):\n\n" + dagStr)
 
 	var reasoning string
 	for attempt := 0; attempt < 3; attempt++ {
 		progress(fmt.Sprintf("Generating .tf files (attempt %d/3)...", attempt+1), float64(attempt), 3)
 		result, err := rt.Run(ctx, session, msg)
 		if err != nil {
-			return "", fmt.Errorf("generate_plan: LLM run (attempt %d): %w", attempt+1, err)
+			return "", fmt.Errorf("generate_terraform_plan: LLM run (attempt %d): %w", attempt+1, err)
 		}
 
 		var llmOutput struct {
@@ -410,14 +564,14 @@ Return JSON:
 		}
 		raw := extractJSON(result.FinalOutput)
 		if raw == "" {
-			return "", fmt.Errorf("generate_plan: LLM returned empty output (attempt %d, FinalOutput=%q)", attempt+1, result.FinalOutput)
+			return "", fmt.Errorf("generate_terraform_plan: LLM returned empty output (attempt %d, FinalOutput=%q)", attempt+1, result.FinalOutput)
 		}
 		if err := json.Unmarshal([]byte(raw), &llmOutput); err != nil {
-			return "", fmt.Errorf("generate_plan: parse (attempt %d): %w (raw=%q)", attempt+1, err, raw)
+			return "", fmt.Errorf("generate_terraform_plan: parse (attempt %d): %w (raw=%q)", attempt+1, err, raw)
 		}
 
 		if len(llmOutput.Files) == 0 {
-			return "", fmt.Errorf("generate_plan: no files generated (attempt %d)", attempt+1)
+			return "", fmt.Errorf("generate_terraform_plan: no files generated (attempt %d)", attempt+1)
 		}
 
 		reasoning = llmOutput.Reasoning
@@ -425,10 +579,10 @@ Return JSON:
 		// Write .tf files to the deployment directory.
 		for name, content := range llmOutput.Files {
 			if strings.ContainsAny(name, `/\`) || strings.Contains(name, "..") {
-				return "", fmt.Errorf("generate_plan: invalid filename %q", name)
+				return "", fmt.Errorf("generate_terraform_plan: invalid filename %q", name)
 			}
 			if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0644); err != nil {
-				return "", fmt.Errorf("generate_plan: write %s: %w", name, err)
+				return "", fmt.Errorf("generate_terraform_plan: write %s: %w", name, err)
 			}
 		}
 
@@ -441,7 +595,7 @@ Return JSON:
 			ProviderMirrors: p.providerMirrors,
 		})
 		if err != nil {
-			return "", fmt.Errorf("generate_plan: create terraform client: %w", err)
+			return "", fmt.Errorf("generate_terraform_plan: create terraform client: %w", err)
 		}
 		if err := client.Init(ctx); err != nil {
 			msg = retryMessage("generate .tf files", "terraform init", err, p.workDir, dir)
@@ -450,6 +604,13 @@ Return JSON:
 		progress("Running terraform plan...", 3, 4)
 		plan, err := client.Plan(ctx)
 		if err == nil {
+			dag.Status = DagPlanned
+			if err := saveDag(dir, dag); err != nil {
+				return "", fmt.Errorf("generate_terraform_plan: save dag: %w", err)
+			}
+			if err := invalidateCost(dir); err != nil {
+				return "", fmt.Errorf("generate_terraform_plan: %w", err)
+			}
 			out := map[string]any{
 				"deployment_id":  deploymentID,
 				"files":          llmOutput.Files,
@@ -460,28 +621,30 @@ Return JSON:
 			}
 			data, err := json.Marshal(out)
 			if err != nil {
-				return "", fmt.Errorf("generate_plan: marshal: %w", err)
+				return "", fmt.Errorf("generate_terraform_plan: marshal: %w", err)
 			}
 			return string(data), nil
 		}
 		msg = retryMessage("generate .tf files", "terraform plan", err, p.workDir, dir)
 	}
 
-	return "", fmt.Errorf("generate_plan: terraform plan failed after 3 attempts")
+	return "", fmt.Errorf("generate_terraform_plan: terraform plan failed after 3 attempts")
 }
 
 // UpdateDeployment modifies an existing deployment by re-running specify_resources
-// (with user adjustments) + generate_plan. The deployment directory is reused.
+// (with user answers/adjustments) + generate_terraform_plan. The deployment
+// directory is reused; both steps invalidate any previous cost estimate, so
+// apply requires a fresh estimate_cost.
 //
 // Use this when the user wants to adjust an already-planned deployment
 // (e.g. change a flavor, rename a resource, add a tag) without starting
 // from scratch. The change_request is passed as adjustments to specify_resources.
-func (p *Planner) UpdateDeployment(ctx context.Context, deploymentID, changeRequest string) (string, error) {
-	// Re-specify resources with the user's adjustments, then regenerate the plan.
-	if _, err := p.SpecifyResources(ctx, deploymentID, changeRequest); err != nil {
+func (p *Planner) UpdateDeployment(ctx context.Context, deploymentID string, answers []string, changeRequest string) (string, error) {
+	// Re-specify resources with the user's answers/adjustments, then regenerate the plan.
+	if _, err := p.SpecifyResources(ctx, deploymentID, answers, changeRequest); err != nil {
 		return "", fmt.Errorf("update_deployment: specify_resources: %w", err)
 	}
-	return p.GeneratePlan(ctx, deploymentID)
+	return p.GenerateTerraformPlan(ctx, deploymentID)
 }
 
 // retryMessage builds the user message for a plan retry attempt.
@@ -506,59 +669,40 @@ Fix the .tf files and return the corrected versions as JSON:
 		request, command, planErr.Error(), relDir, tfFiles))
 }
 
-// EstimateCost reads the saved terraform plan for a deployment and queries
-// cloud pricing via the LLM. The LLM loads the pricing skill and uses
+// EstimateCost prices a planned deployment from its DAG (step 4 of the
+// 6-step deployment flow). The LLM loads the pricing skill and uses
 // http_request (BSS API, auto-signed) to query prices, with WebSearch/WebFetch
-// as a fallback for public pricing pages. This MUST be called before
-// apply_deployment so the user sees the cost.
-func (p *Planner) EstimateCost(ctx context.Context, deploymentID string) (string, error) {
+// as a fallback for public pricing pages. pricingMode ("on-demand" or
+// "monthly") comes from the user's stated preference; "" defaults to
+// on-demand. The result is persisted to cost.json and the DAG is marked
+// cost_estimated — apply_deployment gates on the marker, so this MUST be
+// called (again after any change) before apply.
+func (p *Planner) EstimateCost(ctx context.Context, deploymentID, pricingMode string) (string, error) {
 	progress := openagent.ProgressFromContext(ctx)
 
 	dir := filepath.Join(p.deploymentsDir, deploymentID)
 
-	// Check that a plan exists — ShowPlan needs the tfplan file.
-	planPath := filepath.Join(dir, "tfplan")
-	if _, err := os.Stat(planPath); err != nil {
-		if os.IsNotExist(err) {
-			return "", fmt.Errorf("estimate_cost: no plan found for deployment %s — call plan_deployment first", deploymentID)
-		}
-		return "", fmt.Errorf("estimate_cost: check plan: %w", err)
-	}
-
-	// Read the saved plan to get exact resource specs.
-	progress("Reading terraform plan...", 0, 3)
-	client, err := iac.NewClient(ctx, dir, iac.Config{
-		Env:             p.cloud.Env(),
-		DryRun:          p.dryRun,
-		BinaryMirrors:   p.binaryMirrors,
-		ProviderMirrors: p.providerMirrors,
-	})
+	// The DAG carries the exact specs the user confirmed — it is the pricing
+	// contract (the tfplan After field is noisy and absent in dry-run).
+	dag, err := loadDag(dir)
 	if err != nil {
-		return "", fmt.Errorf("estimate_cost: create terraform client: %w", err)
+		return "", fmt.Errorf("estimate_cost: %w", err)
 	}
-	plan, err := client.ShowPlan(ctx)
-	if err != nil {
-		return "", fmt.Errorf("estimate_cost: read plan: %w", err)
-	}
-
-	// Serialize plan changes (resource type + exact specs) for the LLM.
-	planJSON, err := json.Marshal(plan.Changes)
-	if err != nil {
-		return "", fmt.Errorf("estimate_cost: marshal plan: %w", err)
+	if !nodeSpecsFilled(dag) {
+		return "", fmt.Errorf("estimate_cost: deployment %s is not fully specified — call specify_resources first", deploymentID)
 	}
 
-	// Check if plan changes have exact specs (After field). In dry-run mode
-	// the simulated plan has no After, so the LLM can only estimate by type.
-	hasSpecs := false
-	for _, c := range plan.Changes {
-		if len(c.After) > 0 {
-			hasSpecs = true
-			break
-		}
+	// Normalize the billing mode: "" defaults to on-demand.
+	mode := pricingMode
+	if mode == "" {
+		mode = "on-demand"
+	}
+	if mode != "on-demand" && mode != "monthly" {
+		return "", fmt.Errorf(`estimate_cost: unsupported pricing_mode %q (expected "on-demand" or "monthly")`, pricingMode)
 	}
 
+	progress("Loading pricing skill...", 0, 3)
 	skillBody := p.loadSkillBody(ctx, "huaweicloud-bss")
-	progress("Loading pricing skill...", 1, 3)
 	cfg := agent.New("iac-pricing",
 		agent.WithModel(p.model),
 		agent.WithSystemPrompts(
@@ -568,12 +712,16 @@ func (p *Planner) EstimateCost(ctx context.Context, deploymentID string) (string
 				"Use read/grep/ls to browse the skills/huaweicloud-bss/references/ directory "+
 				"for BSS API definitions, use http_request to call the BSS pricing APIs (signing is automatic), "+
 				"and use WebSearch/WebFetch as a fallback for public pricing pages. "+
-				"You are given the planned resources with exact specs from terraform plan. "+
-				"Query the monthly price for each resource. "+
+				"You are given the planned resources with exact specs from the deployment DAG. "+
+				"Query the price for each resource in the billing mode specified in your user message: "+
+				"on-demand (按需) uses ListOnDemandResourceRatings, monthly (包月) uses ListRateOnPeriodDetail. "+
+				"In on-demand mode: if a product does not support on-demand (API error or empty result), "+
+				"fall back to ListRateOnPeriodDetail (monthly) for that product and note it in the note field. "+
 				"Mark prices that cannot be determined as null — do NOT fabricate. "+
-				"Return {\"items\": [{\"resource\": \"...\", \"spec\": \"...\", \"monthly\": price or null}], \"total_monthly\": ... or null, \"currency\": \"CNY\", \"note\": \"...\"}."),
-		agent.WithMaxTurns(8),
-	)
+				"Return {\"items\": [{\"resource\": \"...\", \"spec\": \"...\", \"price\": price or null}], "+
+				"\"total\": ... or null, \"currency\": \"CNY\", \"note\": \"...\"}."),
+			agent.WithMaxTurns(8),
+		)
 	rt := kernel.New(cfg, kernel.Deps{
 		Tools:          p.fileTools(),
 		SessionStore:   p.memory,
@@ -582,35 +730,54 @@ func (p *Planner) EstimateCost(ctx context.Context, deploymentID string) (string
 		Hooks:          openagent.MultiHooks(sloghooks.New(slog.Default()), newProgressHook()),
 	})
 
-	var userMsg string
-	if hasSpecs {
-		userMsg = "Query the prices for these planned resources (with exact specs):\n\n" + string(planJSON)
-	} else {
-		userMsg = "Query the prices for these planned resources (specs not available — estimate by resource type only):\n\n" + string(planJSON)
+	dagStr, err := dagInput(dag)
+	if err != nil {
+		return "", fmt.Errorf("estimate_cost: %w", err)
 	}
+	userMsg := "Billing mode: " + mode + ". Query the prices for these planned resources (with exact specs):\n\n" + dagStr
 
 	session := openagent.Session{ID: sessionID(deploymentID)}
-	progress("Querying cloud pricing...", 2, 3)
+	progress("Querying cloud pricing...", 1, 3)
 	result, err := rt.Run(ctx, session, openagent.UserMessage(userMsg))
 	if err != nil {
 		return "", fmt.Errorf("estimate_cost: LLM run: %w", err)
 	}
 
-	// Parse the LLM output and add deployment_id.
+	// Parse the LLM output and persist the estimate marker.
 	raw := extractJSON(result.FinalOutput)
 	var cost struct {
-		Items        []any  `json:"items"`
-		TotalMonthly any    `json:"total_monthly"`
-		Currency     string `json:"currency"`
-		Note         string `json:"note"`
+		Items []any  `json:"items"`
+		Total any    `json:"total"`
+		Currency string `json:"currency"`
+		Note   string `json:"note"`
 	}
 	if json.Unmarshal([]byte(raw), &cost) != nil {
 		cost.Note = result.FinalOutput
 	}
+	est := &CostEstimate{
+		Version:      CostVersion,
+		DeploymentID: deploymentID,
+		PricingMode:  mode,
+		EstimatedAt:  time.Now().UTC().Format(time.RFC3339),
+		Items:        cost.Items,
+		TotalMonthly: cost.Total,
+		Currency:     cost.Currency,
+		Note:         cost.Note,
+	}
+	if err := saveCost(dir, est); err != nil {
+		return "", fmt.Errorf("estimate_cost: %w", err)
+	}
+	dag.Status = DagCostEstimated
+	if err := saveDag(dir, dag); err != nil {
+		return "", fmt.Errorf("estimate_cost: save dag: %w", err)
+	}
+	progress("Done", 2, 3)
+
 	out := map[string]any{
 		"deployment_id": deploymentID,
+		"pricing_mode":  mode,
 		"items":         cost.Items,
-		"total_monthly": cost.TotalMonthly,
+		"total_monthly": cost.Total,
 		"currency":      cost.Currency,
 		"note":          cost.Note,
 	}

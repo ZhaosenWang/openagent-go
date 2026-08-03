@@ -29,18 +29,19 @@ Match the user's request to one of these patterns. Do NOT browse all references 
 - Parse the user's deployment goal (what, region, HA, budget, etc.)
 - Match to an architecture pattern above
 - Run `ls skills/huaweicloud-deploy/references/` to verify service categories exist
-- **Do NOT read individual .tf files** — that happens in generate_plan
-- Return `{architecture, services, reasoning, questions?}`
+- **Do NOT read individual .tf files** — that happens in generate_terraform_plan
+- Return the architecture as a DAG: `{architecture, services, reasoning, questions?, dag: {nodes: [{id, type, name, depends_on}]}}` — one node per resource, depends_on lists the node ids this resource depends on, do NOT fill specs (that happens in specify_resources)
 
 ### Step 2: specify_resources
-- Read the architecture from conversation history
-- Use http_request to query available specs if needed (ListFlavors, ListImages)
+- Read the DAG from your input message — it is the read-only contract: preserve node ids, fill specs for every node
+- Use load_skill on the matching service skill (e.g. `load_skill("huaweicloud-ecs")`) to find API endpoints, then http_request to query available specs (ListFlavors, ListImages)
 - Determine concrete specs: flavor, image, disk size, CIDR, bandwidth, etc.
-- **Do NOT write .tf files** — that happens in generate_plan
-- Return `{resources: [{type, name, spec}], reasoning}`
+- If choices are too many or info is missing, return `{status: "need_input", questions: [...]}` instead of guessing
+- **Do NOT write .tf files** — that happens in generate_terraform_plan
+- Return `{status: "ready", resources: [{id, type, name, spec}], reasoning}` — every DAG node gets a spec
 
-### Step 3: generate_plan
-- Read architecture + resource specs from conversation history
+### Step 3: generate_terraform_plan
+- Read the fully-specified DAG from your input message — it is the authoritative contract: one resource block per node (address = type.name), wire dependencies per depends_on, do NOT deviate from the DAG
 - Browse ONLY the relevant reference directories (e.g. `references/ecs/` for ECS)
 - Generate .tf files: providers.tf, variables.tf, main.tf, terraform.tfvars
 - **Do NOT browse all 63 service directories** — only the ones for your resources
