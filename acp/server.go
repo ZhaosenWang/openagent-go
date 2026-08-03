@@ -367,23 +367,44 @@ var _ openacp.AgentHandler = (*AgentServer)(nil)
 // runtime_set_model_config. When the model already exists, empty apiKey
 // or baseURL preserve the originals; when inserting a new model, values
 // are used as-is.
-func (s *AgentServer) SetModel(provider, modelID, apiKey, baseURL string) {
+func (s *AgentServer) SetModel(provider, modelID, apiKey, baseURL string, maxInputTokens, maxOutputTokens int) {
 	s.modelsMu.Lock()
 	defer s.modelsMu.Unlock()
 	key := provider + "/" + modelID
-	if old, ok := s.modelConfigs[key]; ok {
-		if apiKey == "" {
-			apiKey = old.APIKey
+	old, exists := s.modelConfigs[key]
+	if apiKey == "" {
+		apiKey = old.APIKey
+	}
+	if baseURL == "" {
+		baseURL = old.BaseURL
+	}
+	cw := maxInputTokens
+	if cw == 0 {
+		if oldModel, ok := s.Models[key]; ok {
+			cw = oldModel.ContextWindow()
 		}
-		if baseURL == "" {
-			baseURL = old.BaseURL
-		}
+	}
+	mot := maxOutputTokens
+	if mot == 0 {
+		mot = old.MaxOutputTokens
+	}
+	if exists {
 		slog.Info("acp updating model", "key", key)
 	} else {
 		slog.Info("acp inserting model", "key", key)
 	}
-	s.Models[key] = openai.New(apiKey, modelID, baseURL)
-	s.modelConfigs[key] = ModelConfig{Provider: provider, ModelID: modelID, APIKey: apiKey, BaseURL: baseURL}
+	m := openai.New(apiKey, modelID, baseURL)
+	if cw > 0 {
+		m = m.WithContextWindow(cw)
+	}
+	s.Models[key] = m
+	s.modelConfigs[key] = ModelConfig{
+		Provider: provider, ModelID: modelID, APIKey: apiKey, BaseURL: baseURL,
+		MaxOutputTokens:        mot,
+		InputCostPerToken:      old.InputCostPerToken,
+		InputCacheCostPerToken: old.InputCacheCostPerToken,
+		OutputCostPerToken:     old.OutputCostPerToken,
+	}
 }
 
 // SetDefaultModelID sets the default model used when a session has not
@@ -1318,6 +1339,10 @@ func (s *AgentServer) OnPrompt(ctx context.Context, req openacp.PromptRequest, s
 	// Must run BEFORE auto-title so slash commands don't get used as
 	// the session title (e.g. "/mode plan" would become the title).
 	if resp, handled := s.cmdRegistry.Handle(s.buildSlashContext(ctx, req.SessionID, ss), input.Content); handled {
+		if s.Mem != nil {
+			_ = s.Mem.Append(ctx, string(req.SessionID), input)
+			_ = s.Mem.Append(ctx, string(req.SessionID), openagent.Message{Role: openagent.RoleAssistant, Content: resp})
+		}
 		sender.SendAgentMessage(resp)
 		return &openacp.PromptResponse{StopReason: openacp.StopReasonEndTurn}, nil
 	}
@@ -2010,10 +2035,15 @@ func (s *AgentServer) buildSlashContext(ctx context.Context, sid openacp.Session
 			return out, nil
 		},
 		SetModel: func(modelID string) error {
-			if _, ok := s.Models[modelID]; !ok {
+			m, ok := s.Models[modelID]
+			if !ok {
 				return fmt.Errorf("unknown model: %s", modelID)
 			}
 			ss.config["model"] = modelID
+			if ss.rt != nil {
+				ss.rt.SetModel(m)
+			}
+			s.saveConfig(ctx, string(sid))
 			if s.updateSender != nil {
 				opts := s.buildConfigOptions(sid)
 				s.updateSender.SendSessionUpdate(sid, openacp.SessionUpdate{

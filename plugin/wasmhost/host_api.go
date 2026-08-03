@@ -61,7 +61,7 @@ type Logger interface {
 type AgentRuntime struct {
 	Get      func(key string) (string, bool)
 	Set      func(key string, value string) error
-	SetModel func(provider, modelID, apiKey, baseURL string)
+	SetModel func(provider, modelID, apiKey, baseURL string, maxInputTokens, maxOutputTokens int)
 }
 
 // Runtime key constants used by AgentRuntime.Get/Set.

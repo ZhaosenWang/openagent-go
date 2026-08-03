@@ -125,11 +125,12 @@ func (h *Handler) RegisterModel(id string, model openagent.Model, provider, apiK
 // SetModel replaces or inserts a model in the registry. apiKey and baseURL
 // override the originals only when non-empty (update) or are used as-is
 // (insert). Used by runtime_set_model_config host export.
-func (h *Handler) SetModel(provider, modelID, apiKey, baseURL string) {
+func (h *Handler) SetModel(provider, modelID, apiKey, baseURL string, maxInputTokens, maxOutputTokens int) {
 	h.modelsMu.Lock()
 	defer h.modelsMu.Unlock()
 	key := provider + "/" + modelID
-	if old, ok := h.modelConfigs[key]; ok {
+	old, ok := h.modelConfigs[key]
+	if ok {
 		if apiKey == "" {
 			apiKey = old.APIKey
 		}
@@ -140,7 +141,17 @@ func (h *Handler) SetModel(provider, modelID, apiKey, baseURL string) {
 		// New model: add to modelList so /models endpoint includes it.
 		h.modelList = append(h.modelList, ModelInfo{ID: modelID, Provider: provider})
 	}
-	h.models[key] = openai.New(apiKey, modelID, baseURL)
+	cw := maxInputTokens
+	if cw == 0 {
+		if oldModel, ok := h.models[key]; ok {
+			cw = oldModel.ContextWindow()
+		}
+	}
+	m := openai.New(apiKey, modelID, baseURL)
+	if cw > 0 {
+		m = m.WithContextWindow(cw)
+	}
+	h.models[key] = m
 	h.modelConfigs[key] = ModelConfig{Provider: provider, ModelID: modelID, APIKey: apiKey, BaseURL: baseURL}
 }
 

@@ -351,10 +351,12 @@ func (h *HostAPI) runtimeSetModelConfig(ctx context.Context, mod api.Module, raw
 		return WriteString(ctx, mod, b)
 	}
 	var mc struct {
-		Provider string `json:"provider"`
-		ModelID  string `json:"model_id"`
-		APIKey   string `json:"api_key"`
-		BaseURL  string `json:"base_url"`
+		Provider       string `json:"provider"`
+		ModelID        string `json:"model_id"`
+		APIKey         string `json:"api_key"`
+		BaseURL        string `json:"base_url"`
+		MaxInputTokens int    `json:"max_input_tokens"`
+		MaxOutputTokens int   `json:"max_output_tokens"`
 	}
 	if err := json.Unmarshal([]byte(raw), &mc); err != nil {
 		b, _ := json.Marshal(map[string]string{"error": err.Error()})
@@ -364,7 +366,7 @@ func (h *HostAPI) runtimeSetModelConfig(ctx context.Context, mod api.Module, raw
 		b, _ := json.Marshal(map[string]string{"error": "provider and model_id are required"})
 		return WriteString(ctx, mod, b)
 	}
-	rt.SetModel(mc.Provider, mc.ModelID, mc.APIKey, mc.BaseURL)
+	rt.SetModel(mc.Provider, mc.ModelID, mc.APIKey, mc.BaseURL, mc.MaxInputTokens, mc.MaxOutputTokens)
 	b, _ := json.Marshal(map[string]string{})
 	return WriteString(ctx, mod, b)
 }
