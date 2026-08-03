@@ -591,25 +591,20 @@ func (s *AgentServer) saveConfig(ctx context.Context, sessionID string) {
 // SessionStore._meta["total_tokens"]. Called after each prompt completes
 // so /context survives server restarts.
 func (s *AgentServer) saveTotalTokens(ctx context.Context, sessionID string, n int) {
-	if s.SessionStore == nil {
-		return
-	}
-	info, err := s.SessionStore.Get(ctx, sessionID)
+	info, err := s.Runtime.Get(ctx, sessionID)
 	if err != nil || info == nil {
 		return
 	}
 	info.SetMeta("total_tokens", n)
-	info.UpdatedAt = time.Now()
-	_ = s.SessionStore.Save(ctx, *info)
+	if err := s.Runtime.Save(ctx, *info); err != nil {
+		slog.Warn("openagent: session meta save failed", "error", err)
+	}
 }
 
 // loadTotalTokens reads the persisted accumulated total token count from
-// SessionStore._meta["total_tokens"]. Returns 0 if unset or unavailable.
+// session meta. Returns 0 if unset or unavailable.
 func (s *AgentServer) loadTotalTokens(ctx context.Context, sessionID string) int {
-	if s.SessionStore == nil {
-		return 0
-	}
-	info, err := s.SessionStore.Get(ctx, sessionID)
+	info, err := s.Runtime.Get(ctx, sessionID)
 	if err != nil || info == nil || info.Meta == nil {
 		return 0
 	}
