@@ -46,6 +46,18 @@ func NewAsyncExtractor(inner Extractor) *AsyncExtractor {
 	return e
 }
 
+// SetModel updates the model on the inner LLMExtractor if present.
+// Safe to call concurrently with Extract; the next background pass
+// uses the new model.
+func (e *AsyncExtractor) SetModel(m openagent.Model) {
+	if e == nil {
+		return
+	}
+	if llm, ok := e.inner.(*LLMExtractor); ok {
+		llm.SetModel(m)
+	}
+}
+
 // Extract implements Extractor: enqueue (non-blocking, ~µs). The actual
 // extraction runs on the background worker.
 func (e *AsyncExtractor) Extract(ctx context.Context, scope ContextScope, messages []openagent.Message) {

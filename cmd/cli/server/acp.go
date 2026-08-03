@@ -82,8 +82,10 @@ func RunACP(ctx context.Context, cfg *config.Config, caps config.Capabilities) e
 		deps.MemoryProvider = knowledge
 	}
 
+	var sumz *summarizer.Compressor
 	if caps.OnMemory() && caps.OnSummarizer() && firstM != nil {
-		ms.WithSummarizer(summarizer.New(firstM).WithMaxTokens(agentCfg.MaxCompressedTokens))
+		sumz = summarizer.New(firstM).WithMaxTokens(agentCfg.MaxCompressedTokens)
+		ms.WithSummarizer(sumz)
 	}
 
 	// Plugin manager — loads agent:tools and agent:observers plugins.
@@ -113,8 +115,10 @@ func RunACP(ctx context.Context, cfg *config.Config, caps config.Capabilities) e
 	// AFTER applyContextProviders so the effective provider is used.
 	// Building it earlier would fork writes to the local sqlite store
 	// while Recall reads the OpenViking index (silent knowledge loss).
+	var extractor *ctxpkg.AsyncExtractor
 	if caps.OnMemory() && firstM != nil && deps.MemoryProvider != nil {
-		deps.Extractor = ctxpkg.NewAsyncExtractor(ctxpkg.NewLLMExtractor(firstM, deps.MemoryProvider))
+		extractor = ctxpkg.NewAsyncExtractor(ctxpkg.NewLLMExtractor(firstM, deps.MemoryProvider))
+		deps.Extractor = extractor
 	}
 	srv := acp.NewAgentServer(agentCfg, deps, sessionStore, modelMap)
 	srv.AgentName = version.Name
@@ -122,6 +126,8 @@ func RunACP(ctx context.Context, cfg *config.Config, caps config.Capabilities) e
 	srv.MCPEnabled = caps.OnMCP()
 	srv.DefaultMode = cfg.DefaultMode
 	srv.PluginMgr = pluginMgr
+	srv.Summarizer = sumz
+	srv.Extractor = extractor
 	srv.ProfileResolver = func(cwd string) []string {
 		return resolveProfiles(cfg.Profiles, cwd)
 	}
