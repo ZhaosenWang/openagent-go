@@ -587,6 +587,46 @@ func (s *AgentServer) saveConfig(ctx context.Context, sessionID string) {
 	}
 }
 
+// saveTotalTokens persists the accumulated total token count to
+// SessionStore._meta["total_tokens"]. Called after each prompt completes
+// so /context survives server restarts.
+func (s *AgentServer) saveTotalTokens(ctx context.Context, sessionID string, n int) {
+	if s.SessionStore == nil {
+		return
+	}
+	info, err := s.SessionStore.Get(ctx, sessionID)
+	if err != nil || info == nil {
+		return
+	}
+	info.SetMeta("total_tokens", n)
+	info.UpdatedAt = time.Now()
+	_ = s.SessionStore.Save(ctx, *info)
+}
+
+// loadTotalTokens reads the persisted accumulated total token count from
+// SessionStore._meta["total_tokens"]. Returns 0 if unset or unavailable.
+func (s *AgentServer) loadTotalTokens(ctx context.Context, sessionID string) int {
+	if s.SessionStore == nil {
+		return 0
+	}
+	info, err := s.SessionStore.Get(ctx, sessionID)
+	if err != nil || info == nil || info.Meta == nil {
+		return 0
+	}
+	raw, ok := info.Meta["total_tokens"]
+	if !ok {
+		return 0
+	}
+	// JSON round-trip may yield float64; handle both int and float64.
+	switch v := raw.(type) {
+	case int:
+		return v
+	case float64:
+		return int(v)
+	}
+	return 0
+}
+
 // connectMCP connects to all configured MCP servers and returns the sessions.
 // Tools are listed once at connect time and cached — the connection is
 // long-lived (one connection per session lifetime).
@@ -799,6 +839,9 @@ func (s *AgentServer) OnLoadSession(ctx context.Context, req openacp.LoadSession
 		s.putSession(req.SessionID, ss)
 	}
 
+	// Restore accumulated token count so /context survives server restarts.
+	ss.totalTokens = s.loadTotalTokens(ctx, string(req.SessionID))
+
 	// Replay history from Memory if available.
 	if s.Mem != nil {
 		s.replayHistory(ctx, req.SessionID, sender)
@@ -942,6 +985,8 @@ func (s *AgentServer) OnResumeSession(ctx context.Context, req openacp.ResumeSes
 		ss.rt = s.buildRuntimeForSession(req.SessionID, ss)
 		s.putSession(req.SessionID, ss)
 	}
+	// Restore accumulated token count so /context survives server restarts.
+	ss.totalTokens = s.loadTotalTokens(ctx, string(req.SessionID))
 	// Load persisted plan into memory (no replay per ACP spec:
 	// session/resume MUST NOT replay history).
 	if ss.PlanEntries() == nil {
@@ -1417,6 +1462,7 @@ func (s *AgentServer) OnPrompt(ctx context.Context, req openacp.PromptRequest, s
 	}
 
 	ss.totalTokens += usage.TotalTokens
+	s.saveTotalTokens(ctx, string(req.SessionID), ss.totalTokens)
 
 	// Report *current* context usage (this turn's PromptTokens), not
 	// accumulated total. Per ACP spec, `used` means "tokens currently
@@ -1951,6 +1997,7 @@ func (s *AgentServer) buildSlashContext(ctx context.Context, sid openacp.Session
 				}
 			}
 			ss.totalTokens = 0
+			s.saveTotalTokens(ctx, string(sid), 0)
 			ss.ClearPlanEntries()
 			s.savePlan(ctx, string(sid), nil)
 			return nil
