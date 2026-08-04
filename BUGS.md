@@ -1,6 +1,6 @@
 # BUGS.md — Known Issues & Technical Debt
 
-> Last updated 2026-08-04.
+> Last updated 2026-08-04 (B3 Discover 空 query 已修复).
 > Format: `[P0]` = critical, `[P1]` = high, `[P2]` = medium, `[P3]` = low.
 
 ---
@@ -24,7 +24,9 @@
 - `provider/openviking/client.go:169-177` `Search` 只构造 `{Kind, ID, Content, Score}`，`Item.Meta` **恒为 nil**；`skill.go:39-44` 读 `it.Meta["path"]/["name"]` 恒为空 → `Match` 返回的每个 SkillInfo `Name="skill"`（全部同名）、`Path=""`；若配置 fs.Loader，`Load` 会去进程 CWD 读 `SKILL.md` 命中错文件。`Discover` 用 `Name=it.ID`（viking:// URI）与 Match 命名互不兼容。
 - `client.go:110-123` `doJSON` 从不校验 envelope `Status`：HTTP 200 + `{"status":"error"}` 时静默视为成功；`Read` 返回 `""` + nil error。
 
-修复：Search 填充 Meta（或 Match 直接用 `it.ID`）；doJSON 校验 `env.Status`，Read 的 result 缺失视为错误。
+- `skill.go:52` `Discover` 调用 `client.Search(ctx, "", 100, "skill")` 传空 query，但服务端 `/api/v1/search/search` 要求 query 非空 → HTTP 400 `INVALID_ARGUMENT`，技能目录永远无法注入上下文。客户端假设"空 query = 全量目录"，服务端不支持该语义——契约不匹配。✅ 已修复（2026-08-04）
+
+修复（Discover 空 query）：`Discover` 改用 `GET /api/v1/skills` 列举接口（`client.ListSkills`），不再走 search；`SkillEntry` 直接映射 `Name/Description/URI` → `SkillInfo`。其余两项（Search Meta、doJSON 校验）仍待修。
 
 ### B4. 模型上下文窗口表误判
 

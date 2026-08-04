@@ -4,11 +4,12 @@
 // OpenViking is a Provider — the runtime never depends on it directly.
 // The client talks to the OpenViking HTTP API directly (no SDK): the
 // server's REST surface is the stable contract, and the provider needs
-// only four endpoints.
+// only a handful of endpoints.
 //
-//	Search  — POST /api/v1/search/search  (semantic retrieval)
-//	Remember — POST /api/v1/sessions → /messages/batch → /commit
-//	Read    — GET  /api/v1/content/read  (viking:// URI → content)
+//	Search     — POST /api/v1/search/search  (semantic retrieval)
+//	ListSkills — GET  /api/v1/skills         (list skill catalog)
+//	Remember   — POST /api/v1/sessions → /messages/batch → /commit
+//	Read       — GET  /api/v1/content/read  (viking:// URI → content)
 package openviking
 
 import (
@@ -176,6 +177,40 @@ func (c *Client) Search(ctx context.Context, query string, limit int, contextTyp
 		})
 	}
 	return items, nil
+}
+
+// ── ListSkills ──
+
+// SkillEntry is one skill in the GET /api/v1/skills catalog listing.
+type SkillEntry struct {
+	Name        string   `json:"name"`
+	URI         string   `json:"uri"`
+	RootURI     string   `json:"root_uri,omitempty"`
+	SkillMDURI  string   `json:"skill_md_uri,omitempty"`
+	Description string   `json:"description"`
+	Tags        []string `json:"tags,omitempty"`
+	Level       int      `json:"level,omitempty"`
+}
+
+// listSkillsResult mirrors the GET /api/v1/skills response result.
+type listSkillsResult struct {
+	Skills []SkillEntry `json:"skills,omitempty"`
+	Total  int          `json:"total,omitempty"`
+}
+
+// ListSkills lists the full skill catalog from OpenViking. nodeLimit caps
+// the number of nodes returned per skill (0 = server default). Unlike
+// Search, this endpoint requires no query and returns every skill.
+func (c *Client) ListSkills(ctx context.Context, nodeLimit int) ([]SkillEntry, error) {
+	query := url.Values{}
+	if nodeLimit > 0 {
+		query.Set("node_limit", fmt.Sprintf("%d", nodeLimit))
+	}
+	var res listSkillsResult
+	if err := c.doJSON(ctx, http.MethodGet, "/api/v1/skills", query, nil, &res); err != nil {
+		return nil, fmt.Errorf("openviking list skills: %w", err)
+	}
+	return res.Skills, nil
 }
 
 // ── Remember ──
