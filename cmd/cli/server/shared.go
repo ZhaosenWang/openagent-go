@@ -375,7 +375,7 @@ type slogObserver struct {
 }
 
 func (o slogObserver) ObserveStage(_ context.Context, event openagent.StageEvent) {
-	o.logger.Info("stage", "name", event.Name, "phase", event.Phase, "duration", event.Duration)
+	o.logger.Debug("stage", "name", event.Name, "phase", event.Phase, "duration", event.Duration)
 }
 
 // buildSlogObserver creates a minimal stderr stage observer.
