@@ -164,7 +164,7 @@ Return JSON:
 }
 - Node ids are short stable ids, unique across the DAG. type must be a terraform resource type of this cloud; name is the terraform resource label.
 - If information is incomplete, return questions instead of the DAG.`),
-		agent.WithMaxTurns(5),
+		agent.WithMaxTurns(32),
 	)
 	rt := kernel.New(cfg, kernel.Deps{
 		Tools:          p.fileTools(),
@@ -299,7 +299,7 @@ or, when you need more input:
 
 - Every node id from the input DAG must appear in "resources" with a filled spec. You may add new nodes with new ids.
 `),
-		agent.WithMaxTurns(12),
+		agent.WithMaxTurns(32),
 	)
 	rt := kernel.New(cfg, kernel.Deps{
 		Tools:          p.fileTools(),
@@ -486,7 +486,7 @@ Return JSON:
 
 - One resource block per DAG node (address = type.name), dependencies wired per the DAG depends_on edges (references or depends_on). Do NOT deviate from the DAG.
 `),
-		agent.WithMaxTurns(10),
+		agent.WithMaxTurns(32),
 	)
 	rt := kernel.New(cfg, kernel.Deps{
 		Tools:          p.fileTools(),
@@ -677,7 +677,7 @@ Return JSON:
   "note": "..."
 }
 `),
-		agent.WithMaxTurns(8),
+		agent.WithMaxTurns(32),
 	)
 
 	rt := kernel.New(cfg, kernel.Deps{
@@ -776,7 +776,7 @@ Return JSON:
   "alternatives": ["...", ...]
 }
 `),
-		agent.WithMaxTurns(8),
+		agent.WithMaxTurns(32),
 	)
 	rt := kernel.New(cfg, kernel.Deps{
 		Tools:          p.fileTools(),
@@ -840,7 +840,7 @@ Return JSON:
   "note": "..."
 }
 `),
-		agent.WithMaxTurns(10),
+		agent.WithMaxTurns(32),
 	)
 	rt := kernel.New(cfg, kernel.Deps{
 		Tools:          p.fileTools(),

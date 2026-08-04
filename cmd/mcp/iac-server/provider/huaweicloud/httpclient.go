@@ -93,7 +93,13 @@ func (t *HTTPRequest) Definition() openagent.FunctionDefinition {
 		Description: "Send an HTTP request to a HuaweiCloud API. " +
 			"SDK-HMAC-SHA256 authentication is handled automatically — do NOT pass credentials. " +
 			"Returns {status, headers, body} as JSON. " +
-			"Use this to call BSS pricing APIs and other HuaweiCloud service APIs.",
+			"Use this to call BSS pricing APIs and other HuaweiCloud service APIs.\n" +
+			"\nPagination: for LIST APIs always pass a small page size first (e.g. limit=20) to confirm " +
+			"the response structure, then page through with the API's pagination parameters. " +
+			"HuaweiCloud OpenAPI uses mainly two pagination styles: offset/limit and marker/limit; " +
+			"a few services use pageNo/pageLimit. Check the API reference (references/*.json) for the exact parameter names.\n" +
+			"\nLarge responses: bodies over 8KB are saved to a file and a path is returned — use read/grep " +
+			"on that file instead of re-querying, and read the structure first before grepping.",
 		Parameters: openagent.SchemaOf[HwParams](),
 	}
 }

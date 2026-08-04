@@ -10,6 +10,7 @@ import (
 
 	openagent "github.com/yusheng-g/openagent-go"
 	"github.com/yusheng-g/openagent-go/agent"
+	ctxpkg "github.com/yusheng-g/openagent-go/context"
 )
 
 // ── streamingTestTool implements both Tool and StreamExecutor ──
@@ -441,5 +442,50 @@ func TestStreamingWithRedactHook_FinalResultRedacted(t *testing.T) {
 	}
 	if !strings.Contains(content, "[REDACTED]") {
 		t.Fatalf("final result not redacted: %q", content)
+	}
+}
+
+// ── builtin tools mounted once ──
+
+type stubMemoryProvider struct{}
+
+func (s *stubMemoryProvider) Recall(context.Context, ctxpkg.ContextScope, string, int) ([]ctxpkg.MemoryEntry, error) {
+	return nil, nil
+}
+func (s *stubMemoryProvider) Store(context.Context, ctxpkg.ContextScope, ctxpkg.MemoryItem) error {
+	return nil
+}
+
+// Builtin tools are mounted once in New. Retrying Run on the same runtime
+// (e.g. iac-server's generate retry loop) must not duplicate tool names —
+// providers like DeepSeek reject duplicate tool names ("Tool names must
+// be unique").
+func TestBuiltinToolsMountedOnce(t *testing.T) {
+	model := &fakeModelWithToolCall{toolName: "recall", toolArgs: `{}`, callID: "call_1"}
+	cfg := agent.New("test", agent.WithModel(model), agent.WithMaxTurns(1))
+	rt := New(cfg, Deps{MemoryProvider: &stubMemoryProvider{}})
+
+	countRecall := func() int {
+		n := 0
+		for _, d := range rt.builtinTools {
+			if d.Name == "recall" {
+				n++
+			}
+		}
+		return n
+	}
+
+	if got := countRecall(); got != 1 {
+		t.Fatalf("recall mounted %d times in New, want 1", got)
+	}
+	session := openagent.Session{ID: "dup-tool-test"}
+	if _, err := rt.Run(context.Background(), session, openagent.UserMessage("go")); err != nil {
+		t.Fatalf("run 1: %v", err)
+	}
+	if _, err := rt.Run(context.Background(), session, openagent.UserMessage("go")); err != nil {
+		t.Fatalf("run 2: %v", err)
+	}
+	if got := countRecall(); got != 1 {
+		t.Fatalf("recall mounted %d times after 2 runs, want 1 (duplicate tool names)", got)
 	}
 }

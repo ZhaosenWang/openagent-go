@@ -146,6 +146,16 @@ func New(cfg *agent.Agent, deps Deps) *Runtime {
 	if len(deps.Tools) > 0 {
 		rt.tools = append(rt.tools, deps.Tools...)
 	}
+	// Builtin tools (load_skill/reload_skills, recall) mount once here —
+	// NOT per Run() call: a runtime whose Run is retried (attempt loops)
+	// would otherwise accumulate duplicate tool definitions, which
+	// providers like DeepSeek reject ("Tool names must be unique").
+	if deps.SkillProvider != nil {
+		rt.builtinTools = execution.BuiltinSkillToolDefs()
+	}
+	if deps.MemoryProvider != nil {
+		rt.builtinTools = append(rt.builtinTools, execution.BuiltinRecallDef())
+	}
 	// Pre-configured sub-agents become delegation tools: isolated context,
 	// own system prompt, tools resolved at call time (see newSubAgentTool).
 	// Registered in New so the model sees them from the first turn.

@@ -9,7 +9,6 @@ import (
 	openagent "github.com/yusheng-g/openagent-go"
 	ctxpkg "github.com/yusheng-g/openagent-go/context"
 	"github.com/yusheng-g/openagent-go/eventbus"
-	"github.com/yusheng-g/openagent-go/execution"
 	"github.com/yusheng-g/openagent-go/governance"
 )
 
@@ -43,15 +42,6 @@ func (rt *Runtime) run(ctx context.Context, session openagent.Session, prefix []
 		rt.runModel = session.Model
 	}
 	rt.mu.Unlock()
-
-	// Skill tools (load_skill/reload_skills) mount when a provider exists;
-	// the catalog itself is matched per-goal by the context runtime.
-	if rt.deps.SkillProvider != nil {
-		rt.builtinTools = execution.BuiltinSkillToolDefs()
-	}
-	if rt.deps.MemoryProvider != nil {
-		rt.builtinTools = append(rt.builtinTools, execution.BuiltinRecallDef())
-	}
 
 	result := &openagent.RunResult{}
 	rt.state.SessionID = session.ID
