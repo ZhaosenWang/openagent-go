@@ -8,7 +8,7 @@ import (
 )
 
 // Skill implements provider/skill.Provider backed by OpenViking's skill
-// index. Discover returns the full catalog (Search with empty query);
+// index. Discover returns the full catalog (GET /api/v1/skills);
 // Load returns the content the index carries for the skill (the full
 // SKILL.md body when the server indexed it, an abstract otherwise — the
 // framework contract is "whatever content the provider has", mirroring
@@ -48,17 +48,18 @@ func (s *Skill) Match(ctx context.Context, intent string, limit int) ([]openagen
 }
 
 // Discover implements provider/skill.Provider: the full skill catalog
-// from OpenViking's skill index.
+// from OpenViking's GET /api/v1/skills listing endpoint.
 func (s *Skill) Discover(ctx context.Context) ([]openagent.SkillInfo, error) {
-	items, err := s.client.Search(ctx, "", 100, "skill")
+	entries, err := s.client.ListSkills(ctx, 1000)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]openagent.SkillInfo, 0, len(items))
-	for _, it := range items {
+	out := make([]openagent.SkillInfo, 0, len(entries))
+	for _, e := range entries {
 		out = append(out, openagent.SkillInfo{
-			Name:        it.ID,
-			Description: it.Content,
+			Name:        e.Name,
+			Description: e.Description,
+			Path:        e.URI,
 		})
 	}
 	return out, nil
