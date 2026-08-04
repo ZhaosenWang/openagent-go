@@ -44,6 +44,9 @@ func (a *Aliyun) Env() map[string]string {
 // nil until skills are embedded for this cloud.
 func (a *Aliyun) Skills() fs.FS { return nil }
 
+// ProviderSource returns the terraform provider source for Alibaba Cloud.
+func (a *Aliyun) ProviderSource() string { return "aliyun/alicloud" }
+
 // Agents returns placeholder prompts for each agent role. Full prompts
 // (API names, skill references) land with the skills directory.
 func (a *Aliyun) Agents() map[provider.PromptRole]provider.AgentConfig {

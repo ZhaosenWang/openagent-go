@@ -47,6 +47,7 @@ type Planner struct {
 	dryRun          bool
 	binaryMirrors   []string // terraform binary download mirrors
 	providerMirrors []string // provider download mirrors
+	pluginCacheDir  string   // shared provider plugin cache (TF_PLUGIN_CACHE_DIR)
 }
 
 // New creates a Planner. workDir should be the cloud home directory
@@ -54,7 +55,7 @@ type Planner struct {
 // memory is shared across all LLM calls and scoped by deployment_id —
 // estimate_cost can see specify_resources' reasoning, troubleshoot can see
 // prior attempts. nil disables memory (each call is isolated).
-func New(model openagent.Model, cloud provider.CloudProvider, loader skill.Provider, memory session.SessionStore, knowledge ctxpkg.MemoryProvider, workDir, deploymentsDir string, dryRun bool, binaryMirrors, providerMirrors []string) *Planner {
+func New(model openagent.Model, cloud provider.CloudProvider, loader skill.Provider, memory session.SessionStore, knowledge ctxpkg.MemoryProvider, workDir, deploymentsDir string, dryRun bool, binaryMirrors, providerMirrors []string, pluginCacheDir string) *Planner {
 	return &Planner{
 		model:           model,
 		cloud:           cloud,
@@ -67,6 +68,7 @@ func New(model openagent.Model, cloud provider.CloudProvider, loader skill.Provi
 		dryRun:          dryRun,
 		binaryMirrors:   binaryMirrors,
 		providerMirrors: providerMirrors,
+		pluginCacheDir:  pluginCacheDir,
 	}
 }
 
@@ -539,6 +541,14 @@ Return JSON:
 			}
 		}
 
+		// Pin the prewarmed provider version: copy the shared lock file
+		// (written by the startup prewarm) into this deployment so init
+		// hits the plugin cache instead of resolving a new latest version.
+		lockPath := filepath.Join(p.workDir, "terraform.lock.hcl")
+		if lock, err := os.ReadFile(lockPath); err == nil {
+			_ = os.WriteFile(filepath.Join(dir, ".terraform.lock.hcl"), lock, 0644)
+		}
+
 		// terraform init + plan.
 		progress("Running terraform init...", 2, 4)
 		client, err := iac.NewClient(ctx, dir, iac.Config{
@@ -546,13 +556,18 @@ Return JSON:
 			DryRun:          p.dryRun,
 			BinaryMirrors:   p.binaryMirrors,
 			ProviderMirrors: p.providerMirrors,
+			PluginCacheDir:  p.pluginCacheDir,
 		})
 		if err != nil {
 			return "", fmt.Errorf("generate_terraform_plan: create terraform client: %w", err)
 		}
 		if err := client.Init(ctx); err != nil {
-			msg = retryMessage("generate .tf files", "terraform init", err, p.workDir, dir)
-			continue
+			// Init failure is an environment/network problem (provider
+			// download, mirror, cache), NOT a .tf problem — retrying with
+			// the LLM editing .tf files cannot fix it. Fail fast so the
+			// client sees the real cause (mirror/network hints) instead of
+			// burning 3 attempts on a pointless loop.
+			return "", fmt.Errorf("generate_terraform_plan: terraform init failed (provider/mirror/network issue — check TF_PROVIDER_MIRRORS and the plugin cache): %w", err)
 		}
 		progress("Running terraform plan...", 3, 4)
 		plan, err := client.Plan(ctx)
@@ -607,6 +622,13 @@ func (p *Planner) UpdateDeployment(ctx context.Context, deploymentID string, ans
 func retryMessage(request, command string, planErr error, workDir, dir string) openagent.Message {
 	tfFiles, _ := readTFFiles(dir)
 	relDir, _ := filepath.Rel(workDir, dir)
+	note := ""
+	if command == "terraform plan" {
+		note = "\n\nNote: terraform init already succeeded — the provider is installed and working. " +
+			"Do NOT investigate provider installation, mirrors, or the registry. " +
+			"The failure is in the .tf resource configuration (arguments, references, or syntax). " +
+			"Fix the resource blocks directly."
+	}
 	return openagent.UserMessage(fmt.Sprintf(`Original request: %s
 
 %s failed with this error:
@@ -616,10 +638,11 @@ func retryMessage(request, command string, planErr error, workDir, dir string) o
 The current .tf files are in directory: %s
 
 %s
+%s
 
 Fix the .tf files and return the corrected versions as JSON:
 {"files": {"providers.tf": "...", "variables.tf": "...", "main.tf": "...", "terraform.tfvars": "..."}, "reasoning": "..."}`,
-		request, command, planErr.Error(), relDir, tfFiles))
+		request, command, planErr.Error(), relDir, tfFiles, note))
 }
 
 // EstimateCost prices a planned deployment from its DAG (step 4 of the

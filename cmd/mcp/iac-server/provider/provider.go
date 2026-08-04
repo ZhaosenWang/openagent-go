@@ -76,4 +76,9 @@ type CloudProvider interface {
 	// each agent role. A role may be missing from the map; the server
 	// rejects such clouds at startup.
 	Agents() map[PromptRole]AgentConfig
+
+	// ProviderSource is the terraform provider source for this cloud
+	// (e.g. "huaweicloud/huaweicloud"), used to prewarm the provider
+	// plugin cache at startup.
+	ProviderSource() string
 }

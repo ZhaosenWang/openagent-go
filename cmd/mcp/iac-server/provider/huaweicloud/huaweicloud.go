@@ -18,6 +18,12 @@ import (
 	"github.com/yusheng-g/openagent-go/cmd/mcp/iac-server/provider"
 )
 
+// DefaultProviderMirror is the HuaweiCloud community provider mirror.
+// Used as the default TF_PROVIDER_MIRRORS entry so terraform init works
+// on networks where registry.terraform.io is slow or unreachable; user
+// configured mirrors are appended after it.
+const DefaultProviderMirror = "https://mirrors.huaweicloud.com/terraform/"
+
 // HuaweiCloud implements provider.CloudProvider.
 type HuaweiCloud struct {
 	region string
@@ -57,6 +63,9 @@ func (h *HuaweiCloud) Skills() fs.FS { return Skills() }
 func (h *HuaweiCloud) Agents() map[provider.PromptRole]provider.AgentConfig {
 	return h.agents()
 }
+
+// ProviderSource returns the terraform provider source for HuaweiCloud.
+func (h *HuaweiCloud) ProviderSource() string { return "huaweicloud/huaweicloud" }
 
 // HTTPRequest returns an http_request tool configured with HuaweiCloud
 // credentials from the environment. The tool handles SDK-HMAC-SHA256

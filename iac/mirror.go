@@ -40,7 +40,10 @@ func writeProviderMirrorConfig(workDir string, mirrors []string) (string, error)
 	}
 
 	// Final fallback: official registry for anything not found in mirrors.
-	b.WriteString("  direct {\n    exclude = [\"registry.terraform.io/*/*\"]\n  }\n")
+	// Only huaweicloud is excluded — the default mirror covers just that
+	// provider, so auxiliary providers (random, tls, ...) must still reach
+	// the official registry.
+	b.WriteString("  direct {\n    exclude = [\"registry.terraform.io/huaweicloud/*\"]\n  }\n")
 	b.WriteString("}\n")
 
 	path := filepath.Join(workDir, ".terraformrc")

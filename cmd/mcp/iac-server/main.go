@@ -35,6 +35,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/yusheng-g/openagent-go/cmd/mcp/iac-server/agent"
@@ -42,6 +43,7 @@ import (
 	"github.com/yusheng-g/openagent-go/cmd/mcp/iac-server/provider"
 	"github.com/yusheng-g/openagent-go/cmd/mcp/iac-server/provider/aliyun"
 	"github.com/yusheng-g/openagent-go/cmd/mcp/iac-server/provider/huaweicloud"
+	"github.com/yusheng-g/openagent-go/iac"
 	"github.com/yusheng-g/openagent-go/mcp"
 	"github.com/yusheng-g/openagent-go/model/openai"
 	memorysqlite "github.com/yusheng-g/openagent-go/provider/memory/sqlite"
@@ -145,11 +147,28 @@ func main() {
 
 	// ── Terraform mirrors (for networks with restricted access) ──
 	binaryMirrors := splitCSV(os.Getenv("TF_BINARY_MIRRORS"))
-	providerMirrors := splitCSV(os.Getenv("TF_PROVIDER_MIRRORS"))
+	// The HuaweiCloud provider mirror is the default so init works without
+	// user configuration; user-supplied mirrors are appended and tried after
+	// it (terraform falls through mirror entries in order).
+	providerMirrors := []string{}
+	if cloud.Name() == "huaweicloud" {
+		providerMirrors = append(providerMirrors, huaweicloud.DefaultProviderMirror)
+	}
+	providerMirrors = append(providerMirrors, splitCSV(os.Getenv("TF_PROVIDER_MIRRORS"))...)
 	if len(binaryMirrors) > 0 || len(providerMirrors) > 0 {
 		slog.Info("terraform mirrors configured",
 			"binary_mirrors", binaryMirrors, "provider_mirrors", providerMirrors)
 	}
+
+	// ── Shared provider plugin cache ──
+	// Providers are downloaded once into <iacHome>/plugins and reused by
+	// every deployment (TF_PLUGIN_CACHE_DIR), instead of re-downloading
+	// into each workspace.
+	pluginCacheDir := filepath.Join(iacHome, "plugins")
+	if err := os.MkdirAll(pluginCacheDir, 0o755); err != nil {
+		fatal(fmt.Errorf("create plugin cache dir: %w", err))
+	}
+	slog.Info("terraform plugin cache", "path", pluginCacheDir)
 
 	// ── Assemble planner + tools ──
 	// Verify the cloud provides every agent role prompt — a missing role
@@ -160,7 +179,27 @@ func main() {
 			fatal(fmt.Errorf("cloud %s is missing agent prompt for role %q — implement Agents()", cloud.Name(), role))
 		}
 	}
-	planner := agent.New(model, cloud, loader, ms, knowledge, cloudHome, deploymentsDir, dryRun, binaryMirrors, providerMirrors)
+	planner := agent.New(model, cloud, loader, ms, knowledge, cloudHome, deploymentsDir, dryRun, binaryMirrors, providerMirrors, pluginCacheDir)
+
+	// ── Prewarm terraform provider ──
+	// Download the cloud provider into the shared plugin cache and pin the
+	// lock file BEFORE serving requests, so the first deployment init is a
+	// cache hit instead of a full download. Failure degrades to a warning —
+	// the first generate init falls back to downloading on demand.
+	lockPath := filepath.Join(cloudHome, "terraform.lock.hcl")
+	prewarmCfg := iac.Config{
+		Env:             cloud.Env(),
+		DryRun:          dryRun,
+		BinaryMirrors:   binaryMirrors,
+		ProviderMirrors: providerMirrors,
+		PluginCacheDir:  pluginCacheDir,
+	}
+	prewarmStart := time.Now()
+	if err := iac.PrewarmProviderCache(ctx, prewarmCfg, cloud.ProviderSource(), lockPath); err != nil {
+		slog.Warn("terraform provider prewarm failed (first deploy init will download on demand)", "error", err)
+	} else {
+		slog.Info("terraform provider prewarmed", "source", cloud.ProviderSource(), "lock", lockPath, "elapsed", time.Since(prewarmStart).Round(time.Millisecond))
+	}
 	tools := iacmcp.NewTools(iacmcp.Config{
 		Planner:         planner,
 		Cloud:           cloud,
