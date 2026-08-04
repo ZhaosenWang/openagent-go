@@ -53,6 +53,11 @@ func (h *HuaweiCloud) Env() map[string]string {
 // Skills returns the embedded skills directory.
 func (h *HuaweiCloud) Skills() fs.FS { return Skills() }
 
+// Agents returns the cloud-specific agent prompts and static skill names.
+func (h *HuaweiCloud) Agents() map[provider.PromptRole]provider.AgentConfig {
+	return h.agents()
+}
+
 // HTTPRequest returns an http_request tool configured with HuaweiCloud
 // credentials from the environment. The tool handles SDK-HMAC-SHA256
 // signing automatically — the LLM never sees AK/SK.

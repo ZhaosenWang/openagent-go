@@ -43,6 +43,7 @@ type Planner struct {
 	knowledge       ctxpkg.MemoryProvider // durable knowledge
 	workDir         string                // cloud home dir (parent of skills/ and deployments/), workDir for read/grep/ls
 	deploymentsDir  string
+	prompts         map[provider.PromptRole]provider.AgentConfig // cloud-specific agent prompts/skills
 	dryRun          bool
 	binaryMirrors   []string // terraform binary download mirrors
 	providerMirrors []string // provider download mirrors
@@ -62,6 +63,7 @@ func New(model openagent.Model, cloud provider.CloudProvider, loader skill.Provi
 		knowledge:       knowledge,
 		workDir:         workDir,
 		deploymentsDir:  deploymentsDir,
+		prompts:         cloud.Agents(),
 		dryRun:          dryRun,
 		binaryMirrors:   binaryMirrors,
 		providerMirrors: providerMirrors,
@@ -115,7 +117,7 @@ Cloud credentials (e.g. HW_ACCESS_KEY, HW_SECRET_KEY, HW_REGION) are injected by
 
 ## Skills
 For propose/specify/generate/estimate/troubleshoot: the relevant skill guide (SKILL.md) is already loaded into your system prompt — you do not need to call any tool to load it. Use read/grep/ls to browse the skill's references/ directory for detailed examples and API definitions.
-For query_cloud and specify_resources: use the load_skill tool to load the relevant cloud-service skill on demand (the skill catalog is in your system prompt). specify_resources loads per-service skills to find API endpoints for spec queries (e.g. load_skill("huaweicloud-ecs") for ListFlavors).
+For query_cloud and specify_resources: use the load_skill tool to load the relevant cloud-service skill on demand (the skill catalog is in your system prompt). specify_resources loads per-service skills to find API endpoints for spec queries (e.g. load_skill on the compute service skill for flavor listings).
 
 ## Output contract
 Return ONLY valid JSON as specified by each tool's instructions. Do not wrap in markdown fences. Do not add conversational text outside the JSON. The server parses your output programmatically — any non-JSON text will cause a parse failure.`
@@ -139,51 +141,28 @@ func (p *Planner) ProposeArchitecture(ctx context.Context, request string) (stri
 	}
 
 	progress("Loading deployment skill...", 0, 2)
-	skillBody := p.loadSkillBody(ctx, "huaweicloud-deploy")
+	skillBody := p.loadSkillBody(ctx, p.agentSkill(provider.RoleArchitect))
 	cfg := agent.New("iac-architect",
 		agent.WithModel(p.model),
 		agent.WithSystemPrompts(
 			serverContext,
 			skillBody,
-			`You are a HuaweiCloud architecture expert. Your job is to RECOMMEND an architecture as a DAG (directed acyclic graph), NOT write .tf files.
-
-## What to do
-1. Parse the user's deployment goal (what to deploy, region, HA, budget, etc.)
-2. Run `+"`ls skills/huaweicloud-deploy/references/`"+` to see available service categories
-3. Match the request to a known architecture pattern (see patterns below)
-4. Return the architecture recommendation as a DAG: one node per resource, depends_on lists the node ids this resource depends on (e.g. an ECS depends on the VPC, subnet, and security group it uses)
-
-## What NOT to do
-- Do NOT read individual .tf files — that happens in generate_terraform_plan
-- Do NOT browse deep into reference directories
-- Do NOT generate .tf configuration
-- Do NOT fill resource specs (flavor, image, disk, CIDR) — that happens in specify_resources
-
-## Common architecture patterns
-- **Single web server**: ECS + VPC + Subnet + Security Group + EIP
-- **Web + database**: ECS + VPC + Subnet + Security Group + EIP + RDS
-- **HA web tier**: ECS×2 + VPC + Subnet + Security Group + ELB + EIP + RDS
-- **Web + cache + db**: ECS + VPC + Subnet + Security Group + EIP + DCS(Redis) + RDS
-- **Container cluster**: CCE + VPC + Subnet + Security Group + EIP
-- **Static site**: OBS + CDN
-
-## Output
+			p.agentPrompt(provider.RoleArchitect),
+			`## Output contract
 Return JSON:
-`+"```json"+`
 {
-  "architecture": "short name, e.g. \"single ECS + VPC + EIP\"",
-  "services": ["ecs", "vpc", "eip"],
+  "architecture": "short name of the architecture",
+  "services": ["...", "..."],
   "reasoning": "why this architecture was chosen",
   "questions": ["..."],  // only if information is incomplete
   "dag": {
     "nodes": [
-      {"id": "vpc-main", "type": "huaweicloud_vpc", "name": "main", "depends_on": []},
-      {"id": "ecs-web", "type": "huaweicloud_compute_instance", "name": "web", "depends_on": ["vpc-main", "subnet-main"]}
+      {"id": "...", "type": "...", "name": "...", "depends_on": []},
+      {"id": "...", "type": "...", "name": "...", "depends_on": ["...", "..."]}
     ]
   }
 }
-`+"```"+`
-- Node ids are short stable ids (e.g. "ecs-web"), unique across the DAG. type must be a huaweicloud terraform resource type; name is the terraform resource label.
+- Node ids are short stable ids, unique across the DAG. type must be a terraform resource type of this cloud; name is the terraform resource label.
 - If information is incomplete, return questions instead of the DAG.`),
 		agent.WithMaxTurns(5),
 	)
@@ -297,44 +276,31 @@ func (p *Planner) SpecifyResources(ctx context.Context, deploymentID string, ans
 	}
 
 	progress("Loading deployment skill...", 0, 3)
-	skillBody := p.loadSkillBody(ctx, "huaweicloud-deploy")
+	skillBody := p.loadSkillBody(ctx, p.agentSkill(provider.RoleSpecifier))
 	cfg := agent.New("iac-specifier",
 		agent.WithModel(p.model),
 		agent.WithSystemPrompts(
 			serverContext,
 			skillBody,
-			`You are a HuaweiCloud resource specification expert. Your job is to determine concrete resource specs for each node of a deployment DAG.
-
-## What to do
-1. Read the DAG from your input message — it is the read-only contract: preserve node ids, do not drop nodes
-2. To find API endpoints for spec queries, use load_skill on the matching service skill (e.g. load_skill("huaweicloud-ecs") for ListFlavors/ListImages, load_skill("huaweicloud-vpc") for CIDR rules). The skill body arrives as a tool result; browse its references/ with read/grep/ls for request schemas
-3. Use http_request to query available specs (read-only List/Show/Get only — NEVER create or modify resources)
-4. Determine a concrete spec for EVERY node: flavor, image, disk size, CIDR, etc.
-5. If the choice is too broad (e.g. many candidate resource types or flavors) or information is insufficient, ask the user instead of guessing
-
-## What NOT to do
-- Do NOT write .tf files — that happens in generate_terraform_plan
-- Do NOT create or modify any cloud resources — only read-only API calls (List/Show/Get)
-- Do NOT invent specs you cannot verify — if undeterminable, ask the user
-
-## Output
+			p.agentPrompt(provider.RoleSpecifier),
+			`## Output contract
 Return JSON:
-`+"```json"+`
-{"status": "ready",
- "resources": [
-   {"id": "ecs-web", "type": "huaweicloud_compute_instance", "name": "web", "spec": {"flavor": "s6.large.2", "image": "Ubuntu 22.04", "disk": 40}},
-   {"id": "vpc-main", "type": "huaweicloud_vpc", "name": "main", "spec": {"cidr": "192.168.0.0/16"}}
- ],
- "reasoning": "why these specs were chosen"}
-`+"```"+`
+{
+  "status": "ready",
+  "resources": [
+    {"id": "...", "type": "...", "name": "...", "spec": {"...": "..."}},
+    {"id": "...", "type": "...", "name": "...", "spec": {"...": "..."}}
+  ],
+  "reasoning": "why these specs were chosen"
+}
+
 or, when you need more input:
-`+"```json"+`
 {"status": "need_input", "questions": ["...", "..."]}
-`+"```"+`
+
 - Every node id from the input DAG must appear in "resources" with a filled spec. You may add new nodes with new ids.
 `),
-			agent.WithMaxTurns(12),
-		)
+		agent.WithMaxTurns(12),
+	)
 	rt := kernel.New(cfg, kernel.Deps{
 		Tools:          p.fileTools(),
 		SessionStore:   p.memory,
@@ -499,30 +465,15 @@ func (p *Planner) GenerateTerraformPlan(ctx context.Context, deploymentID string
 	}
 
 	progress("Loading deployment skill...", 0, 4)
-	skillBody := p.loadSkillBody(ctx, "huaweicloud-deploy")
+	skillBody := p.loadSkillBody(ctx, p.agentSkill(provider.RolePlanner))
 	cfg := agent.New("iac-planner",
 		agent.WithModel(p.model),
 		agent.WithSystemPrompts(
 			serverContext,
 			skillBody,
-			`You are a HuaweiCloud terraform configuration expert. Generate .tf files from the deployment DAG.
-
-## What to do
-1. Read the DAG from your input message — it is the authoritative contract: one resource block per node (address = type.name), wire dependencies per the dag depends_on edges (references or depends_on), and do NOT deviate from the DAG
-2. Browse ONLY the relevant reference examples — e.g. if deploying ECS, look at references/ecs/, NOT all directories
-3. Generate .tf files: providers.tf, variables.tf, main.tf, terraform.tfvars
-4. Follow the credential rules, naming conventions, and variable design from the skill guide
-5. Use the node spec values (flavor, image, cidr, ...) from the DAG for variables and terraform.tfvars
-
-## What NOT to do
-- Do NOT browse all reference directories — only the ones relevant to your resources
-- Do NOT hardcode credentials
-- Do NOT ask questions — use the DAG from your input message
-- Do NOT add resources that are not in the DAG
-
-## Output
+			p.agentPrompt(provider.RolePlanner),
+			`## Output contract
 Return JSON:
-`+"```json"+`
 {
   "files": {
     "providers.tf": "...",
@@ -532,7 +483,9 @@ Return JSON:
   },
   "reasoning": "why these .tf configs were generated"
 }
-`+"```"+``),
+
+- One resource block per DAG node (address = type.name), dependencies wired per the DAG depends_on edges (references or depends_on). Do NOT deviate from the DAG.
+`),
 		agent.WithMaxTurns(10),
 	)
 	rt := kernel.New(cfg, kernel.Deps{
@@ -702,26 +655,31 @@ func (p *Planner) EstimateCost(ctx context.Context, deploymentID, pricingMode st
 	}
 
 	progress("Loading pricing skill...", 0, 3)
-	skillBody := p.loadSkillBody(ctx, "huaweicloud-bss")
+	skillBody := p.loadSkillBody(ctx, p.agentSkill(provider.RolePricer))
 	cfg := agent.New("iac-pricing",
 		agent.WithModel(p.model),
 		agent.WithSystemPrompts(
 			serverContext,
 			skillBody,
-			"You are a HuaweiCloud pricing expert. "+
-				"Use read/grep/ls to browse the skills/huaweicloud-bss/references/ directory "+
-				"for BSS API definitions, use http_request to call the BSS pricing APIs (signing is automatic), "+
-				"and use WebSearch/WebFetch as a fallback for public pricing pages. "+
-				"You are given the planned resources with exact specs from the deployment DAG. "+
-				"Query the price for each resource in the billing mode specified in your user message: "+
-				"on-demand (按需) uses ListOnDemandResourceRatings, monthly (包月) uses ListRateOnPeriodDetail. "+
-				"In on-demand mode: if a product does not support on-demand (API error or empty result), "+
-				"fall back to ListRateOnPeriodDetail (monthly) for that product and note it in the note field. "+
-				"Mark prices that cannot be determined as null — do NOT fabricate. "+
-				"Return {\"items\": [{\"resource\": \"...\", \"spec\": \"...\", \"price\": price or null}], "+
-				"\"total\": ... or null, \"currency\": \"CNY\", \"note\": \"...\"}."),
-			agent.WithMaxTurns(8),
-		)
+			p.agentPrompt(provider.RolePricer),
+			`## Output contract
+You are given the planned resources with exact specs from the deployment DAG.
+Return JSON:
+{
+  "items": [
+    {
+      "resource": "...", 
+	  "spec": "...",
+	  "price": price or null}
+  ], 
+  "total": ... or null, 
+  "currency": "CNY", 
+  "note": "..."
+}
+`),
+		agent.WithMaxTurns(8),
+	)
+
 	rt := kernel.New(cfg, kernel.Deps{
 		Tools:          p.fileTools(),
 		SessionStore:   p.memory,
@@ -746,10 +704,10 @@ func (p *Planner) EstimateCost(ctx context.Context, deploymentID, pricingMode st
 	// Parse the LLM output and persist the estimate marker.
 	raw := extractJSON(result.FinalOutput)
 	var cost struct {
-		Items []any  `json:"items"`
-		Total any    `json:"total"`
+		Items    []any  `json:"items"`
+		Total    any    `json:"total"`
 		Currency string `json:"currency"`
-		Note   string `json:"note"`
+		Note     string `json:"note"`
 	}
 	if json.Unmarshal([]byte(raw), &cost) != nil {
 		cost.Note = result.FinalOutput
@@ -802,19 +760,22 @@ func (p *Planner) Troubleshoot(ctx context.Context, deploymentID, errorMsg strin
 		return "", fmt.Errorf("troubleshoot: read .tf: %w", err)
 	}
 
-	skillBody := p.loadSkillBody(ctx, "huaweicloud-troubleshoot")
+	skillBody := p.loadSkillBody(ctx, p.agentSkill(provider.RoleTroubleshooter))
 	progress("Loading troubleshoot skill...", 0, 2)
 	cfg := agent.New("iac-troubleshooter",
 		agent.WithModel(p.model),
 		agent.WithSystemPrompts(
 			serverContext,
 			skillBody,
-			"You are a HuaweiCloud infrastructure troubleshooting expert. "+
-				"Use read/grep/ls to find correct patterns in skills/huaweicloud-deploy/references/, "+
-				"use WebSearch/WebFetch to search for error solutions. "+
-				"You are given the error message and the .tf files that failed. "+
-				"Diagnose the root cause and suggest specific fixes. "+
-				"Return {\"diagnosis\": \"...\", \"suggestion\": \"...\", \"alternatives\": [\"...\", ...]}."),
+			p.agentPrompt(provider.RoleTroubleshooter),
+			`## Output contract
+Return JSON:
+{
+  "diagnosis": "...",
+  "suggestion": "...",
+  "alternatives": ["...", ...]
+}
+`),
 		agent.WithMaxTurns(8),
 	)
 	rt := kernel.New(cfg, kernel.Deps{
@@ -871,15 +832,14 @@ func (p *Planner) QueryCloud(ctx context.Context, query string) (string, error) 
 		agent.WithModel(p.model),
 		agent.WithSystemPrompts(
 			serverContext,
-			"You are a HuaweiCloud cloud query expert. "+
-				"Use load_skill to load the relevant skill for the cloud service being queried "+
-				"(e.g. load_skill(\"huaweicloud-ecs\") for ECS instances/flavors, "+
-				"load_skill(\"huaweicloud-vpc\") for VPCs/subnets/security groups, "+
-				"load_skill(\"huaweicloud-bss\") for billing/pricing/orders). "+
-				"Then use http_request to call the API with the correct endpoint and parameters. "+
-				"CRITICAL: Only call read-only APIs (List/Show/Get). NEVER call Create/Update/Delete APIs — "+
-				"this tool is for querying existing resources only, not for creating or modifying them. "+
-				"Return {\"results\": [...], \"note\": \"...\"}."),
+			p.agentPrompt(provider.RoleQueryer),
+			`## Output contract
+Return JSON:
+{
+  "results": [...],
+  "note": "..."
+}
+`),
 		agent.WithMaxTurns(10),
 	)
 	rt := kernel.New(cfg, kernel.Deps{
@@ -918,6 +878,24 @@ func (p *Planner) QueryCloud(ctx context.Context, query string) (string, error) 
 	return string(data), nil
 }
 
+// agentPrompt returns the cloud-specific expert prompt for a role
+// ("" when the cloud provides none for this role).
+func (p *Planner) agentPrompt(role provider.PromptRole) string {
+	if cfg, ok := p.prompts[role]; ok {
+		return cfg.Prompt
+	}
+	return ""
+}
+
+// agentSkill returns the static skill name for a role ("" = the role
+// loads skills dynamically via load_skill).
+func (p *Planner) agentSkill(role provider.PromptRole) string {
+	if cfg, ok := p.prompts[role]; ok {
+		return cfg.SkillName
+	}
+	return ""
+}
+
 // loadSkillBody statically loads a skill's SKILL.md body by name.
 // The body is injected directly into the agent's system prompt instead of
 // relying on the LLM to call load_skill at runtime — this is deterministic,
@@ -943,8 +921,8 @@ func (p *Planner) loadSkillBody(ctx context.Context, name string) string {
 // fileTools returns the standard file + web tools for all LLM agents.
 // read/grep/ls operate with workDir = cloud home so the LLM can browse
 // both skills/ (references, guides) and deployments/ (.tf files).
-// If the cloud provider exposes an http_request tool (e.g. huaweicloud
-// with SDK-HMAC-SHA256 signing), it is included for calling cloud APIs.
+// If the cloud provider exposes an http_request tool (signed requests to
+// cloud APIs), it is included for calling cloud APIs.
 func (p *Planner) fileTools() []openagent.Tool {
 	tools := []openagent.Tool{
 		opentool.NewReadFile(p.workDir),

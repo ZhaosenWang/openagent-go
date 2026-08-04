@@ -152,6 +152,14 @@ func main() {
 	}
 
 	// ── Assemble planner + tools ──
+	// Verify the cloud provides every agent role prompt — a missing role
+	// silently degrades that agent to contract-only guidance, so fail fast.
+	agentPrompts := cloud.Agents()
+	for _, role := range provider.AllRoles {
+		if cfg, ok := agentPrompts[role]; !ok || cfg.Prompt == "" {
+			fatal(fmt.Errorf("cloud %s is missing agent prompt for role %q — implement Agents()", cloud.Name(), role))
+		}
+	}
 	planner := agent.New(model, cloud, loader, ms, knowledge, cloudHome, deploymentsDir, dryRun, binaryMirrors, providerMirrors)
 	tools := iacmcp.NewTools(iacmcp.Config{
 		Planner:         planner,
