@@ -346,6 +346,19 @@ func (rt *Runtime) commit(ctx context.Context, session openagent.Session, msg op
 	if msg.Transient || rt.deps.SessionStore == nil {
 		return
 	}
+	// A cancelled run still persists what it already produced. The loop
+	// commits a message only after it EXISTS (the model call returned, the
+	// tool job finished with a real result — executeTools waits for jobs
+	// to complete even when cancelled). A cancelled ctx would fail the
+	// backend's transaction immediately and the message would be lost:
+	// the assistant tool_calls message lands in the store but its result
+	// does not, and cancelCompensation skips it (it sees the result in the
+	// in-memory working set) — an orphan tool_call in history, re-read by
+	// the model next turn. Same deliberate background-ctx pattern as
+	// cancelCompensation. The write is a bounded local operation.
+	if ctx.Err() != nil {
+		ctx = context.Background()
+	}
 	start := time.Now()
 	rt.observe(ctx, openagent.StageMemoryAppend, "enter", nil, time.Time{}, nil)
 	err := rt.deps.SessionStore.Append(ctx, session.ID, msg)
