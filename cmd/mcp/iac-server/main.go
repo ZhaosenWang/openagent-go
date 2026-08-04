@@ -48,6 +48,7 @@ import (
 	"github.com/yusheng-g/openagent-go/provider/skill"
 	sessionsqlite "github.com/yusheng-g/openagent-go/session/sqlite"
 	skillfs "github.com/yusheng-g/openagent-go/skill/fs"
+	"github.com/yusheng-g/openagent-go/summarizer"
 )
 
 func main() {
@@ -134,6 +135,10 @@ func main() {
 		fatal(fmt.Errorf("create knowledge store: %w", err))
 	}
 	defer knowledge.Close()
+	// Enable conversation compaction: long deployment sessions (specify,
+	// troubleshoot, ...) are summarized instead of hard-truncated when they
+	// outgrow the context window. Same pattern as the CLI.
+	ms.WithSummarizer(summarizer.New(model).WithMaxTokens(8192))
 	slog.Info("memory database", "path", memoryPath)
 
 	dryRun := os.Getenv("IAC_DRY_RUN") == "true"
