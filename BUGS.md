@@ -19,14 +19,14 @@
 
 修复：approvals 落独立表/行，或所有 session meta 写操作经单一写者/事务串行化。
 
-### B3. OpenViking 技能能力实际不可用
+### B3. ~~OpenViking 技能能力实际不可用~~ ✅ 已修复（2026-08-04）
 
-- `provider/openviking/client.go:169-177` `Search` 只构造 `{Kind, ID, Content, Score}`，`Item.Meta` **恒为 nil**；`skill.go:39-44` 读 `it.Meta["path"]/["name"]` 恒为空 → `Match` 返回的每个 SkillInfo `Name="skill"`（全部同名）、`Path=""`；若配置 fs.Loader，`Load` 会去进程 CWD 读 `SKILL.md` 命中错文件。`Discover` 用 `Name=it.ID`（viking:// URI）与 Match 命名互不兼容。
-- `client.go:110-123` `doJSON` 从不校验 envelope `Status`：HTTP 200 + `{"status":"error"}` 时静默视为成功；`Read` 返回 `""` + nil error。
+- ~~`provider/openviking/client.go:169-177` `Search` 只构造 `{Kind, ID, Content, Score}`，`Item.Meta` **恒为 nil**；`skill.go:39-44` 读 `it.Meta["path"]/["name"]` 恒为空 → `Match` 返回的每个 SkillInfo `Name="skill"`（全部同名）、`Path=""`~~。修复：`Match` 不再依赖 `Meta`，直接从 `it.ID`（URI）提取 skill 名和根 URI。
+- ~~`client.go:110-123` `doJSON` 从不校验 envelope `Status`~~。修复：`doJSON` 在 `env.Error` 检查后新增 `env.Status != "" && env.Status != "ok"` 校验。
+- ~~`skill.go:69-74` `Load` 在 `s.loader==nil` 时返回 `skill.Description`（一句话摘要），非完整 SKILL.md body~~。修复：`Load` 改用 `client.Read(skill.Path+"/SKILL.md")` 拉取完整内容，Read 失败时回退到 description。
+- ~~`skill.go:52` `Discover` 调用 `client.Search(ctx, "", 100, "skill")` 传空 query~~。修复（2026-08-04 早些时候）：`Discover` 改用 `GET /api/v1/skills` 列举接口。
 
-- `skill.go:52` `Discover` 调用 `client.Search(ctx, "", 100, "skill")` 传空 query，但服务端 `/api/v1/search/search` 要求 query 非空 → HTTP 400 `INVALID_ARGUMENT`，技能目录永远无法注入上下文。客户端假设"空 query = 全量目录"，服务端不支持该语义——契约不匹配。✅ 已修复（2026-08-04）
-
-修复（Discover 空 query）：`Discover` 改用 `GET /api/v1/skills` 列举接口（`client.ListSkills`），不再走 search；`SkillEntry` 直接映射 `Name/Description/URI` → `SkillInfo`。其余两项（Search Meta、doJSON 校验）仍待修。
+修复仅涉及 `provider/openviking/skill.go` + `provider/openviking/client.go`，与本地 FS provider（`provider/skill/fs.go`）零交集，两种接入场景（有/无 OpenViking）均可用。
 
 ### B4. 模型上下文窗口表误判
 

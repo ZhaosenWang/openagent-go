@@ -139,9 +139,22 @@ func (e *LLMExtractor) Extract(ctx context.Context, scope ContextScope, messages
 		return
 	}
 
-	items, err := parseExtractionItems(resp.Choices[0].Message.Content)
+	choice := resp.Choices[0]
+	raw := choice.Message.Content
+
+	// An empty response is normal — the model found nothing worth
+	// extracting this turn. Log finish_reason only when it indicates a
+	// truncation or filter that may have suppressed content.
+	if strings.TrimSpace(raw) == "" {
+		if fr := choice.FinishReason; fr == "length" || fr == "content_filter" {
+			slog.Warn("openagent: knowledge extract empty response",
+				"finish_reason", fr)
+		}
+		return
+	}
+
+	items, err := parseExtractionItems(raw)
 	if err != nil {
-		raw := resp.Choices[0].Message.Content
 		if len(raw) > 300 {
 			raw = raw[:300]
 		}
@@ -233,9 +246,12 @@ func recallQuery(messages []openagent.Message) string {
 }
 
 // parseExtractionItems parses the model's JSON array response (markdown
-// fences tolerated).
+// fences tolerated). An empty string returns nil (nothing to extract).
 func parseExtractionItems(raw string) ([]ExtractionItem, error) {
 	content := strings.TrimSpace(raw)
+	if content == "" {
+		return nil, nil
+	}
 	content = strings.TrimPrefix(content, "```json")
 	content = strings.TrimPrefix(content, "```")
 	content = strings.TrimSuffix(content, "```")

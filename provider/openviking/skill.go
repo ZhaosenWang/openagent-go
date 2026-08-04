@@ -2,6 +2,7 @@ package openviking
 
 import (
 	"context"
+	"strings"
 
 	openagent "github.com/yusheng-g/openagent-go"
 	"github.com/yusheng-g/openagent-go/skill/fs"
@@ -9,10 +10,8 @@ import (
 
 // Skill implements provider/skill.Provider backed by OpenViking's skill
 // index. Discover returns the full catalog (GET /api/v1/skills);
-// Load returns the content the index carries for the skill (the full
-// SKILL.md body when the server indexed it, an abstract otherwise — the
-// framework contract is "whatever content the provider has", mirroring
-// the filesystem provider's body load).
+// Match runs semantic search (POST /api/v1/search/search);
+// Load fetches the full SKILL.md body via GET /api/v1/content/read.
 type Skill struct {
 	client *Client
 	loader *fs.Loader // optional local fallback for full instructions
@@ -33,14 +32,9 @@ func (s *Skill) Match(ctx context.Context, intent string, limit int) ([]openagen
 	out := make([]openagent.SkillInfo, 0, len(items))
 	for _, it := range items {
 		info := openagent.SkillInfo{
-			Name:        it.Kind,
+			Name:        skillNameFromURI(it.ID),
 			Description: it.Content,
-		}
-		if id, ok := it.Meta["path"].(string); ok {
-			info.Path = id
-		}
-		if name, ok := it.Meta["name"].(string); ok {
-			info.Name = name
+			Path:        skillRootFromURI(it.ID),
 		}
 		out = append(out, info)
 	}
@@ -70,6 +64,44 @@ func (s *Skill) Load(ctx context.Context, skill openagent.SkillInfo) (string, er
 	if s.loader != nil {
 		return s.loader.Load(ctx, skill)
 	}
-	// Fallback: content already embedded in the match (kind carried it).
-	return skill.Description, nil
+	if skill.Path == "" {
+		return skill.Description, nil
+	}
+	content, err := s.client.Read(ctx, strings.TrimSuffix(skill.Path, "/")+"/SKILL.md")
+	if err != nil {
+		return skill.Description, nil
+	}
+	return content, nil
+}
+
+// skillNameFromURI extracts the skill name from a viking:// URI.
+//
+//	"viking://user/default/skills/huawei-cloud-cli-guidance/.abstract.md" → "huawei-cloud-cli-guidance"
+//	"viking://user/default/skills/huawei-cloud-cli-guidance"             → "huawei-cloud-cli-guidance"
+func skillNameFromURI(uri string) string {
+	idx := strings.Index(uri, "/skills/")
+	if idx == -1 {
+		return ""
+	}
+	rest := uri[idx+len("/skills/"):]
+	if slash := strings.Index(rest, "/"); slash != -1 {
+		rest = rest[:slash]
+	}
+	return rest
+}
+
+// skillRootFromURI strips any trailing file path to get the skill root URI.
+//
+//	"viking://user/default/skills/huawei-cloud-cli-guidance/.abstract.md" → "viking://user/default/skills/huawei-cloud-cli-guidance"
+//	"viking://user/default/skills/huawei-cloud-cli-guidance"             → "viking://user/default/skills/huawei-cloud-cli-guidance"
+func skillRootFromURI(uri string) string {
+	idx := strings.Index(uri, "/skills/")
+	if idx == -1 {
+		return uri
+	}
+	rest := uri[idx+len("/skills/"):]
+	if slash := strings.Index(rest, "/"); slash != -1 {
+		return uri[:idx+len("/skills/")+slash]
+	}
+	return uri
 }
