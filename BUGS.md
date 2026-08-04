@@ -1,502 +1,134 @@
 # BUGS.md — Known Issues & Technical Debt
 
-> Last updated 2026-07-22 (rev 11).
+> Last updated 2026-08-04.
 > Format: `[P0]` = critical, `[P1]` = high, `[P2]` = medium, `[P3]` = low.
-> `[DEBT]` = technical debt (no immediate breakage, will compound).
 
 ---
 
-## 🐛 Bugs
+## [P0] 严重
 
-### [P1] ACP approval: "Allow Always" does not persist — asks again on next tool call
+### B1. ~~取消时已完成工具结果从存储丢失（H2）~~ ✅ 已修复（2026-08-04）
 
-[acp/server.go:1383-1386](acp/server.go), [acp/server.go:1417](acp/server.go): The `acpApprover` struct is stateless — selecting "Allow Always" in the approval dialog behaves identically to "Allow" (one-shot). The `case "allow", "always"` branch at line 1417 returns `true` but does not record the decision. Additionally, `agentForTurn()` (line 1196) creates a new `acpApprover` for each turn, so any state added to the struct would not survive across turns.
+原问题：`kernel/run.go` 结果循环用**已取消的 ctx** 提交已完成工具结果——sqlite `BeginTx(ctx)` 对已取消 ctx 立即失败，存储里留下带 `tool_calls` 无结果的 assistant 消息；cancelCompensation 用内存消息建 covered 表（真实结果已在其中）不补写。下一轮历史出现中段孤儿 tool_call。
 
-**Root cause**: Two compounding issues:
-1. `acpApprover.Approve()` handles `"allow"` and `"always"` identically — no decision caching
-2. `agentForTurn()` creates a fresh `acpApprover` per turn, so per-struct cache would still not persist
+修复：`commit`（kernel/run.go:345）在 `ctx.Err() != nil` 时改用 `context.Background()` 提交（与 cancelCompensation 同模式）——运行中已产生的消息（模型输出、真实工具结果）在取消时仍落库，cancelCompensation 的 covered 判断恢复正确。
 
-**Fix plan**: Store "allow_always" decisions in a session-scoped cache on `agentSession` (via `sync.Map`), shared with each turn's `acpApprover` through a pointer. When the cache has an entry for the current tool name, skip the `RequestPermission` round-trip entirely. Only the "always" option updates the cache; "allow" (one-shot) remains uncached.
+### B2. 审批持久化丢失更新（lost update）
 
-Repro:
-1. Set mode to "manual" in VS Code ACP plugin
-2. Trigger a tool (e.g., `bash_execute "echo hello"`)
-3. Select "Allow Always" in the approval dialog
-4. Trigger the same tool again — dialog reappears (should be skipped)
+`governance/persistent_memory.go:72-98`：`Remember` = Get → 改内存 → `Save` 整行（sqlite `INSERT OR REPLACE` 全行替换）。`m.mu` 只串行化同实例调用，但 ACP 层 7 处 `Runtime.Save`（标题/cwd 更新）与它无共享锁——交错序列可把 approvals 字段静默抹掉；跨进程共享同一 sqlite 文件时锁完全失效（last-writer-wins）。"Allow-Always 跨重启存活"契约静默失效。
 
----
+修复：approvals 落独立表/行，或所有 session meta 写操作经单一写者/事务串行化。
 
-### [P1] ~~`cli serve` fails to start with "unexpected end of JSON input" when settings.json missing/empty and no plugins~~ ✅ FIXED
+### B3. OpenViking 技能能力实际不可用
 
-[cmd/cli/main.go:62,65-67](cmd/cli/main.go): **Fixed in this commit** — `settings` is normalized to `[]byte("{}")` when empty before the plugin loop, so both `CallInit` and the final `Unmarshal` always receive valid JSON.
+- `provider/openviking/client.go:169-177` `Search` 只构造 `{Kind, ID, Content, Score}`，`Item.Meta` **恒为 nil**；`skill.go:39-44` 读 `it.Meta["path"]/["name"]` 恒为空 → `Match` 返回的每个 SkillInfo `Name="skill"`（全部同名）、`Path=""`；若配置 fs.Loader，`Load` 会去进程 CWD 读 `SKILL.md` 命中错文件。`Discover` 用 `Name=it.ID`（viking:// URI）与 Match 命名互不兼容。
+- `client.go:110-123` `doJSON` 从不校验 envelope `Status`：HTTP 200 + `{"status":"error"}` 时静默视为成功；`Read` 返回 `""` + nil error。
 
-Original issue: `settings = raw` (line 62) ended up as a nil or empty byte slice in three scenarios — (1) `settings.json` not created, (2) file exists but empty, (3) no settings plugin loaded → `json.Unmarshal(settings, &cfg)` (line 122) failed with `unexpected end of JSON input` and aborted startup. Repro: `./openagent-cli serve --acp` with no plugins + missing/empty settings.json.
+修复：Search 填充 Meta（或 Match 直接用 `it.ID`）；doJSON 校验 `env.Status`，Read 的 result 缺失视为错误。
 
-Note: line 43 `json.Unmarshal(raw, &preCfg)` silently swallows the same empty-input error — non-fatal there (defaults to empty `Config{}`, falls back to `DefaultPluginsDir()`). Left untouched as this is the expected graceful-degradation behavior.
+### B4. 模型上下文窗口表误判
 
----
+`utils/context_window.go:34`：`gpt-4.1` 子串命中 `has(lower,"gpt-4")` → 128K，官方实际 **1M**（在 1/8 容量处就触发压缩）；`:40-41`：`deepseek v2.5` → 8K，实际 **128K**（16 倍提前压缩）。且 `TokenizerModelID` 对 gpt-4.1 走 cl100k → CJK 超计 ~60%。
 
-### [P1] ~~extended-settings plugin emits invalid JSON / overwrites existing `provider` map~~ ✅ FIXED
+修复：`"gpt-4"` 匹配之前加 `"gpt-4.1" → Window1M`；`v2.5 → Window128K`；`TokenizerModelID` 把 gpt-4.1 归入 o200k。**并给窗口表加映射测试**（此表已多次出错：GLM-5、本次两处）。
 
-[cmd/cli/examples/plugin/extended-settings/src/lib.rs](cmd/cli/examples/plugin/extended-settings/src/lib.rs): **Fixed in this commit** — `cli_init` now delegates to a pure `inject_settings` helper that parses settings via `serde_json` and deep-merges `provider.my_provider` and `env.MY_PROVIDER_API_KEY` into the existing object tree (creating maps if absent). All merge semantics are overwrite: keyring values replace user values for `api_key`/`base_url`/`models`/`env.MY_PROVIDER_API_KEY`; other existing keys preserved. 6 unit tests cover all three cases below plus overwrite, invalid-JSON fallback, and non-object root.
+### B5. toSDKContentParts 未知类型留 `null` 元素炸掉请求
 
-Original issue: `cli_init` unconditionally prefixed the injected block with `,` and unconditionally created a fresh `"provider"` object, producing three failure modes: (1) empty `{}` → `{,"provider":...` invalid JSON; (2) non-empty without `provider` — same fragile code path, only syntactically valid by accident; (3) non-empty with existing `provider` → overwrote the whole map → silent data loss of user-configured providers. Symptom: `parse merged settings: invalid character ',' looking for beginning of object key string` after `plugin: loaded extended-settings (...)`.
+`model/openai/openai.go:257-261`：注释称"drop it explicitly"，但 `out[i]` 是**索引赋值**而非 append——未知 part 类型的零值元素保留原位，序列化为 `content: [..., null, ...]` → OpenAI 兼容 API 400，run 硬失败。注释（"序列化为空 {} 被 API 静默丢弃"）与实现双重错误。
+
+修复：默认分支 `continue`（append 已知类型）。
 
 ---
 
-### [P1] ~~`memory/sqlite` FTS — CJK search returns nothing~~ ✅ FIXED
+## [P1] 高
 
-[memory/sqlite/memory.go](memory/sqlite/memory.go): **Fixed in this commit** — `migrate` now creates `messages_fts` with the `trigram` tokenizer (rebuilds legacy `unicode61` tables in place + backfills from `messages`). `ftsSearch` trims leading/trailing punctuation from each token, OR-joins them as phrases with BM25 ranking, and falls back to a `LIKE` substring scan for tokens too short (<3 chars) for trigram.
+### B6. MCP 连接无超时阻塞 ACP serve 循环
 
-Original issue: `migrate()` created `messages_fts` with the default `unicode61` tokenizer, which treats a run of CJK characters as one token, so CJK queries matched nothing. A punctuation (`! ? . , ; / #`) crash was partially mitigated by stripping those characters before `MATCH` and returning `nil` on empty queries, but FTS5 still only worked for whitespace-separated languages (English, European).
+`acp/server.go:825` `connectMCP` 在 serve 循环内同步执行，ctx 是 `context.Background()`（acp/sdk/server.go:567）且 stdio 握手无超时。坏 MCP 子进程不响应时 `mcp.Client.Connect` 无限阻塞——session/cancel、session/close、session/list 全部停摆，用户无法取消运行中的 prompt。mux.request 的 5 分钟上限不覆盖此路径。
 
----
+修复：`context.WithTimeout(ctx, 15s)`（超时 kill 子进程，mcp/client.go:96-99 已有该逻辑）+ 独立 goroutine 执行。
 
-### [P2] ~~VSCode ACP plugin mode indicator not updated after /mode or exit_plan_mode~~ ✅ FIXED
+### B7. 流式工具取消报"部分内容成功"
 
-[acp/server.go:671-691](acp/server.go), [acp/server.go:851-879](acp/server.go): **Fixed in this commit** — `setSessionMode` now sends both `current_mode_update` and `config_option_update`; `exit_plan_mode` now calls `setSessionMode` instead of manually setting mode + sending only `current_mode_update`; `OnSetSessionConfigOption` skips duplicate `config_option_update` when mode was changed.
+`execution/runtime.go:196-203`：`toolCtx.Done()` 时 flush 后把部分流内容包装成**无 Error 的成功 ToolResult**，提交进会话历史，下一轮模型还读得到；阻塞路径在取消时返回错误结果，两路径语义不一致。且 `ErrorResult(chunk.Error, false, "")` 硬编码 retryable=false，瞬态流错误永不重试。
 
-`setSessionMode` only sends `current_mode_update` (line 684-688), not `config_option_update`. The VSCode ACP plugin renders the mode selector as a config option (ID: `"mode"`) and relies on `config_option_update` to refresh its value. When mode is changed via `/mode` slash command, `session/set_mode` RPC, or `exit_plan_mode` tool, the plugin's mode indicator is not updated — even though the agent's internal mode (and actual tool gating behavior) has correctly changed. `OnSetSessionConfigOption` is the only path that sends both notifications, so only mode changes via the plugin's own config UI work correctly.
+修复：取消/错误时给结果打错误或 cancelled 标记（保留 chunk.Error 的 Retryable 语义）。
 
-Additionally, `exit_plan_mode` (line 851-879) manually sets `ss.mode` and sends only `current_mode_update`, bypassing `setSessionMode` entirely. This has the same symptom: after the agent calls `exit_plan_mode`, the actual mode reverts to auto/manual, but the plugin indicator still shows "plan".
+### B8. truncateToolArg 按字节截断 UTF-8
 
-Repro:
-1. `/mode plan` → echo shows success, agent enters plan mode, but plugin indicator still shows previous mode
-2. In plan mode, agent calls `exit_plan_mode` → actual mode reverts, but plugin indicator still shows "plan"
+`acp/server.go:2498` `s[:n-3]` 可能切断多字节字符 → 工具标题（shell description/goal/query 含中文/emoji 时）含非法 UTF-8，客户端显示乱码。与已修先例 a736ac7（会话标题截断）同类，同文件 `firstLine` 已用 `[]rune` 修复，此处漏修。
 
-Fix:
-1. Add `config_option_update` notification to `setSessionMode` (alongside the existing `current_mode_update`).
-2. Replace the manual mode-setting + single notification in `exit_plan_mode`'s callback with a call to `setSessionMode`.
-3. In `OnSetSessionConfigOption`, skip the explicit `config_option_update` when mode was changed (to avoid double-sending since `setSessionMode` now sends it).
+修复：同 firstLine 改为 rune 截断。
 
----
+### B9. summarizer 无重试 + 无 nil 防御
 
-### [P2] ~~Team: no model selection, no ContextWindow, stale ModelID~~ ✅ FIXED
+- 主模型调用有重试，但 Compact→Summarize 单发：429/503 瞬时限流 → 溢出区间既不在摘要也不在工作集 → **当轮上下文空洞**（`kernel/run.go` 仅 `slog.Error` 后继续，prepareMemory 仍推进工作集起点）。
+- `summarizer/llm.go:70-74` 未判 `resp == nil`（extractor_llm.go:137 有检查，两处不对称）；接口未禁止第三方 Model 返回 (nil,nil)，违规即 panic。
 
-[rest/team.go](rest/team.go): **Fixed in this commit** — `TeamHandler` now carries a model registry (`models`/`modelList`/`modelsMu`) mirroring `Handler`, with `RegisterModel`/`lookupModel`. `handleChat` resolves the model from `ChatRequest.ModelID`/`Provider` (falling back to stored session meta, then the first-template model), persists `modelId`/`provider` to session meta via `withMeta`+`syncMeta`, and sets `Model`/`ModelID` on the `openagent.Session` handed to `team.RunStream`. Because `runner.go:68-70` does `r.runModel = session.Model if non-nil`, the selected model overrides every team agent's model for that run. `NewTeamHandler` wires a `fillDetail` hook that resolves the session's effective model (stored meta > handler default) and sets `detail.ContextWindow`, so `GET /team/sessions/{id}` returns a non-zero `contextWindow` and the current (non-stale) `modelId`.
+修复：Summarize 调用处对 RetryableError 重试一次；补 `resp == nil` 防御。
 
-Original issue:
-1. `handleChat` ignored `ChatRequest.ModelID` — `oaSession` constructed without `Model` or `ModelID`. Frontend model selector had no effect in team mode.
-2. `s.info.ModelID` never synced to team handler. `GET /team/sessions/{id}` returned creation-time `ModelID` forever.
-3. `handleGetSession` missing `ContextWindow` — Frontend showed `contextWindow: 0` for team sessions.
+### B10. SSE 连接永久悬挂（team 端点）
 
-Tests: `rest/team_model_test.go` — `TestTeamHandleChatModelOverride` (model-b is invoked when selected) and `TestTeamGetSessionContextWindow` (`contextWindow == 16000` and `_meta.modelId == "model-b"` after a model-b chat).
+`rest/team.go:352-359`：`for se := range sub.C` 仅靠 done/error 或写失败退出；eventbus Publish 满则**静默丢弃**（bus.go:266-273），慢客户端写满 256 槽后终态 "done"/"error" 被丢 → SSE 循环永远阻塞（无 `r.Context().Done()` select、无心跳），HTTP 连接与 goroutine 泄漏到进程退出。对照 rest/handler.go:470-477 有同样洞。
 
----
+修复：SSE 循环同时 select `r.Context().Done()`；或 run 结束关闭 done chan 作为终止信号。
 
-### [P2] `fetchMessages` can overwrite live SSE stream
+### B11. extractor 防护缺失
 
-[examples/frontend/vue-app/src/stores/chat.ts](examples/frontend/vue-app/src/stores/chat.ts): `watchEffect` → `clearChat()` → `fetchMessages()` (async). Between `clearChat()` and `fetchMessages` completing, a live SSE stream can push messages. When `fetchMessages` resolves, `messages.value = converted` unconditionally overwrites live messages.
+- `context/extractor_llm.go:141-158`：`op != "skip"` 即 Store——`{"op":"update","topic":""}` 或幻觉 topic 时 sqlite 端按空 topic 直接 INSERT → 重复条目膨胀（Mem0 式去重要防的正是这个），完全静默。要求 update 的 topic 非空且在 existing 中命中，否则降级 skip/add。
+- `context/async_extractor.go:71-89`：worker 无 recover——一次 panic 后 queue 里的 key 无人处理，此后所有会话的知识提取**静默永久失效**到进程重启。
+- `extractor_llm.go:105`：Recall 错误被吞 → DB 故障时模型把已有知识全标 add。
 
----
+### B12. checkpoint 派生自已取消的 ctx
 
-### [P2] ~~`guard/llm/guard.go` — Parse failure defaults to block (fail-closed)~~ ✅ FIXED
+`acp/server.go`（OnPrompt 收尾）：`cpCtx, cancel := context.WithTimeout(ctx, 5*time.Second)`——客户端 $/cancel_request 恰好触发后 cpCtx 立即 done，被取消的 turn 的 checkpoint 必然失败（仅 warn），恢复点永远丢失。同函数 saveTotalTokens 同样问题（静默失败）。
 
-[guard/llm/guard.go](guard/llm/guard.go): **Fixed in this commit** — `parseResult` accepts a `failOpen bool` parameter (signature `func parseResult(content string, failOpen bool) openagent.GuardResult`) and honors it on the parse-failure path: when `json.Unmarshal` fails and both `"allowed": true/false` substring matches miss, it returns `Allowed: true` if `failOpen` is set, `Allowed: false` otherwise. The `judge` method forwards `g.failOpen` into `parseResult`, so `failOpen` now covers network/API errors, empty choices, **and** parse errors — all three failure modes. The default (`WithFailOpen` unset → `failOpen=false`) remains fail-closed, the documented safety posture.
+修复：`context.WithTimeout(context.Background(), 5*time.Second)`。
 
-Original issue (stale — described a version before `995bbb8`): `parseResult` did substring match on `"allowed": true/false`. If substring match also failed, defaulted to `Allowed: false`. The `failOpen` option only covered network/API errors and empty choices, not parse errors (`parseResult` ignored `failOpen` when it couldn't extract a boolean). This was already addressed in commit `995bbb8` (refactor that threaded `failOpen` into `parseResult`), predating this entry.
+### B13. OpenViking 客户端资源与安全
 
----
+- `client.go:105-108` `io.ReadAll` 无大小上限：异常/被攻陷服务端返回 GB 级响应直接耗尽进程内存。修：`io.LimitReader`（如 32MB）。
+- 客户端零认证通道（`OpenVikingConfig` 只有 Endpoint，无 header 注入点）：远程部署时任何能触达端点地址的进程可读可写全部记忆。修：可选 Bearer token / 自定义 header。
+- `Remember`（client.go:199-209）中途失败残留孤儿会话（创建后 commit 失败不清理）。
 
-### [P2] Dynamic team agents not persisted across restarts
+### B14. 工具截断产物权限过宽
 
-[rest/team.go](rest/team.go): `handleAddAgent` creates agents at runtime. `SessionStore` only persists `SessionInfo` — agent list not stored. After restart, `getOrCreate` → `newEntry` rebuilds from templates only.
+`result.go:147-156`：工具输出（可能含密钥）写入 `/tmp/openagent` **0755 目录、0644 文件**，本机其他用户可读。修：0700/0600。
 
----
+### B15. 重试不区分幂等性 + hooks 每尝试重复触发
 
-### [P3] API credit leak on client SSE disconnect
+`execution/runtime.go:96-113`：任何 `Retryable=true` 结果以完全相同参数重跑（最多 2 次，500ms/1s 退避无抖动）——对已产生部分副作用的工具（写盘后超时）重复执行副作用；每次尝试独立走完整管线，`OnToolStart/End` hooks 每尝试触发一遍。当前无内置工具设 Retryable，属潜在危险基础设施。
 
-[rest/handler.go:272](rest/handler.go#L272), [rest/team.go:222](rest/team.go#L222), [rest/orchestrate_handler.go:264](rest/orchestrate_handler.go#L264): All three use `context.Background()` (with long timeout) for agent goroutines. SSE client disconnects → goroutine continues running with no consumer.
+修复：文档明确 Retryable 仅允许幂等工具；hooks 只在首次尝试触发；退避加抖动。
 
 ---
 
-### [P2] ~~`cmd/cli/keyring` silently falls back to `MemStore` in D-Bus-less environments, losing persisted secrets~~ ✅ FIXED
+## [P2] 中
 
-[cmd/cli/keyring/keyring.go:46-58](cmd/cli/keyring/keyring.go),
-[cmd/cli/keyring/keyring_linux.go:29-138](cmd/cli/keyring/keyring_linux.go),
-[cmd/cli/main.go:317-338](cmd/cli/main.go),
-[go.mod:9,23](go.mod): **Fixed in this commit** — `Open()` delegates to a platform-dispatched `openBackend()`. On Linux, `isSecretServiceAvailable()` explicitly checks `dbus.SessionBus()` + `NameHasOwner("org.freedesktop.secrets")` (no more `gkr.Get("__probe__")` autolaunch), then falls back to a kernel-keyring backend (`keyctlBackend`) implemented on `golang.org/x/sys/unix` (`KeyctlLink`/`KeyctlSearch`/`KeyctlRead`/`AddKey`/`KeyctlInt(KEYCTL_UNLINK)`). `ErrKeyringUnavailable` sentinel and `HasSupport()` added. `cli keyring set`/`delete` use a new `keyringOrFail()` helper that `log.Fatalf`s with an actionable message ("install `dbus-x11` or run with `--cap-add=keyutils`") instead of silently writing to `MemStore` — eliminating the silent-data-loss derived issue. `github.com/godbus/dbus/v5` and `golang.org/x/sys` promoted to direct deps. macOS/Windows paths unchanged (still use `zalando` `__probe__`, correct for non-D-Bus backends).
+### B16. slash Handle 无 panic 兜底 + 参数重组
 
-Original issue: `Open()` probed the system keychain with `gkr.Get("openagent", "__probe__")`. On Linux, `zalando/go-keyring v0.2.8` routes through the Secret Service API (`github.com/godbus/dbus/v5`). When `DBUS_SESSION_BUS_ADDRESS` was unset and no `dbus-launch` existed on `PATH`, `godbus` attempted to exec `dbus-launch` and returned `exec: "dbus-launch": executable file not found in $PATH`. This error propagated up to `openKeyring()`, which substituted `MemStore` with a WARNING. Repro: Huawei Cloud EulerOS 2 container (aarch64, no `dbus-x11` installed).
+`slash/slash.go:140-167`：handler 是任意闭包（接 server 方法），panic 直接冒泡到 ACP 请求 goroutine（唯一分发点，acp/server.go 调用处无 recover）。且 `Fields`+`Join` 与文档"raw argument string"矛盾：多行/引号/连续空白被改写（`/note "a  b"` → `"a b"`）。修：Handle 内 defer recover 转错误响应；传原始字符串。
 
-**Remaining follow-up (not fixed, explicitly out of scope per scope notes):**
-- Double WARNING: `main()` calls `openKeyring()` once at startup, then `keyring get` calls it again, printing the same warning twice. `set`/`delete` no longer double-warn (they use `keyringOrFail()`). Scope notes (below) record this as not being fixed in this change.
+### B17. GET 读端点复活已删除会话
 
-SCOPE NOTES (per user direction, honored):
-- keyring library was NOT swapped to `99designs/keyring`; `zalando/go-keyring` stays.
-- File-based fallback (Plan B) was rejected; kernel keyring is the last non-volatile tier, and a missing kernel-keyring capability surfaces as an explicit error.
+`rest/team.go:232/268/412/436/500` 全部走 `getOrCreate`（rest/session.go:398-446，缺失时 newEntry + syncMeta 持久化）——GET /messages 对已删除 id 返回 200 空数组并**在 store 里创建新记录**，前端删除后轮询会复活会话；对照 rest/handler.go 的 messages() 不创建，行为不一致。修：读取路径先 `Exists(id)`，仅 chat 保留 getOrCreate。
 
----
+### B18. 团队会话 approvalMemory 未初始化
 
-### [P1] ~~Sandbox environment has no outbound network connectivity~~ ✅ FIXED
+`rest/team.go:533-585` newEntry 不创建 approvalMemory（对照 Handler.newEntry 创建了 PersistentApprovalMemory）——团队模式下 "always allow" 决策只活在内存，重启即忘，与单 agent 模式行为不一致。
 
-[cmd/cli/main.go:128-130](cmd/cli/main.go),
-[cmd/cli/settings/settings.json:18-21](cmd/cli/settings/settings.json),
-[cmd/cli/server/http.go:25-54](cmd/cli/server/http.go),
-[sandbox/native/native.go](sandbox/native/native.go),
-[sandbox/native/native_linux.go](sandbox/native/native_linux.go),
-[cmd/cli/config/config.go](cmd/cli/config/config.go):
+### B19. 窗口表映射测试缺失
 
-**Fixed in this commit** — root cause was
-`sandbox/native/native_linux.go:bwrapArgs()` unconditionally passing
-`--unshare-all` to `bwrap`. That flag implies `--unshare-net`, putting
-the sandboxed process into a fresh network namespace with no routes,
-no DNS, and no outbound connectivity. Every shell command the agent
-ran (`curl`, `pip install`, `hcloud`, etc.) failed as a result. (The
-agent's own LLM HTTP calls go through the main Go process, not the
-sandbox, so those were unaffected — only shell-tool network was dead.)
-
-Fix is five-layered:
-
-1. **Policy API in `sandbox/native`** — added `Policy{Network,
-   WritablePaths, ReadablePaths}` and `NewWithPolicy(workDir, Policy)`.
-   `New(workDir)` now delegates to `NewWithPolicy(workDir, Policy{})`
-   whose zero-value `Network == ""` means **host** (network allowed).
-2. **`bwrapArgs()` reworked** — replaced `--unshare-all` (which
-  hard-fails on user-namespace creation in restricted containers) with
-   explicit namespace flags: `--unshare-user-try` (graceful),
-   `--unshare-ipc`, `--unshare-pid`, `--unshare-uts`,
-   `--unshare-cgroup-try`. Network is governed directly: `isolated`
-   policy adds `--unshare-net`; `host`/default omits it entirely (no
-   more `--unshare-all` + `--share-net` roundtrip). `WritablePaths` /
-   `ReadablePaths` produce additional `--bind` / `--ro-bind` entries.
-3. **`/etc` network config mounted read-only** — `bwrapArgs()` now
-   bind-mounts `/etc/resolv.conf`, `/etc/hosts`, `/etc/nsswitch.conf`,
-   and `/etc/ssl` via `--ro-bind-try`. Without these, even with host
-   network namespace sharing, glibc inside the sandbox cannot resolve
-   DNS (no resolv.conf) and TLS verification fails (no CA certs).
-   This was the second root cause: the first-round fix added
-   `--share-net` but the agent still saw `curl exit 6 (Couldn't
-   resolve host)` because resolv.conf wasn't mounted.
-4. **bwrap-startup-failure fallback** — `confineAndRun` and
-   `confineAndRunStream` now detect bwrap setup failures (empty
-   stdout + stderr starting with `bwrap:`) and fall back to
-   unconfined execution silently, instead of returning the bwrap
-   error to the agent. Previously the fallback only triggered
-   when bwrap was not found (`exec.LookPath` failed); if bwrap was
-   installed but couldn't start (e.g. `setting up uid map: Permission
-   denied` in containers), the shell command never ran and the agent
-   only saw the bwrap error. The fallback is silent for the
-   high-frequency bwrap-startup-failure path (every shell command in
-   containers) to avoid log spam; a WARNING is still logged for the
-   low-frequency cases (bwrap not installed, `c.Start()` fails).
-5. **Configurable from `settings.json`** — `cmd/cli/config/config.go`
-   gained a `SandboxConfig{Network, WritablePaths, ReadablePaths}`
-   field. `cmd/cli/server/{http,acp}.go` switched from `native.New()`
-   to `native.NewWithPolicy(cwd, sandboxPolicy(cfg.Sandbox))`. Missing
-   config defaults to host networking — the agent can finally reach
-   the internet through shell tools. Users who want the old isolated
-   behavior can set `{"sandbox": {"network": "isolated"}}` in
-   `settings.json`.
-
-The policy tests in `native_policy_linux_test.go` (previously failing
-to compile because the API didn't exist) now pass, including
-`TestBwrapArgsEtcMounts` (verifies /etc network files are mounted)
-and `TestBwrapArgsNetworkPolicy` (verifies `--unshare-net` is
-absent for host/default, present for isolated). The renamed
-`TestSandboxIsolatedPolicyBlocksNetwork` verifies the isolated policy
-still blocks network end-to-end — it auto-skips when the sandbox
-itself can't start (via `sandboxFunctional` helper), so it no longer
-false-fails in containers that block bwrap.
-
-Original issue: the containerized sandbox (observed in the local
-runtime log) had no outbound network at all. This was an
-environment-level limitation that broke core `openagent-cli serve`
-runtime paths assuming network access.
-
-Evidence (log lines 205-227, 405-432):
-- `curl https://www.baidu.com` and `curl https://www.google.com` →
-  HTTP `000` (immediate failure)
-- `host google.com` / `nslookup` → DNS resolution failed
-- `ip route` → empty routing table; no visible network interfaces
-- `HTTP_PROXY`/`HTTPS_PROXY` configured in `settings.json:18-21` point
-  to `proxynj.huawei.com:8080` (Huawei internal proxy), which is
-  equally unreachable from inside the sandbox
-
-Impact on `openagent-cli serve` (before the fix):
-- `server/http.go:38-53` `buildModels` constructs OpenAI clients for
-  every provider in `settings.json` (`api.deepseek.com`,
-  `open.bigmodel.cn`). Every agent turn that calls the model endpoint
-  fails — the agent cannot produce any response.
-- `main.go:128-130` injects `cfg.Env` (including the proxy vars) via
-  `os.Setenv`, but since the proxy host is itself unreachable from the
-  sandbox, the proxy configuration provides no relief.
-- Runtime package installation (`pip install`, `hcloud` download) is
-  impossible, so SDKs/CLIs cannot be added on the fly.
-
-Repro (log lines 84-99, 194-203): user asked to query cn-north-4 ECS
-list — with no network and no preinstalled cloud CLI/SDK, the agent
-could not reach any Huawei Cloud endpoint and the user had to supply
-data manually.
-
-**Remaining follow-ups (not fixed in this commit):**
-
-1. Add `openagent-cli doctor` subcommand that probes network
-   reachability (proxy host, DNS, routing table) at startup and
-   reports the degraded mode explicitly. Today failures only surface
-   when an agent turn actually tries to call out, producing opaque
-   timeouts.
-2. Detect empty routing table / unreachable proxy during `serve`
-   startup and fail fast with an actionable message instead of letting
-   every LLM call hit a timeout.
-3. Document that in network-isolated sandboxes (when the user opts
-   into `sandbox.network: "isolated"`), the agent must delegate
-   network-bound operations to the host machine via
-   `terminal_create` / `read_client_file` rather than executing them
-   in-sandbox.
-4. ✅ Resolved — `TestSandboxWorkspaceAccess` / `TestSandboxStreaming`
-   now pass via the bwrap-startup-failure fallback (they fall back to
-   unconfined execution and the commands succeed). The isolation tests
-   `TestSandboxBlocksExternalAccess` /
-   `TestSandboxIsolatedPolicyBlocksNetwork` auto-skip via the
-   `sandboxFunctional` helper when bwrap can't start, instead of
-   false-failing.
+手写模型表（utils/context_window.go）已多次出错（GLM-5、gpt-4.1、deepseek v2.5），无测试锚定。修：每个已知模型断言预期窗口的映射测试。
 
 ---
 
-### [P1] ~~`cmd/cli` server modes hardcode `MaxTurns=10` — complex tasks silently truncated~~ ✅ FIXED (partial)
-
-[cmd/cli/server/acp.go:63](cmd/cli/server/acp.go#L63),
-[cmd/cli/server/http.go:53](cmd/cli/server/http.go#L53): **Fixed in this commit** — both call sites bumped from `WithMaxTurns(10)` to `WithMaxTurns(100)`. 100 turns covers any realistic single-task workflow (read → search → edit → test → fix → rerun) without exhausting the budget mid-investigation, while still providing a safety cap against runaway loops.
-
-[runner.go:59-62](runner.go#L59),
-[runner.go:121](runner.go#L121),
-[runner.go:456-463](runner.go#L456),
-[agent.go:77](agent.go#L77),
-[cmd/tui/main.go:44](cmd/tui/main.go#L44):
-
-Original issue: Both CLI server entry points hardcoded `openagent.WithMaxTurns(10)` when
-constructing the agent, and the value was not exposed in `settings.json`
-or any CLI flag. One "turn" in this framework equals one LLM call plus
-one round of tool execution (`runner.go:121`), so on any non-trivial
-task — read a few files, grep, edit, run tests, fix, rerun — the budget
-was exhausted before the agent finishes. The CLI server modes were in fact
-*more restrictive than the framework's own default* of 20
-(`runner.go:60-62`, `agent.go:77`, used by `cmd/tui/main.go:44`).
-
-**Silent truncation is the worst part.** When `turn > maxTurns`, the
-`for` loop at `runner.go:121` simply exits, falls through to
-`runner.go:456-463`:
-
-```go
-}  // end of for-loop
-result.TurnCount = turn
-result.ContextWindow = r.runModel.ContextWindow()
-if ch != nil {
-    ch <- StreamEvent{Type: StreamDone, Result: result}
-}
-return result, nil
-```
-
-`result.StopReason` is left empty, no error is returned, and a normal
-`StreamDone` event is emitted — indistinguishable from a graceful
-"model returned no tool_calls" stop (`runner.go:393-405`). The user sees
-a half-finished answer that looks complete; tool_calls left pending by
-the last assistant turn are never executed and never reported.
-
-**Impact:**
-- ACP mode (`cli serve --acp`): any task needing >10 turns returns a
-  truncated, "successful-looking" response. Observed during the
-  Huawei Cloud ECS diagnosis session — the agent ran out of turns
-  mid-investigation and returned partial findings as if finished.
-- REST mode (`cli serve`): same silent truncation over SSE; frontend
-  shows a normal `done` event with an incomplete answer.
-- No workaround available to end users without recompiling — the value
-  is neither in `settings.json` nor a CLI flag.
-
-**Remaining follow-ups (not fixed in this commit):**
-
-1. ✅ Bump the CLI server default — done (10 → 100).
-2. Surface hitting the cap explicitly. In `runner.go:456`, detect
-   `turn > maxTurns` (i.e. the loop exited without `break` and the last
-   `choice.Message.ToolCalls` was non-empty) and set
-   `result.StopReason = "max_turns"` plus emit a `StreamEvent{Type:
-   StreamWarning, ...}` (or at minimum log a WARNING). Frontends and
-   ACP clients can then prompt the user to continue.
-3. Make the value configurable: add `maxTurns` (or `agent.maxTurns`)
-   to `settings.json` schema in `cmd/cli/settings/`, and a
-   `--max-turns` flag on `cli serve`, defaulting to the bumped value.
-   Mirror the pattern already used for `cfg.Provider` / `cfg.Profiles`.
-
----
-
-### [P1] ~~ACP Agent→Client RPC tools registered without checking client capabilities~~ ✅ FIXED
-
-[acp/server.go](acp/server.go): **Fixed in this commit** — `OnInitialize` now persists `req.ClientCapabilities` (guarded by `s.mu`). Three capability helpers (`clientCanReadFile`, `clientCanWriteFile`, `clientCanTerminal`) gate tool registration in `agentForTurn` (all three modes: plan, auto, manual) and `injectExecutionTools`. The plan-mode system prompt in `buildDynamicContext` conditionally advertises `read_client_file` only when the client supports it.
-
-Original issue: `OnInitialize` receives `req.ClientCapabilities` (including `fs.readTextFile`, `fs.writeTextFile`, `terminal`) from the client during the `initialize` handshake, but discards it entirely — only hardcoded `AgentCapabilities` are returned. `agentForTurn` and `injectExecutionTools` then register `read_client_file`, `write_client_file`, and all `terminal/*` tools based solely on `s.clientRPC != nil`, without checking whether the client actually advertised support for these RPCs.
-
-When a client that does not implement `fs/read_text_file` (e.g., a browser-based or mobile ACP client) connects, the LLM is offered `read_client_file` and calls it, but the client rejects the `fs/read_text_file` RPC with JSON-RPC `-32601 Method not found`. The agent wraps this as `read_client_file: acp: fs/read_text_file call failed: ... not available on this client`. The same applies to `write_client_file` and all `terminal/*` tools.
-
-Per the ACP spec, capabilities are negotiated during `initialize` — presence signals support, absence signals the feature is unavailable. The agent must not offer tools whose Agent→Client RPCs the client cannot handle.
-
----
-
-### [P1] ~~Skills not recognized or usable in `cli serve` (ACP + REST modes)~~ ✅ FIXED
-
-[cmd/cli/server/acp.go:65](cmd/cli/server/acp.go), [cmd/cli/server/http.go:62](cmd/cli/server/http.go), [cmd/cli/server/shared.go:270-288](cmd/cli/server/shared.go): **Fixed in this commit** — both CLI server entry points call `buildOpts(opts, caps, model)`, which wires `openagent.WithSkillLoader(openSkillLoader())` when `caps.OnSkills()` is true (default on) and a skill directory exists. `openSkillLoader()` (`shared.go:216-223`) auto-discovers skill directories via `skillDirs()` (`shared.go:225-238`), probing four locations: `~/.openagent/skills`, `~/.agents/skills`, `$cwd/.agents/skills`, `$cwd/.openagent/skills`. The runner's nil-gate at `runner.go:74-79` now gets a non-nil loader when any directory exists, enabling `load_skill`/`reload_skills` tools and the skill catalog in the dynamic prompt.
-
-Original issue: Both CLI server entry points constructed the agent **without** `openagent.WithSkillLoader(...)`, so `agent.SkillLoader` stayed nil and the runner short-circuited the entire skill subsystem (no `load_skill`/`reload_skills` tools, no "## Available Skills" catalog, no "## Loaded Skill:" body). The `Config` struct had no skills directory field. Cross-confirmation: `WithSkillLoader` was called only in `cmd/iac-mcp/main.go`, `examples/skill/main.go`, and `examples/iac/agents.go` — never under `cmd/cli/server/`.
-
-Implementation note: the fix used auto-discovery of four well-known directories rather than the `Config.Skills string` field proposed in the original fix plan, and named the helper `openSkillLoader` rather than `resolveSkillLoader`. Same effect; no `settings.json` field needed.
-
----
-
-### [P2] ~~`plan_create` available in all modes, bypassing plan-mode workflow~~ ✅ FIXED
-
-[plan/tool.go:205-260](plan/tool.go), [acp/server.go:740-750](acp/server.go), [acp/server.go:867-919](acp/server.go), [acp/server.go:1263-1285](acp/server.go): **Fixed in this commit** — Added `EnterTool` (`enter_plan_mode`) to `plan/tool.go` as a symmetrical counterpart to `ExitTool` (`exit_plan_mode`). `plan_create` registration moved inside the `if ss.mode == "plan"` block in `OnPrompt`; `enter_plan_mode` registered in the `else` branch (auto/manual modes). `enterPlanMode` helper added to `AgentServer` to persist the mode transition via `setSessionMode`. `buildDynamicContext` updated to hint auto/manual agents about `enter_plan_mode` when no plan exists. The `enter_plan_mode` tool result card is suppressed in the CLI channel UI (same as `plan_update`). Cross-turn approach avoids removing execution tools from the agent clone mid-turn. `enter_plan_mode` inherits the current mode's approver automatically — auto runs without approval, manual triggers user confirmation via `acpApprover`.
-
-Original issue: `plan_create` was registered unconditionally in `OnPrompt` — available in auto, manual, and plan modes. The agent in auto/manual mode could call `plan_create` and immediately begin executing, bypassing the "enter plan mode → create plan → user review → exit plan mode → execute" workflow. The symmetry was also broken: `exit_plan_mode` had no `enter_plan_mode` counterpart.
-
-Final tool availability:
-
-| Tool | auto | manual | plan |
-|------|:----:|:------:|:----:|
-| `enter_plan_mode` | ✓ (no approval) | ✓ (needs approval) | ✗ |
-| `plan_create` | ✗ | ✗ | ✓ |
-| `plan_update` | ✓ | ✓ | ✓ |
-| `exit_plan_mode` | ✗ | ✗ | ✓ |
-
----
-
-### [P2] ~~`memory/file` `countLinesLocked` hits `bufio.Scanner` default 64KB cap — long messages cause session amnesia / append deadlock~~ ✅ FIXED
-
-[memory/file/memory.go](memory/file/memory.go), [memory/file/memory_test.go](memory/file/memory_test.go): **Fixed in this commit** — `countLinesLocked` now counts by newline via `bufio.Reader.ReadString('\n')` instead of `bufio.Scanner`. A Scanner inherits the 64KB default token cap and returns `bufio.ErrTooLong` on any single line exceeding it; `ReadString` chunks oversized lines and only counts a record on the terminating `'\n'` (which `Append` always writes), so `Count` is no longer capped at any fixed buffer size. 6 unit tests in `memory/file/memory_test.go` cover all four failure modes below plus the 2MB `(>1MB readAllLocked cap)` and partial-trailing-line edge cases — verified to fail on the old code (`bufio.Scanner: token too long`) and pass after the fix.
-
-Original issue: `countLinesLocked` used `bufio.NewScanner(f)` without `scanner.Buffer(...)`, so it inherited the stdlib default `bufio.MaxScanTokenSize = 64*1024` (64KB). The sibling write path (`Append`, no limit) and read path `readAllLocked` (explicit 1MB cap) were unaffected — a single JSON message > 64KB could be written and read back, **only "count lines" returned `bufio.ErrTooLong`**. Trigger threshold was low: one assistant message embedding a large artifact (a `read` of a big single-line file, a `grep` full-repo hit, a base64 screenshot, an SQL dump) sufficed. `Compact` never deleted original messages, so the oversized line **persisted permanently** — one trigger became a chronic condition.
-
-Note: `cli serve` (REST + ACP) uses `memory/sqlite` (whose `Count` is `SELECT COUNT(*)` — no scanner, no cap); `file` memory was only reached via `examples/iac`, `examples/memory`, and downstream embedded users, so the main product surface was unaffected. Side-by-side repro (`file` vs `sqlite` over the same >64KB message set) confirmed sqlite never failed; file now matches.
-
-Impact (all four reproduced against the real `*file.Memory` and now fixed):
-
-1. **Silent amnesia mid-run** — `prepareMemory` (`runner.go:521`) got `ErrTooLong` from `Count`, returned `nil, ci` without fataling; the main loop continued with **zero history** for the turn. No error surfaced to the user. Compaction/summarizer also stopped firing.
-2. **Restart append deadlock** — `Append` (`memory.go:91-97`) seeded `nextIdx` via `countLinesLocked` on first use. Once the file held a >64KB line, the first `Append` after restart errored, leaving `nextIdx` at 0; **every subsequent `Append` re-entered the `==0` branch and failed again**. `appendMemory` (`runner.go:1013-1024`) was void and only observed, so the in-memory conversation kept running while all new messages were silently dropped.
-3. **Count/Recent split-brain** — for 64KB < line ≤ 1MB, `readAllLocked` succeeded but `Count` errored. `globalOffset := totalCount - len(msgs)` (`runner.go:538`) went negative, skewing compaction and indexing.
-4. **Error-swallowing callers made sessions "vanish"** — `acp/server.go:467`, `rest/session.go:188/208`, and `rest/team_memory.go:77-80` discarded `Count` errors, treating them as `n=0`. A session with messages was judged empty and disappeared from REST lists / ACP replay (file still present, `Recent` still readable). With `Count` no longer erroring on oversized lines, these callers now see the true count.
-
-Historical repro (now passes after the fix):
-1. Start an agent with file memory (`examples/iac` or an embedded path).
-2. Have the agent `read`/`grep` a single-line file > 64KB.
-3. Next turn: agent forgets the conversation (empty history).
-4. Restart: new inputs to that session fail to persist (`file memory append: bufio.Scanner: token too long`) until the oversized line is manually split.
-
----
-
-## 🔧 Workarounds
-
-### `runner.go` — Emergency context window trimming
-
-[runner.go:222-253](runner.go): "last-resort truncation" triggers when system prompts + compressed context + large tool results push past the model's hard limit. The new `estimatePromptOverhead` in `prepareMemory` accounts for fixed overhead tokens, so this path should now only fire when tool results are unexpectedly large. Still a valid safety net.
-
----
-
-### `team.go` — Handoff hint retry for forgetful models
-
-[team.go](team.go): Agent has handoff tools but doesn't use them → retry with hardcoded prompt. Root cause in the model, not the framework.
-
----
-
-### `runner.go` — Fragile history dedup
-
-[runner.go:148-149](runner.go): `appendMemory(input)` → `Recent()` → strip last `RoleUser` message. If concurrent access inserts another user message between Append and Recent, wrong message is removed.
-
----
-
-### `guard/llm/guard.go` — Substring matching for safety verdict
-
-[guard/llm/guard.go](guard/llm/guard.go): Looking for `"allowed": false` and `"allowed": true` as substrings in a lowercased string. Can produce false positives on edge cases.
-
----
-
-## 💣 Technical Debt
-
-### [DEBT] `runner.go:58-403` — Monolithic `run()` loop
-
-[runner.go](runner.go): The entire 8-node mainline loop is one function (~400 lines). Unit testing individual stages impossible without mocking the entire loop. File ~1383 lines total (grew with subagent + two-phase executeTools + estimatePromptOverhead).
-
----
-
-### [DEBT] `prompt.go:34` — `PromptBuilder` is a function type, not an interface
-
-[prompt.go](prompt.go): `type PromptBuilder func(context.Context, PromptInput) ([]Message, error)`. Cannot add methods. Zero value panics.
-
----
-
-### [DEBT] `memory.go:62-66` — `ThroughIndex` zero value semantically overloaded
-
-[memory.go](memory.go): `ThroughIndex = 0` means either "never compressed" or "first compaction covered 0 messages." With the summarizer now implemented (summarizer/llm.go), the distinction matters more.
-
----
-
-### [DEBT] `runner.go` — `prepareMemory` `overflow` variable semantic confusion
-
-[runner.go](runner.go): `overflow` starts as `len(msgs)`, becomes a keep-from index, expanded by `SafeCompressionBoundary`, then used as both compaction cutoff AND trim keep-point.
-
----
-
-### [DEBT] `agent.go` — `RunGoal`: goal text duplicated in prompt
-
-[agent.go](agent.go): Goal injected into system instructions AND passed as first `UserMessage(goal)`. Same text appears twice.
-
----
-
-### [DEBT] `team.go` — Lock-release-external-relock TOCTOU pattern
-
-[team.go](team.go): Each window has explicit nil/orphan checks, but the pattern is fragile throughout.
-
----
-
-### [DEBT] `router.go` — `containsWord` is `strings.Contains`, no word-boundary matching
-
-[router.go](router.go): `"I don't think billing is appropriate"` matches agent `"billing"`.
-
----
-
-### [DEBT] `session.go` — `Session` passed by value, mutations invisible to caller
-
-[session.go](session.go): Runner sets `session.Turn = turn` on a struct copy. Caller never sees updated turn count.
-
----
-
-### [DEBT] Pervasive silent error suppression
-
-Errors discarded without logging:
-
-| File | What's lost |
-|------|-------------|
-| [rest/team_memory.go](rest/team_memory.go) | `Recent()` errors from shared/private memory |
-| [rest/team_memory.go](rest/team_memory.go) | `Count()` errors |
-| [memory/file/memory.go](memory/file/memory.go) | Corrupt JSON lines silently skipped |
-| [memory/sqlite/memory.go](memory/sqlite/memory.go) | Vector scan row errors silently skipped |
-| [runner.go](runner.go) | `Memory.Compact()` errors → silent budget overflow |
-
----
-
-### [DEBT] Hardcoded `/bin/bash` — not portable
-
-[tool/shell.go](tool/shell.go) and [sandbox/native/native_linux.go](sandbox/native/native_linux.go): Breaks on NixOS, Alpine, macOS.
-
----
-
-### [DEBT] `memory/file/memory.go` — Scanner buffer initialized with length 0
-
-[memory/file/memory.go:292](memory/file/memory.go#L292): `scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)` — `bufio.Scanner` ignores 0-length buffer and allocates its own.
-
----
-
-### [DEBT] Sandbox disabled by default — credential mounting unresolved when enabled
-
-[sandbox/native/native_linux.go](sandbox/native/native_linux.go):
-`bwrapArgs()` does not mount `$HOME` or credential directories (`~/.hcloud`, `~/.aws`, `~/.kube`, `~/.config/gcloud`, `~/.docker`). When the sandbox is enabled via `--sandbox`, cloud CLIs inside bwrap cannot read auth configs. Workaround: use `readable_paths` in `settings.json`, or fix bwrap to mount credential dirs automatically. Additionally, bwrap requires setuid or `newuidmap` to function on this host — without them it silently falls back to unconfined execution.
-
----
-
-## Legend
-
-| Tag | Meaning |
-|-----|---------|
-| `P0` | Critical — data loss, API contract violation, resource leak |
-| `P1` | High — incorrect behavior in common scenarios |
-| `P2` | Medium — incorrect behavior in edge cases |
-| `P3` | Low — cosmetic or harmless |
-| `DEBT` | Technical debt — will compound as codebase grows |
+## [P3] 低
+
+- `acp/server.go:2299-2305`（同 B8 先例之外）其余字节截断点：`truncate`（provider/openviking/client.go:226-231）、`extractor_llm.go:213` recallQuery `c[:200]`、`:132` 日志 `raw[:300]`、`extractor_llm.go:149` `len(content) < 12` 按字节。
+- `truncateTokens`（kernel/prompt.go:143-156）O(n²)（每加一个 rune 全量 BPE）且硬编码 "gpt-4" cl100k（CJK 超计 ~60%）。
+- `checkHandoff`（kernel/run.go:310-319）对被拒绝/失败的工具也生效——transfer_to_ 被拒仍以 "handoff" 结束本轮，模型无法重试。
+- 子代理 approver 构造时捕获而非运行时解析（kernel/as_tool.go:72）——SetHumanApprover 中途切换后旧子代理工具持旧 approver。
+- 硬窗口检查（kernel/run.go:143-150）未预留输出 token——prompt 恰好等于窗口时 provider 拒绝。
+- modelcall.go:127-132 稀疏 tool-call index：`len(map)` 是条目数而非最大 index，不连续 index 的调用被静默丢弃。
+- `baseURL` 字符串拼接遇尾斜杠双斜杠（provider/openviking/client.go:87-90）。
