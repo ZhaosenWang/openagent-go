@@ -63,6 +63,14 @@ func detectVersion(binaryPath string) (string, error) {
 // (a cached "terraform" could be any stale version) and hc-install
 // fetches the latest release directly.
 func Install(ctx context.Context, ver string, mirrors []string, destDir string) (string, error) {
+	// Absolute destDir — a relative path (e.g. when $HOME is unset and
+	// UserHomeDir returns "") would install the binary relative to the
+	// process cwd and fail at exec time with a confusing fork/exec error.
+	abs, err := filepath.Abs(destDir)
+	if err != nil {
+		return "", fmt.Errorf("resolve install dir: %w", err)
+	}
+	destDir = abs
 	if err := os.MkdirAll(destDir, 0755); err != nil {
 		return "", fmt.Errorf("create install dir: %w", err)
 	}

@@ -1,4 +1,4 @@
-// iac-server is a cloud IaC MCP server. It exposes 11 tools over
+// iac-server is a cloud IaC MCP server. It exposes the deployment tools over
 // MCP stdio so any MCP client (Claude Code, opencode, Cursor, openagent) can
 // plan, update, estimate cost, apply, troubleshoot, and destroy cloud
 // infrastructure, and query existing cloud resources/bills.
@@ -194,12 +194,17 @@ func main() {
 		ProviderMirrors: providerMirrors,
 		PluginCacheDir:  pluginCacheDir,
 	}
-	prewarmStart := time.Now()
-	if err := iac.PrewarmProviderCache(ctx, prewarmCfg, cloud.ProviderSource(), lockPath); err != nil {
-		slog.Warn("terraform provider prewarm failed (first deploy init will download on demand)", "error", err)
-	} else {
-		slog.Info("terraform provider prewarmed", "source", cloud.ProviderSource(), "lock", lockPath, "elapsed", time.Since(prewarmStart).Round(time.Millisecond))
-	}
+	// Prewarm runs in the background so startup (and the MCP initialize
+	// handshake) is not blocked — first deploy init downloads on demand
+	// if the prewarm has not finished yet.
+	go func() {
+		prewarmStart := time.Now()
+		if err := iac.PrewarmProviderCache(ctx, prewarmCfg, cloud.ProviderSource(), lockPath); err != nil {
+			slog.Warn("terraform provider prewarm failed (first deploy init will download on demand)", "error", err)
+		} else {
+			slog.Info("terraform provider prewarmed", "source", cloud.ProviderSource(), "lock", lockPath, "elapsed", time.Since(prewarmStart).Round(time.Millisecond))
+		}
+	}()
 	tools := iacmcp.NewTools(iacmcp.Config{
 		Planner:         planner,
 		Cloud:           cloud,

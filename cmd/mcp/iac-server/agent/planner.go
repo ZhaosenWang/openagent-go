@@ -48,6 +48,8 @@ type Planner struct {
 	binaryMirrors   []string // terraform binary download mirrors
 	providerMirrors []string // provider download mirrors
 	pluginCacheDir  string   // shared provider plugin cache (TF_PLUGIN_CACHE_DIR)
+	jobs            *JobManager  // async job execution (per-deployment serialized)
+	jobObs          *jobObserver // streams model output into job logs
 }
 
 // New creates a Planner. workDir should be the cloud home directory
@@ -69,12 +71,40 @@ func New(model openagent.Model, cloud provider.CloudProvider, loader skill.Provi
 		binaryMirrors:   binaryMirrors,
 		providerMirrors: providerMirrors,
 		pluginCacheDir:  pluginCacheDir,
+		jobs:            NewJobManager(filepath.Join(workDir, "jobs")),
+		jobObs:          &jobObserver{},
 	}
 }
 
 // sessionID returns the Memory session key for a deployment.
 func sessionID(deploymentID string) string {
 	return "dep-" + deploymentID
+}
+
+// ctxProgress returns the progress callback from ctx, or a no-op when none
+// is present. The MCP layer only injects a ProgressFunc when the client
+// supplied a progressToken — a client that omits it must not crash the
+// agent, so the no-op guard is mandatory.
+func ctxProgress(ctx context.Context) openagent.ProgressFunc {
+	p := openagent.ProgressFromContext(ctx)
+	if p == nil {
+		return func(string, float64, float64) {}
+	}
+	return p
+}
+
+// SubmitJob runs fn as an async job and returns the job id immediately.
+// Same-deployment jobs serialize; fn's ctx has the 15-min deadline and a
+// progress callback that writes to the job file. The mcp layer wraps the
+// long-running Planner methods with this.
+func (p *Planner) SubmitJob(ctx context.Context, deploymentID, tool string, fn func(ctx context.Context) (string, error)) (string, error) {
+	return p.jobs.Submit(ctx, deploymentID, tool, fn)
+}
+
+// GetJob returns the current state of an async job (nil if unknown).
+// wait > 0 long-polls until completion or timeout.
+func (p *Planner) GetJob(ctx context.Context, id string, wait time.Duration) (*Job, error) {
+	return p.jobs.Get(ctx, id, wait)
 }
 
 // planResult is the JSON returned by propose/specify need_input flows.
@@ -94,7 +124,7 @@ const serverContext = `You are the server-side LLM of an MCP server (iac-server)
 
 ## Your role
 - You run on the SERVER side. You never talk to the end user directly.
-- The MCP CLIENT (e.g. Claude Code, Cursor, openagent) calls one of the 11 MCP tools and forwards the user's request to you.
+- The MCP CLIENT (e.g. Claude Code, Cursor, openagent) calls the MCP tools and forwards the user's request to you.
 - Your output is returned to the client as the tool result. The client then decides what to show the user and whether to proceed.
 - You do NOT need user approval for any action — approval is the client's concern, not yours.
 
@@ -133,7 +163,7 @@ Return ONLY valid JSON as specified by each tool's instructions. Do not wrap in 
 // services, and reasoning. If information is incomplete, returns questions.
 // The user confirms the architecture before calling specify_resources.
 func (p *Planner) ProposeArchitecture(ctx context.Context, request string) (string, error) {
-	progress := openagent.ProgressFromContext(ctx)
+	progress := ctxProgress(ctx)
 
 	// Pre-allocate the deployment ID so all subsequent steps share the same
 	// Memory session and deployment directory.
@@ -173,7 +203,8 @@ Return JSON:
 		SessionStore:   p.memory,
 		Compressor:     ctxpkg.CompressorOf(p.memory),
 		MemoryProvider: p.knowledge,
-		Hooks:          openagent.MultiHooks(sloghooks.New(slog.Default()), newProgressHook()),
+		Observer:       p.jobObs,
+		Hooks:          sloghooks.New(slog.Default()),
 	})
 
 	progress("Analyzing deployment request...", 1, 2)
@@ -269,7 +300,7 @@ Return JSON:
 //
 // The user confirms the resources before calling generate_terraform_plan.
 func (p *Planner) SpecifyResources(ctx context.Context, deploymentID string, answers []string, adjustments string) (string, error) {
-	progress := openagent.ProgressFromContext(ctx)
+	progress := ctxProgress(ctx)
 
 	dir := filepath.Join(p.deploymentsDir, deploymentID)
 	dag, err := loadDag(dir)
@@ -309,7 +340,8 @@ or, when you need more input:
 		Compressor:     ctxpkg.CompressorOf(p.memory),
 		MemoryProvider: p.knowledge,
 		SkillProvider:  p.loader,
-		Hooks:          openagent.MultiHooks(sloghooks.New(slog.Default()), newProgressHook()),
+		Observer:       p.jobObs,
+		Hooks:          sloghooks.New(slog.Default()),
 	})
 
 	progress("Determining resource specs...", 1, 3)
@@ -455,7 +487,7 @@ or, when you need more input:
 //
 // The user reviews the plan preview before calling estimate_cost.
 func (p *Planner) GenerateTerraformPlan(ctx context.Context, deploymentID string) (string, error) {
-	progress := openagent.ProgressFromContext(ctx)
+	progress := ctxProgress(ctx)
 
 	dir := filepath.Join(p.deploymentsDir, deploymentID)
 	dag, err := loadDag(dir)
@@ -495,7 +527,8 @@ Return JSON:
 		SessionStore:   p.memory,
 		Compressor:     ctxpkg.CompressorOf(p.memory),
 		MemoryProvider: p.knowledge,
-		Hooks:          openagent.MultiHooks(sloghooks.New(slog.Default()), newProgressHook()),
+		Observer:       p.jobObs,
+		Hooks:          sloghooks.New(slog.Default()),
 	})
 
 	session := openagent.Session{ID: sessionID(deploymentID)}
@@ -654,7 +687,7 @@ Fix the .tf files and return the corrected versions as JSON:
 // cost_estimated — apply_deployment gates on the marker, so this MUST be
 // called (again after any change) before apply.
 func (p *Planner) EstimateCost(ctx context.Context, deploymentID, pricingMode string) (string, error) {
-	progress := openagent.ProgressFromContext(ctx)
+	progress := ctxProgress(ctx)
 
 	dir := filepath.Join(p.deploymentsDir, deploymentID)
 
@@ -708,7 +741,8 @@ Return JSON:
 		SessionStore:   p.memory,
 		Compressor:     ctxpkg.CompressorOf(p.memory),
 		MemoryProvider: p.knowledge,
-		Hooks:          openagent.MultiHooks(sloghooks.New(slog.Default()), newProgressHook()),
+		Observer:       p.jobObs,
+		Hooks:          sloghooks.New(slog.Default()),
 	})
 
 	dagStr, err := dagInput(dag)
@@ -774,7 +808,7 @@ Return JSON:
 // The LLM loads the troubleshoot skill, browses examples for correct
 // patterns, and searches the web for error solutions.
 func (p *Planner) Troubleshoot(ctx context.Context, deploymentID, errorMsg string) (string, error) {
-	progress := openagent.ProgressFromContext(ctx)
+	progress := ctxProgress(ctx)
 
 	dir := filepath.Join(p.deploymentsDir, deploymentID)
 
@@ -806,7 +840,8 @@ Return JSON:
 		SessionStore:   p.memory,
 		Compressor:     ctxpkg.CompressorOf(p.memory),
 		MemoryProvider: p.knowledge,
-		Hooks:          openagent.MultiHooks(sloghooks.New(slog.Default()), newProgressHook()),
+		Observer:       p.jobObs,
+		Hooks:          sloghooks.New(slog.Default()),
 	})
 
 	// user message = dynamic content (error + .tf file path + .tf files)
@@ -848,7 +883,7 @@ Return JSON:
 // loading (SkillProvider) — the LLM sees the skill catalog and calls
 // load_skill to load the relevant cloud-service skill on demand.
 func (p *Planner) QueryCloud(ctx context.Context, query string) (string, error) {
-	progress := openagent.ProgressFromContext(ctx)
+	progress := ctxProgress(ctx)
 
 	progress("Setting up query agent...", 0, 2)
 	cfg := agent.New("iac-queryer",
@@ -871,7 +906,8 @@ Return JSON:
 		Compressor:     ctxpkg.CompressorOf(p.memory),
 		MemoryProvider: p.knowledge,
 		SkillProvider:  p.loader,
-		Hooks:          openagent.MultiHooks(sloghooks.New(slog.Default()), newProgressHook()),
+		Observer:       p.jobObs,
+		Hooks:          sloghooks.New(slog.Default()),
 	})
 
 	session := openagent.Session{ID: "query"}

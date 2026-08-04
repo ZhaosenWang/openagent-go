@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	openagent "github.com/yusheng-g/openagent-go"
 	"github.com/yusheng-g/openagent-go/cmd/mcp/iac-server/agent"
@@ -49,7 +50,15 @@ func NewTools(cfg Config) []openagent.Tool {
 		&listDeploymentsTool{cfg: cfg},
 		&queryCloudTool{cfg: cfg},
 		&updateDeploymentTool{cfg: cfg},
+		&getJobResultTool{cfg: cfg},
 	}
+}
+
+// jobStarted renders the immediate response of an async tool call: the
+// client polls get_job_result with the returned job_id.
+func jobStarted(jobID, tool string) *openagent.ToolResult {
+	content := fmt.Sprintf(`{"job_id": %q, "status": "started", "tool": %q, "hint": "call get_job_result with job_id to poll for completion (wait_seconds up to 60 to block)"}`, jobID, tool)
+	return &openagent.ToolResult{Content: content}
 }
 
 // workDir returns the workspace path for a deployment ID.
@@ -92,7 +101,7 @@ type proposeArchitectureTool struct{ cfg Config }
 func (t *proposeArchitectureTool) Definition() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
 		Name:        "propose_architecture",
-		Description: "Step 1 of deployment: Analyze a deployment request and recommend a cloud architecture. Returns architecture name, required services, reasoning, and a deployment_id. Does NOT write .tf files. The user should confirm the architecture before calling specify_resources.",
+		Description: "Step 1 of deployment: Analyze a deployment request and recommend a cloud architecture. Returns architecture name, required services, reasoning, and a deployment_id. Does NOT write .tf files. The user should confirm the architecture before calling specify_resources." + " ASYNC: returns immediately with a job_id — call get_job_result(job_id, wait_seconds=25) to poll for the result.",
 		Parameters:  openagent.SchemaOf[ProposeArchitectureParams](),
 	}
 }
@@ -102,11 +111,13 @@ func (t *proposeArchitectureTool) Execute(ctx context.Context, args json.RawMess
 	if err != nil {
 		return openagent.ErrorResult(fmt.Errorf("propose_architecture: %w", err), false, "")
 	}
-	out, err := t.cfg.Planner.ProposeArchitecture(ctx, params.Request)
+	jobID, err := t.cfg.Planner.SubmitJob(ctx, "", "propose_architecture", func(ctx context.Context) (string, error) {
+		return t.cfg.Planner.ProposeArchitecture(ctx, params.Request)
+	})
 	if err != nil {
 		return openagent.ErrorResult(err, false, "")
 	}
-	return &openagent.ToolResult{Content: out}
+	return jobStarted(jobID, "propose_architecture")
 }
 
 // ── specify_resources ──
@@ -116,7 +127,7 @@ type specifyResourcesTool struct{ cfg Config }
 func (t *specifyResourcesTool) Definition() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
 		Name:        "specify_resources",
-		Description: "Step 2 of deployment: Determine concrete resource specs (flavor, image, disk, CIDR, etc.) for each node of the DAG from propose_architecture. Queries available specs via cloud APIs. If too many choices or missing info, returns status need_input with questions — call again with answers filled in. Optional adjustments let the user modify specs. The user should confirm the resources before calling generate_terraform_plan.",
+		Description: "Step 2 of deployment: Determine concrete resource specs (flavor, image, disk, CIDR, etc.) for each node of the DAG from propose_architecture. Queries available specs via cloud APIs. If too many choices or missing info, returns status need_input with questions — call again with answers filled in. Optional adjustments let the user modify specs. The user should confirm the resources before calling generate_terraform_plan." + " ASYNC: returns immediately with a job_id — call get_job_result(job_id, wait_seconds=25) to poll for the result.",
 		Parameters:  openagent.SchemaOf[SpecifyResourcesParams](),
 	}
 }
@@ -129,11 +140,13 @@ func (t *specifyResourcesTool) Execute(ctx context.Context, args json.RawMessage
 	if !validDeploymentID(params.DeploymentID) {
 		return openagent.ErrorResult(fmt.Errorf("specify_resources: invalid deployment_id %q", params.DeploymentID), false, "")
 	}
-	out, err := t.cfg.Planner.SpecifyResources(ctx, params.DeploymentID, params.Answers, params.Adjustments)
+	jobID, err := t.cfg.Planner.SubmitJob(ctx, params.DeploymentID, "specify_resources", func(ctx context.Context) (string, error) {
+		return t.cfg.Planner.SpecifyResources(ctx, params.DeploymentID, params.Answers, params.Adjustments)
+	})
 	if err != nil {
 		return openagent.ErrorResult(err, false, "")
 	}
-	return &openagent.ToolResult{Content: out}
+	return jobStarted(jobID, "specify_resources")
 }
 
 // ── generate_terraform_plan ──
@@ -143,7 +156,7 @@ type generateTerraformPlanTool struct{ cfg Config }
 func (t *generateTerraformPlanTool) Definition() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
 		Name:        "generate_terraform_plan",
-		Description: "Step 3 of deployment: Write .tf files from the deployment DAG (nodes = resources with confirmed specs, edges = dependencies), then run terraform init + plan. Returns the .tf files and a plan preview. Requires specify_resources to have completed. The user should review the plan before calling estimate_cost.",
+		Description: "Step 3 of deployment: Write .tf files from the deployment DAG (nodes = resources with confirmed specs, edges = dependencies), then run terraform init + plan. Returns the .tf files and a plan preview. Requires specify_resources to have completed. The user should review the plan before calling estimate_cost." + " ASYNC: returns immediately with a job_id — call get_job_result(job_id, wait_seconds=25) to poll for the result.",
 		Parameters:  openagent.SchemaOf[GenerateTerraformPlanParams](),
 	}
 }
@@ -156,11 +169,13 @@ func (t *generateTerraformPlanTool) Execute(ctx context.Context, args json.RawMe
 	if !validDeploymentID(params.DeploymentID) {
 		return openagent.ErrorResult(fmt.Errorf("generate_terraform_plan: invalid deployment_id %q", params.DeploymentID), false, "")
 	}
-	out, err := t.cfg.Planner.GenerateTerraformPlan(ctx, params.DeploymentID)
+	jobID, err := t.cfg.Planner.SubmitJob(ctx, params.DeploymentID, "generate_terraform_plan", func(ctx context.Context) (string, error) {
+		return t.cfg.Planner.GenerateTerraformPlan(ctx, params.DeploymentID)
+	})
 	if err != nil {
 		return openagent.ErrorResult(err, false, "")
 	}
-	return &openagent.ToolResult{Content: out}
+	return jobStarted(jobID, "generate_terraform_plan")
 }
 
 // ── update_deployment ──
@@ -170,7 +185,7 @@ type updateDeploymentTool struct{ cfg Config }
 func (t *updateDeploymentTool) Definition() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
 		Name:        "update_deployment",
-		Description: "Modify an existing deployment. Re-runs specify_resources (with user answers/adjustments) and generate_terraform_plan. Use this when the user wants to adjust an existing deployment (e.g. \"change ECS flavor to s6.xlarge.2\"). Returns the updated plan with the same deployment_id. The previous cost estimate is invalidated — call estimate_cost again before apply_deployment.",
+		Description: "Modify an existing deployment. Re-runs specify_resources (with user answers/adjustments) and generate_terraform_plan. Use this when the user wants to adjust an existing deployment (e.g. \"change ECS flavor to s6.xlarge.2\"). Returns the updated plan with the same deployment_id. The previous cost estimate is invalidated — call estimate_cost again before apply_deployment." + " ASYNC: returns immediately with a job_id — call get_job_result(job_id, wait_seconds=25) to poll for the result.",
 		Parameters:  openagent.SchemaOf[UpdateDeploymentParams](),
 	}
 }
@@ -183,11 +198,13 @@ func (t *updateDeploymentTool) Execute(ctx context.Context, args json.RawMessage
 	if !validDeploymentID(params.DeploymentID) {
 		return openagent.ErrorResult(fmt.Errorf("update_deployment: invalid deployment_id %q", params.DeploymentID), false, "")
 	}
-	out, err := t.cfg.Planner.UpdateDeployment(ctx, params.DeploymentID, params.Answers, params.ChangeRequest)
+	jobID, err := t.cfg.Planner.SubmitJob(ctx, params.DeploymentID, "update_deployment", func(ctx context.Context) (string, error) {
+		return t.cfg.Planner.UpdateDeployment(ctx, params.DeploymentID, params.Answers, params.ChangeRequest)
+	})
 	if err != nil {
 		return openagent.ErrorResult(err, false, "")
 	}
-	return &openagent.ToolResult{Content: out}
+	return jobStarted(jobID, "update_deployment")
 }
 
 // ── estimate_cost ──
@@ -197,7 +214,7 @@ type estimateCostTool struct{ cfg Config }
 func (t *estimateCostTool) Definition() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
 		Name:        "estimate_cost",
-		Description: "Step 4 of deployment: Estimate the cost of a PLANNED deployment (resources not yet created) from the deployment DAG. MUST be called after generate_terraform_plan (and after any update_deployment) and before apply_deployment — apply is rejected without it. pricing_mode: \"on-demand\" (按需) or \"monthly\" (包月); if the user did not state a preference, omit it. This forecasts FUTURE costs — it does NOT query past billing. For existing bills/costs, use query_cloud.",
+		Description: "Step 4 of deployment: Estimate the cost of a PLANNED deployment (resources not yet created) from the deployment DAG. MUST be called after generate_terraform_plan (and after any update_deployment) and before apply_deployment — apply is rejected without it. pricing_mode: \"on-demand\" (按需) or \"monthly\" (包月); if the user did not state a preference, omit it. This forecasts FUTURE costs — it does NOT query past billing. For existing bills/costs, use query_cloud." + " ASYNC: returns immediately with a job_id — call get_job_result(job_id, wait_seconds=25) to poll for the result.",
 		Parameters:  openagent.SchemaOf[EstimateCostParams](),
 	}
 }
@@ -210,11 +227,13 @@ func (t *estimateCostTool) Execute(ctx context.Context, args json.RawMessage) *o
 	if !validDeploymentID(params.DeploymentID) {
 		return openagent.ErrorResult(fmt.Errorf("estimate_cost: invalid deployment_id %q", params.DeploymentID), false, "")
 	}
-	out, err := t.cfg.Planner.EstimateCost(ctx, params.DeploymentID, params.PricingMode)
+	jobID, err := t.cfg.Planner.SubmitJob(ctx, params.DeploymentID, "estimate_cost", func(ctx context.Context) (string, error) {
+		return t.cfg.Planner.EstimateCost(ctx, params.DeploymentID, params.PricingMode)
+	})
 	if err != nil {
 		return openagent.ErrorResult(err, false, "")
 	}
-	return &openagent.ToolResult{Content: out}
+	return jobStarted(jobID, "estimate_cost")
 }
 
 // ── troubleshoot_deployment ──
@@ -224,7 +243,7 @@ type troubleshootDeploymentTool struct{ cfg Config }
 func (t *troubleshootDeploymentTool) Definition() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
 		Name:        "troubleshoot_deployment",
-		Description: "Diagnose a deployment error and suggest fixes. Reads the .tf files and error message, researches solutions via examples and web search, and returns a diagnosis with recommended actions.",
+		Description: "Diagnose a deployment error and suggest fixes. Reads the .tf files and error message, researches solutions via examples and web search, and returns a diagnosis with recommended actions." + " ASYNC: returns immediately with a job_id — call get_job_result(job_id, wait_seconds=25) to poll for the result.",
 		Parameters:  openagent.SchemaOf[TroubleshootParams](),
 	}
 }
@@ -237,11 +256,13 @@ func (t *troubleshootDeploymentTool) Execute(ctx context.Context, args json.RawM
 	if !validDeploymentID(params.DeploymentID) {
 		return openagent.ErrorResult(fmt.Errorf("troubleshoot_deployment: invalid deployment_id %q", params.DeploymentID), false, "")
 	}
-	out, err := t.cfg.Planner.Troubleshoot(ctx, params.DeploymentID, params.Error)
+	jobID, err := t.cfg.Planner.SubmitJob(ctx, params.DeploymentID, "troubleshoot_deployment", func(ctx context.Context) (string, error) {
+		return t.cfg.Planner.Troubleshoot(ctx, params.DeploymentID, params.Error)
+	})
 	if err != nil {
 		return openagent.ErrorResult(err, false, "")
 	}
-	return &openagent.ToolResult{Content: out}
+	return jobStarted(jobID, "troubleshoot_deployment")
 }
 
 // ── apply_deployment ──
@@ -401,7 +422,7 @@ type queryCloudTool struct{ cfg Config }
 func (t *queryCloudTool) Definition() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
 		Name:        "query_cloud",
-		Description: "Query EXISTING cloud resources, specs, bills, costs, or quotas. Use this for any read-only query about the current cloud account state — e.g. \"list all ECS instances\", \"what specs does s6.large.2 have\", \"how much did I spend this month\", \"show my bills for 2025-07\". This queries real cloud APIs for already-existing resources and past billing data. Does NOT modify any resources. For estimating FUTURE costs of a planned deployment, use estimate_cost.",
+		Description: "Query EXISTING cloud resources, specs, bills, costs, or quotas. Use this for any read-only query about the current cloud account state — e.g. \"list all ECS instances\", \"what specs does s6.large.2 have\", \"how much did I spend this month\", \"show my bills for 2025-07\". This queries real cloud APIs for already-existing resources and past billing data. Does NOT modify any resources. For estimating FUTURE costs of a planned deployment, use estimate_cost." + " ASYNC: returns immediately with a job_id — call get_job_result(job_id, wait_seconds=25) to poll for the result.",
 		Parameters:  openagent.SchemaOf[QueryCloudParams](),
 	}
 }
@@ -411,11 +432,53 @@ func (t *queryCloudTool) Execute(ctx context.Context, args json.RawMessage) *ope
 	if err != nil {
 		return openagent.ErrorResult(fmt.Errorf("query_cloud: %w", err), false, "")
 	}
-	out, err := t.cfg.Planner.QueryCloud(ctx, params.Query)
+	jobID, err := t.cfg.Planner.SubmitJob(ctx, "", "query_cloud", func(ctx context.Context) (string, error) {
+		return t.cfg.Planner.QueryCloud(ctx, params.Query)
+	})
 	if err != nil {
 		return openagent.ErrorResult(err, false, "")
 	}
-	return &openagent.ToolResult{Content: out}
+	return jobStarted(jobID, "query_cloud")
+}
+
+// ── get_job_result ──
+
+type getJobResultTool struct{ cfg Config }
+
+func (t *getJobResultTool) Definition() openagent.FunctionDefinition {
+	return openagent.FunctionDefinition{
+		Name: "get_job_result",
+		Description: "Poll the result of an async job started by propose_architecture, specify_resources, generate_terraform_plan, " +
+			"update_deployment, estimate_cost, troubleshoot_deployment, or query_cloud. " +
+			"Those tools return immediately with a job_id; call this with that job_id to retrieve the outcome. " +
+			"Returns {status: \"running\"|\"done\"|\"failed\", progress_msg, outputs (the server LLM text), result, error}. " +
+			"wait_seconds (0-60) blocks up to that long and returns as soon as the job finishes — " +
+			"pass a value comfortably below your client's tool-call timeout to poll efficiently.",
+		Parameters: openagent.SchemaOf[GetJobResultParams](),
+	}
+}
+
+func (t *getJobResultTool) Execute(ctx context.Context, args json.RawMessage) *openagent.ToolResult {
+	params, err := openagent.ParseArgs[GetJobResultParams](args)
+	if err != nil {
+		return openagent.ErrorResult(fmt.Errorf("get_job_result: %w", err), false, "")
+	}
+	wait := time.Duration(params.WaitSeconds) * time.Second
+	if wait < 0 || wait > 60*time.Second {
+		return openagent.ErrorResult(fmt.Errorf("get_job_result: wait_seconds must be 0-60"), false, "")
+	}
+	job, err := t.cfg.Planner.GetJob(ctx, params.JobID, wait)
+	if err != nil {
+		return openagent.ErrorResult(fmt.Errorf("get_job_result: %w", err), false, "")
+	}
+	if job == nil {
+		return openagent.ErrorResult(fmt.Errorf("get_job_result: unknown job %q", params.JobID), false, "")
+	}
+	data, err := json.Marshal(job)
+	if err != nil {
+		return openagent.ErrorResult(fmt.Errorf("get_job_result: marshal: %w", err), false, "")
+	}
+	return &openagent.ToolResult{Content: string(data), JSON: data}
 }
 
 // ── list_deployments ──
@@ -527,6 +590,12 @@ type DestroyDeploymentParams struct {
 // GetDeploymentStatusParams are the arguments to get_deployment_status.
 type GetDeploymentStatusParams struct {
 	DeploymentID string `json:"deployment_id" jsonschema:"description=Deployment ID to check"`
+}
+
+// GetJobResultParams are the arguments to get_job_result.
+type GetJobResultParams struct {
+	JobID       string `json:"job_id" jsonschema:"description=Job ID returned by an async tool call"`
+	WaitSeconds int    `json:"wait_seconds,omitempty" jsonschema:"description=Block up to this many seconds (0-60) and return as soon as the job finishes; 0 returns immediately"`
 }
 
 // QueryCloudParams are the arguments to query_cloud.
