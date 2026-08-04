@@ -115,6 +115,9 @@ func (c *Client) doJSON(ctx context.Context, method, path string, query url.Valu
 	if env.Error != nil {
 		return &apiError{StatusCode: resp.StatusCode, Code: env.Error.Code, Message: env.Error.Message}
 	}
+	if env.Status != "" && env.Status != "ok" {
+		return &apiError{StatusCode: resp.StatusCode, Code: env.Status, Message: truncate(string(data), 200)}
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return &apiError{StatusCode: resp.StatusCode, Message: truncate(string(data), 200)}
 	}
