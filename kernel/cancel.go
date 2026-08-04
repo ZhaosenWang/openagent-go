@@ -10,11 +10,29 @@ import (
 
 // cancelCompensation persists unresolved tool results when the run is
 // cancelled mid-execution, so a restarted session sees what was in flight.
-// It uses context.Background() deliberately: the run context is cancelled
-// and the compensation write must still complete.
+// It uses context.Background() deliberately — for BOTH the store write and
+// the event sends: the run context is cancelled, and if the events were
+// sent with it, chSend's select would randomly drop them (ctx.Done() is
+// already closed and races the buffered send), so the client would never
+// see the compensation or the terminal aborted event.
 func (rt *Runtime) cancelCompensation(ctx context.Context, session openagent.Session, workingMessages []openagent.Message, ch chan<- openagent.StreamEvent) {
+	// Event sends carry a bounded deadline instead of an unbounded
+	// background send: the consumer goroutine is NOT guaranteed to be
+	// alive — REST returns its drain loop on r.Context().Done() (client
+	// disconnect) before the run finishes cancelling, and a full channel
+	// with a dead consumer would block forever. The store write below is
+	// the durable contract; the events are best-effort on top.
+	sendComp := func(ev openagent.StreamEvent) {
+		if ch == nil {
+			return
+		}
+		select {
+		case ch <- ev:
+		case <-time.After(5 * time.Second):
+		}
+	}
 	if rt.deps.SessionStore == nil {
-		chSend(ctx, ch, openagent.StreamEvent{Type: openagent.StreamAborted, Error: ctx.Err()})
+		sendComp(openagent.StreamEvent{Type: openagent.StreamAborted, Error: ctx.Err()})
 		return
 	}
 	// Find assistant tool_calls in the working set whose results are missing
@@ -39,15 +57,18 @@ func (rt *Runtime) cancelCompensation(ctx context.Context, session openagent.Ses
 				Content:    "cancelled by user",
 			}
 			start := time.Now()
-			rt.observe(ctx, openagent.StageMemoryAppend, "enter", nil, time.Time{}, nil)
+			rt.observe(context.Background(), openagent.StageMemoryAppend, "enter", nil, time.Time{}, nil)
 			err := rt.deps.SessionStore.Append(context.Background(), session.ID, msg)
-			rt.observe(ctx, openagent.StageMemoryAppend, "leave", nil, start, err)
+			rt.observe(context.Background(), openagent.StageMemoryAppend, "leave", map[string]any{
+				"role":  string(msg.Role),
+				"chars": len([]rune(msg.Content)),
+			}, start, err)
 			if err != nil {
 				slog.Error("openagent: cancel compensation append failed", "error", err)
 			}
-			chSend(ctx, ch, openagent.StreamEvent{Type: openagent.StreamToolResult, Message: msg})
+			sendComp(openagent.StreamEvent{Type: openagent.StreamToolResult, Message: msg})
 			covered[tc.ID] = true
 		}
 	}
-	chSend(ctx, ch, openagent.StreamEvent{Type: openagent.StreamAborted, Error: ctx.Err()})
+	sendComp(openagent.StreamEvent{Type: openagent.StreamAborted, Error: ctx.Err()})
 }

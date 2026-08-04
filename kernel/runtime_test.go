@@ -489,3 +489,119 @@ func TestBuiltinToolsMountedOnce(t *testing.T) {
 		t.Fatalf("recall mounted %d times after 2 runs, want 1 (duplicate tool names)", got)
 	}
 }
+
+// ── cancel-path persistence ──
+
+// memStore is a minimal in-memory SessionStore for cancel-path tests.
+type memStore struct {
+	mu   sync.Mutex
+	msgs []openagent.Message
+}
+
+func (m *memStore) Append(_ context.Context, _ string, msg openagent.Message) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.msgs = append(m.msgs, msg)
+	return nil
+}
+func (m *memStore) Recent(_ context.Context, _ string, n, _ int) ([]openagent.Message, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if n > len(m.msgs) {
+		n = len(m.msgs)
+	}
+	out := make([]openagent.Message, n)
+	copy(out, m.msgs[len(m.msgs)-n:])
+	return out, nil
+}
+func (m *memStore) RecentAfter(_ context.Context, _ string, throughIndex, n int) ([]openagent.Message, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if throughIndex >= len(m.msgs) || n <= 0 {
+		return nil, nil
+	}
+	end := throughIndex + n
+	if end > len(m.msgs) {
+		end = len(m.msgs)
+	}
+	out := make([]openagent.Message, end-throughIndex)
+	copy(out, m.msgs[throughIndex:end])
+	return out, nil
+}
+func (m *memStore) Count(_ context.Context, _ string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.msgs), nil
+}
+func (m *memStore) DeleteSession(_ context.Context, _ string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.msgs = nil
+	return nil
+}
+
+// A streaming tool cancelled mid-flight must persist a CANCELLED (error)
+// result, not a truncated "success": the cancelled run commits with a
+// background ctx (B1) and the model would otherwise read the partial
+// output as a complete result next turn. This covers BOTH cancellation
+// patterns — a ctx-respecting tool closing its stream early (the
+// streamingTestTool pattern) and a blocking tool reaching toolCtx.Done().
+//
+// The tool must still be RUNNING when the cancel lands: progress events
+// are rate-limited to 1/sec, so with a fast tool the first progress
+// event arrives after the tool already finished (a success result is
+// then correct, not a cancellation). 5 chunks × 300ms keeps the tool in
+// flight past the first progress flush.
+func TestStreamCancellationPersistsErrorResult(t *testing.T) {
+	streamTool := &streamingTestTool{
+		name:   "slow_tool",
+		chunks: []string{"start", "middle", "end", "more", "tail"},
+		delay:  300 * time.Millisecond,
+	}
+	model := &fakeModelWithToolCall{
+		toolName: "slow_tool",
+		toolArgs: `{}`,
+		callID:   "call_cancel",
+	}
+	store := &memStore{}
+	cfg := agent.New("test",
+		agent.WithModel(model),
+		agent.WithMaxTurns(1),
+	)
+	rt := New(cfg, Deps{Tools: []openagent.Tool{streamTool}, SessionStore: store})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch := rt.RunStream(ctx, openagent.Session{ID: "test"}, openagent.UserMessage("go"))
+
+	var sawAborted bool
+	for evt := range ch {
+		if evt.Type == openagent.StreamToolProgress {
+			cancel()
+		}
+		if evt.Type == openagent.StreamAborted {
+			sawAborted = true
+		}
+	}
+	if !sawAborted {
+		t.Fatal("expected StreamAborted after cancel")
+	}
+
+	// The persisted tool result must carry the cancellation error.
+	msgs, err := store.Recent(context.Background(), "test", 10, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range msgs {
+		if m.Role == openagent.RoleTool && m.ToolCallID == "call_cancel" {
+			if m.Result == nil || m.Result.Error == nil {
+				t.Fatalf("cancelled tool result persisted as success: %+v", m)
+			}
+			if m.Result.Error.Code != "cancelled" {
+				t.Fatalf("error code = %q, want cancelled", m.Result.Error.Code)
+			}
+			return
+		}
+	}
+	t.Fatalf("no tool result persisted for call_cancel: %+v", msgs)
+}

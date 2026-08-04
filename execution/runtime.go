@@ -130,9 +130,14 @@ func (e *ExecutionRuntime) executeOnce(ctx context.Context, session openagent.Se
 	if rc.Builtin {
 		if h := e.builtinHandler(call.Function.Name); h != nil {
 			tc := e.fireToolHooks(toolCtx, rc.Def, args)
+			var result *openagent.ToolResult
+			// Pair the leave + OnToolEnd even if the builtin handler
+			// panics (job goroutine recovers above) — see executeOnce.
+			defer func() {
+				e.fireToolHooksEnd(toolCtx, rc.Def, args, result, tc)
+			}()
 			msg := h(toolCtx, session, call, ch)
-			result := &openagent.ToolResult{Content: msg.Content}
-			e.fireToolHooksEnd(toolCtx, rc.Def, args, result, tc)
+			result = &openagent.ToolResult{Content: msg.Content}
 			msg.Content = result.Content
 			msg.Result = result
 			return msg
@@ -156,6 +161,12 @@ func (e *ExecutionRuntime) executeOnce(ctx context.Context, session openagent.Se
 	teStart := time.Now()
 	e.observe(toolCtx, openagent.StageToolExecute, "enter", map[string]any{"tool": call.Function.Name}, time.Time{}, nil)
 	var result *openagent.ToolResult
+	// Pair the leave even when the tool panics (recovered by the job
+	// goroutine above executeOnce) — a dangling enter reads as a stuck
+	// tool to observers. result.AsError() is nil-safe.
+	defer func() {
+		e.observe(ctx, openagent.StageToolExecute, "leave", toolResultDetail(call.Function.Name, result), teStart, result.AsError())
+	}()
 
 	// ── Streaming path (optional interface) ──
 	// Streaming tools run only when the parent run is itself streaming
@@ -164,50 +175,84 @@ func (e *ExecutionRuntime) executeOnce(ctx context.Context, session openagent.Se
 	// result (e.g. the sub-agent streams deltas then the final answer).
 	if se, ok := rc.Tool.(openagent.StreamExecutor); ok && ch != nil {
 		toolCh := se.ExecuteStream(toolCtx, args)
-		var buf strings.Builder
-		// Rate-limit progress events (1/sec) to avoid flooding the channel.
-		ticker := time.NewTicker(time.Second)
-		defer ticker.Stop()
-		var pending string
-		flush := func() {
-			if pending != "" && ch != nil {
+		if toolCh == nil {
+			// Broken tool contract: a nil channel is never ready in a
+			// select, so the loop below would spin on the ticker forever
+			// — the run hangs silently. Fail explicitly instead.
+			result = openagent.ErrorResult(fmt.Errorf("tool %q: ExecuteStream returned a nil channel", call.Function.Name), false, "")
+		} else {
+			var buf strings.Builder
+			// Rate-limit progress events (1/sec) to avoid flooding the channel.
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			var pending string
+			flush := func() {
+				if pending != "" && ch != nil {
+					select {
+					case ch <- openagent.StreamEvent{Type: openagent.StreamToolProgress, Text: pending, ToolCallID: call.ID}:
+					case <-toolCtx.Done():
+					}
+					pending = ""
+				}
+			}
+			done := false
+			cancelled := false
+			for !done {
 				select {
-				case ch <- openagent.StreamEvent{Type: openagent.StreamToolProgress, Text: pending, ToolCallID: call.ID}:
+				case chunk, ok := <-toolCh:
+					if !ok {
+						done = true
+						// A ctx-respecting streaming tool closes its channel
+						// early on cancellation (the common pattern) — the
+						// channel close, not toolCtx.Done(), is what the loop
+						// sees. toolCtx.Err() is only non-nil on real
+						// cancellation (job.Cancel / parent ctx): the job
+						// does NOT cancel toolCtx on normal completion.
+						if toolCtx.Err() != nil {
+							cancelled = true
+						}
+					} else if chunk.Error != nil {
+						result = openagent.ErrorResult(chunk.Error, false, "")
+						done = true
+					} else {
+						buf.WriteString(chunk.Content)
+						pending += chunk.Content
+					}
+				case <-ticker.C:
+					flush()
 				case <-toolCtx.Done():
+					flush()
+					done = true
+					cancelled = true
 				}
-				pending = ""
 			}
-		}
-		done := false
-		for !done {
-			select {
-			case chunk, ok := <-toolCh:
-				if !ok {
-					done = true
-				} else if chunk.Error != nil {
-					result = openagent.ErrorResult(chunk.Error, false, "")
-					done = true
+			flush()
+			if result == nil {
+				if cancelled {
+					// Cancelled mid-stream (run cancel / job cancel): the
+					// partial content is already on the wire as progress
+					// events, but the RESULT must not read as a successful
+					// completion — the kernel persists it (cancelled runs
+					// commit with a background ctx) and the model would
+					// otherwise see a truncated "success" next turn. Same
+					// semantics as the blocking path, where a ctx-aware tool
+					// returns a cancellation error.
+					result = &openagent.ToolResult{
+						Content: buf.String(),
+						Error: &openagent.ToolError{
+							Message: "tool execution cancelled",
+							Code:    "cancelled",
+						},
+					}
 				} else {
-					buf.WriteString(chunk.Content)
-					pending += chunk.Content
+					result = &openagent.ToolResult{Content: buf.String()}
 				}
-			case <-ticker.C:
-				flush()
-			case <-toolCtx.Done():
-				flush()
-				done = true
 			}
-		}
-		flush()
-		if result == nil {
-			result = &openagent.ToolResult{Content: buf.String()}
 		}
 	} else {
 		// ── Blocking path (default) ──
 		result = rc.Tool.Execute(toolCtx, args)
 	}
-
-	e.observe(ctx, openagent.StageToolExecute, "leave", map[string]any{"tool": call.Function.Name}, teStart, result.AsError())
 
 	if e.cfg.Hooks != nil {
 		e.cfg.Hooks.OnToolEnd(toolCtx, rc.Def, args, result, toolHookState)
@@ -262,10 +307,31 @@ func (e *ExecutionRuntime) fireToolHooks(ctx context.Context, def openagent.Func
 }
 
 func (e *ExecutionRuntime) fireToolHooksEnd(ctx context.Context, def openagent.FunctionDefinition, args json.RawMessage, result *openagent.ToolResult, tc toolHookCtx) {
-	e.observe(ctx, openagent.StageToolExecute, "leave", map[string]any{"tool": def.Name}, tc.start, result.AsError())
+	e.observe(ctx, openagent.StageToolExecute, "leave", toolResultDetail(def.Name, result), tc.start, result.AsError())
 	if e.cfg.Hooks != nil {
 		e.cfg.Hooks.OnToolEnd(ctx, def, args, result, tc.hookState)
 	}
+}
+
+// toolResultDetail builds the tool.execute leave detail: metadata only
+// (success/error code, size, truncation, artifact) — never the content.
+func toolResultDetail(name string, result *openagent.ToolResult) map[string]any {
+	detail := map[string]any{"tool": name}
+	if result == nil {
+		detail["ok"] = false
+		return detail // panic or nil result — no payload to summarize
+	}
+	detail["ok"] = result.Error == nil
+	if result.Error != nil {
+		detail["error_code"] = result.Error.Code
+		detail["retryable"] = result.Error.Retryable
+	}
+	detail["chars"] = len([]rune(result.Content))
+	detail["truncated"] = result.Truncated
+	if result.FileRef != "" {
+		detail["file_ref"] = result.FileRef
+	}
+	return detail
 }
 
 func (e *ExecutionRuntime) observe(ctx context.Context, stage, phase string, detail map[string]any, start time.Time, err error) {

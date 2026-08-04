@@ -39,6 +39,28 @@ func (rt *Runtime) prepareMemory(ctx context.Context, session openagent.Session)
 	if rt.deps.SessionStore == nil {
 		return nil, ci, nil
 	}
+	// enter/leave pair for the memory-fetch stage (leave duration covers
+	// compaction + working-set trim; the detail reports the fetch window —
+	// total stored messages vs the post-summary increment actually read —
+	// plus the compaction outcome of this pass).
+	var (
+		totalCount int
+		from       int
+		msgs       []openagent.Message
+		err        error
+	)
+	start := time.Now()
+	rt.observe(ctx, openagent.StageMemoryFetch, "enter", nil, time.Time{}, nil)
+	defer func() {
+		rt.observe(ctx, openagent.StageMemoryFetch, "leave", map[string]any{
+			"total":     totalCount,
+			"from":      from,
+			"fetched":   len(msgs),
+			"compacted": ci.count, // messages newly covered by the summary
+			"comp_from": ci.from,  // global index range of the new summary
+			"comp_to":   ci.to,    // (exclusive end of the range)
+		}, start, err)
+	}()
 
 	// ── Load any existing summary unconditionally ──
 	// Manual compaction (/compact) can leave a session whose remaining
@@ -74,20 +96,18 @@ func (rt *Runtime) prepareMemory(ctx context.Context, session openagent.Session)
 	// (no 5000 cap: the overflow scan below must see every un-summarized
 	// message to decide the boundary, and the head can no longer fall
 	// outside the fetch window).
-	totalCount, err := rt.deps.SessionStore.Count(ctx, session.ID)
+	totalCount, err = rt.deps.SessionStore.Count(ctx, session.ID)
 	if err != nil {
-		rt.observe(ctx, openagent.StageMemoryFetch, "leave",
-			map[string]any{"error": err.Error()}, time.Now(), err)
 		return nil, ci, err
 	}
 	if totalCount == 0 {
 		return nil, ci, nil
 	}
-	from := 0
+	from = 0
 	if ci.compressed != nil {
 		from = ci.compressed.ThroughIndex
 	}
-	msgs, err := rt.deps.SessionStore.RecentAfter(ctx, session.ID, from, totalCount-from)
+	msgs, err = rt.deps.SessionStore.RecentAfter(ctx, session.ID, from, totalCount-from)
 	if err != nil || len(msgs) == 0 {
 		return nil, ci, err
 	}

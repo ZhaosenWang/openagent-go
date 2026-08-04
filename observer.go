@@ -40,6 +40,13 @@ type StageEvent struct {
 // Unlike RunHooks which observes agent/tool lifecycles, RunObserver observes
 // every stage inside the 8-node loop — memory fetch, prompt build, guard checks,
 // model calls, tool execution, and memory append.
+//
+// Concurrency contract: implementations MUST be safe for concurrent use.
+// StageToolExecute events are emitted from the tool job goroutines (parallel
+// tools), everything else from the run goroutine — events from different
+// stages can interleave arbitrarily. "enter"/"leave" pairs are guaranteed
+// within a stage (even when the stage body panics), but leave may arrive
+// after a later stage's enter when the body runs on a job goroutine.
 type RunObserver interface {
 	ObserveStage(ctx context.Context, event StageEvent)
 }

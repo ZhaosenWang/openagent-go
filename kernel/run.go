@@ -49,7 +49,14 @@ func (rt *Runtime) run(ctx context.Context, session openagent.Session, prefix []
 	// Guard.in BEFORE persisting the input: a blocked input must never
 	// reach the store — it would be re-read into the model's context next
 	// turn (same principle as the guard.out comment below).
-	if ok, msg := rt.guardInput(ctx, input); !ok {
+	gStart := time.Now()
+	rt.observe(ctx, openagent.StageGuardIn, "enter", nil, time.Time{}, nil)
+	ok, msg := rt.guardInput(ctx, input)
+	// The block reason rides in Err for blocked runs (observers read
+	// Err.Message); allowed is structured so aggregators can count
+	// pass/block without parsing error strings.
+	rt.observe(ctx, openagent.StageGuardIn, "leave", map[string]any{"allowed": ok}, gStart, msg)
+	if !ok {
 		return nil, msg
 	}
 
@@ -126,7 +133,19 @@ func (rt *Runtime) run(ctx context.Context, session openagent.Session, prefix []
 
 		// ② Prompt build — consumes the AgentContext (v2.0: Context is the
 		// agent input; the kernel never assembles prompt fragments itself).
+		pStart := time.Now()
+		rt.observe(ctx, openagent.StagePromptBuild, "enter", nil, time.Time{}, nil)
 		prompt, err := rt.buildPrompt(ctx, session, ac)
+		// Composition counts (skills/memories/resources) let observers
+		// attribute prompt growth to a context source without inspecting
+		// the content.
+		rt.observe(ctx, openagent.StagePromptBuild, "leave", map[string]any{
+			"messages":  len(prompt),
+			"tokens":    openagent.CountMessages(openagent.TokenizerModelID(rt.runModel), prompt),
+			"skills":    len(ac.Skills),
+			"memories":  len(ac.Memories),
+			"resources": len(ac.Resources),
+		}, pStart, err)
 		if err != nil {
 			slog.Error("openagent: prompt build failed", "error", err)
 			chSend(ctx, ch, openagent.StreamEvent{Type: openagent.StreamError, Error: err})
@@ -150,8 +169,39 @@ func (rt *Runtime) run(ctx context.Context, session openagent.Session, prefix []
 		req := rt.buildModelRequest(session, prompt)
 		lastReq = req
 
-		// ④ Model call.
-		resp, err := rt.callModel(ctx, req, ch)
+		// ④ Model call. The stage wraps the whole call — retries and
+		// streaming included — so the observed duration is the real
+		// model latency of the turn.
+		mStart := time.Now()
+		rt.observe(ctx, openagent.StageModelCall, "enter", map[string]any{"model": req.Model}, time.Time{}, nil)
+		resp, retries, err := rt.callModel(ctx, req, ch)
+		mDetail := map[string]any{"model": req.Model, "retries": retries}
+		if resp != nil {
+			mDetail["choices"] = len(resp.Choices)
+			if len(resp.Choices) > 0 {
+				if fr := resp.Choices[0].FinishReason; fr != "" {
+					mDetail["finish_reason"] = fr
+				}
+				mDetail["tool_calls"] = len(resp.Choices[0].Message.ToolCalls)
+				// The full model output is observation data — observers
+				// are read-only (unlike hooks which mutate), so no
+				// truncation here; consumers filter as they see fit.
+				if content := resp.Choices[0].Message.Content; content != "" {
+					mDetail["content_chars"] = len([]rune(content))
+					mDetail["content"] = content
+				}
+				if rc := resp.Choices[0].Message.ReasoningContent; rc != "" {
+					mDetail["reasoning_chars"] = len([]rune(rc))
+				}
+			}
+			if u := resp.Usage; u.TotalTokens > 0 {
+				mDetail["total_tokens"] = u.TotalTokens
+				mDetail["prompt_tokens"] = u.PromptTokens
+				mDetail["completion_tokens"] = u.CompletionTokens
+				mDetail["cache_read_tokens"] = u.CacheReadTokens
+			}
+		}
+		rt.observe(ctx, openagent.StageModelCall, "leave", mDetail, mStart, err)
 		if err != nil {
 			if ctx.Err() != nil {
 				chSend(ctx, ch, openagent.StreamEvent{Type: openagent.StreamAborted, Error: ctx.Err()})
@@ -177,7 +227,13 @@ func (rt *Runtime) run(ctx context.Context, session openagent.Session, prefix []
 		// model's context next turn), the result, or the tool-call event.
 		// (Live-streamed text deltas are already on the wire and cannot be
 		// recalled — the guard governs what is stored and reused.)
-		if blocked, reason, tripwire := rt.guardOutput(ctx, choice); blocked {
+		goStart := time.Now()
+		rt.observe(ctx, openagent.StageGuardOut, "enter", map[string]any{"target": "model"}, time.Time{}, nil)
+		blocked, reason, tripwire := rt.guardOutput(ctx, choice)
+		// reason + tripwire are structured for security auditing: which
+		// rule blocked (or tripped) the output.
+		rt.observe(ctx, openagent.StageGuardOut, "leave", map[string]any{"target": "model", "blocked": blocked, "reason": reason, "tripwire": tripwire}, goStart, nil)
+		if blocked {
 			if tripwire {
 				return nil, fmt.Errorf("output guard tripwire: %s", reason)
 			}
@@ -207,7 +263,13 @@ func (rt *Runtime) run(ctx context.Context, session openagent.Session, prefix []
 		// ⑥⑦ Tool execution (approval + concurrent execution).
 		results := rt.executeTools(ctx, session, choice.ToolCalls, ch)
 		for _, r := range results {
-			if blocked, reason, tripwire := rt.guardOutput(ctx, r); blocked {
+			// Guard.out on each tool result (same per-item granularity as
+			// tool.execute).
+			goStart := time.Now()
+			rt.observe(ctx, openagent.StageGuardOut, "enter", map[string]any{"target": "tool"}, time.Time{}, nil)
+			blocked, reason, tripwire := rt.guardOutput(ctx, r)
+			rt.observe(ctx, openagent.StageGuardOut, "leave", map[string]any{"target": "tool", "blocked": blocked, "reason": reason, "tripwire": tripwire}, goStart, nil)
+			if blocked {
 				if tripwire {
 					return nil, fmt.Errorf("output guard tripwire on tool result: %s", reason)
 				}
@@ -224,6 +286,17 @@ func (rt *Runtime) run(ctx context.Context, session openagent.Session, prefix []
 			result.StopReason = "handoff"
 			break
 		}
+	}
+
+	// The turn loop can end while the run was cancelled during the LAST
+	// turn's tool execution — the loop-top cancellation check (and its
+	// compensation) never runs again. Surface the cancellation instead of
+	// reporting a normal completion: StreamDone below would otherwise be
+	// randomly dropped (cancelled ctx) and the client never sees a
+	// terminal event.
+	if ctx.Err() != nil {
+		rt.cancelCompensation(ctx, session, workingMessages, ch)
+		return nil, ctx.Err()
 	}
 
 	result.ContextWindow = rt.runModel.ContextWindow()
@@ -322,11 +395,19 @@ func (rt *Runtime) observe(ctx context.Context, stage string, phase string, deta
 	if rt.deps.Observer == nil {
 		return
 	}
+	// "enter" events pass a zero start (callers mark the start separately
+	// and pass it to the matching "leave"). time.Since(zero) is ~1.7e9
+	// years — a nonsense duration that observers must ignore today; make
+	// it explicit zero instead so nothing has to special-case enter.
+	d := time.Duration(0)
+	if !start.IsZero() {
+		d = time.Since(start)
+	}
 	rt.deps.Observer.ObserveStage(ctx, openagent.StageEvent{
 		Name:     stage,
 		Phase:    phase,
 		Detail:   detail,
-		Duration: time.Since(start),
+		Duration: d,
 		Err:      err,
 	})
 }
@@ -352,7 +433,12 @@ func (rt *Runtime) commit(ctx context.Context, session openagent.Session, msg op
 	start := time.Now()
 	rt.observe(ctx, openagent.StageMemoryAppend, "enter", nil, time.Time{}, nil)
 	err := rt.deps.SessionStore.Append(ctx, session.ID, msg)
-	rt.observe(ctx, openagent.StageMemoryAppend, "leave", nil, start, err)
+	// Metadata only (role + size), never the content: the audit trail
+	// must show WHAT was written without duplicating the payload.
+	rt.observe(ctx, openagent.StageMemoryAppend, "leave", map[string]any{
+		"role":  string(msg.Role),
+		"chars": len([]rune(msg.Content)),
+	}, start, err)
 	if err != nil {
 		slog.Error("openagent: memory append failed", "error", err)
 	}

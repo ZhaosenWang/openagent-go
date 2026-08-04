@@ -10,8 +10,11 @@ import (
 )
 
 // callModel calls the model with streaming preferred, retrying on
-// transient (RetryableError) failures with exponential backoff.
-func (rt *Runtime) callModel(ctx context.Context, req openagent.ChatCompletionRequest, ch chan<- openagent.StreamEvent) (*openagent.ChatCompletionResponse, error) {
+// transient (RetryableError) failures with exponential backoff. The
+// returned retries is the number of attempts before success (0 = first
+// try) — surfaced to the model.call stage detail so observers can track
+// provider reliability without counting StreamRetrying events.
+func (rt *Runtime) callModel(ctx context.Context, req openagent.ChatCompletionRequest, ch chan<- openagent.StreamEvent) (*openagent.ChatCompletionResponse, int, error) {
 	const maxRetries = 3
 	var lastErr error
 
@@ -26,21 +29,21 @@ func (rt *Runtime) callModel(ctx context.Context, req openagent.ChatCompletionRe
 			select {
 			case <-time.After(backoff):
 			case <-ctx.Done():
-				return nil, ctx.Err()
+				return nil, attempt, ctx.Err()
 			}
 		}
 
 		resp, err := rt.callModelOnce(ctx, req, ch)
 		if err == nil {
-			return resp, nil
+			return resp, attempt, nil
 		}
 		var re *openagent.RetryableError
 		if !errors.As(err, &re) {
-			return nil, err
+			return nil, attempt, err
 		}
 		lastErr = err
 	}
-	return nil, fmt.Errorf("max retries exceeded: %w", lastErr)
+	return nil, maxRetries, fmt.Errorf("max retries exceeded: %w", lastErr)
 }
 
 // callModelOnce tries streaming first, falls back to non-streaming.
