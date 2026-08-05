@@ -47,6 +47,25 @@ func registerSettings(mux *http.ServeMux, mgr FeishuChannel) {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"saved": true})
 	})
+	// Clear the feishu credentials — the frontend "re-register" flow is
+	// DELETE + POST /connect (with no credentials left, connect runs QR
+	// registration). A running connection keeps working until the next
+	// connect (credentials and connection are separate).
+	mux.HandleFunc("DELETE /api/settings/channels/feishu", func(w http.ResponseWriter, r *http.Request) {
+		if mgr == nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "feishu channel not configured"})
+			return
+		}
+		if err := mgr.ClearCredentials(); err != nil {
+			if errors.Is(err, ErrFeishuRegistrationInFlight) {
+				writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+				return
+			}
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"cleared": true})
+	})
 }
 
 // maskSecret masks a secret for display: "****" + last 4 chars (or

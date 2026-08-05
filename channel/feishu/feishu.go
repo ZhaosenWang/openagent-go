@@ -37,6 +37,10 @@ type Channel struct {
 	// manager to flip its status from connecting → connected.
 	onReady        func()
 	onReconnecting func()
+	// onError is invoked by the SDK on every connection failure (including
+	// failed reconnects). Used by the manager to surface first-connect
+	// failures (e.g. bad credentials) instead of a silent reconnect loop.
+	onError func(err error)
 }
 
 // New returns a Feishu Channel. The Channel must be started via Start() to
@@ -52,6 +56,10 @@ func (c *Channel) SetOnReady(f func()) { c.onReady = f }
 // SetOnReconnecting registers the reconnecting callback (nil clears it).
 // Fired when the SDK loses the connection and starts auto-reconnecting.
 func (c *Channel) SetOnReconnecting(f func()) { c.onReconnecting = f }
+
+// SetOnError registers the connection-error callback (nil clears it).
+// Fired on every failed connection attempt, including reconnects.
+func (c *Channel) SetOnError(f func(err error)) { c.onError = f }
 
 // Name implements channel.Channel.
 func (c *Channel) Name() string { return "feishu" }
@@ -87,6 +95,9 @@ func (c *Channel) Start(ctx context.Context, handler channel.MessageHandler) err
 	}
 	if c.onReconnecting != nil {
 		c.ws.SetOnReconnecting(c.onReconnecting)
+	}
+	if c.onError != nil {
+		c.ws.SetOnError(c.onError)
 	}
 
 	return c.ws.Start(ctx)

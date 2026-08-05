@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -177,6 +178,13 @@ func (m *FeishuManager) ConnectAsync(onQR func(url string, expireIn int)) (bool,
 			slog.Error("feishu: registration failed", "error", rerr)
 			return
 		}
+		// Register the new credentials in the in-memory copy BEFORE the
+		// connection check: a Disconnect may abandon the connection
+		// (stopping), but the credentials are valid regardless — a later
+		// connect must reuse them instead of forcing another scan.
+		m.mu.Lock()
+		m.feishuCfg = &config.FeishuConfig{AppID: reg.AppID, AppSecret: reg.AppSecret}
+		m.mu.Unlock()
 		// startConnection runs the disconnect checkpoint atomically with
 		// its field replacement — a Disconnect that landed while the user
 		// scanned (the SDK registration cannot always be aborted
@@ -218,11 +226,13 @@ func (m *FeishuManager) startConnection(lock *ChannelLock, creds FeishuCredentia
 		// or the connection is permanently lost; the SDK reconnects on
 		// transient failures internally.
 		ch := feishu.New(creds.AppID, creds.AppSecret)
+		everReady := false
 		ch.SetOnReady(func() {
 			// The SDK flips to ready after the WebSocket connects (and
 			// after every reconnect) — this is the only place the
 			// connected state is observable, since Start() blocks for
 			// the whole connection lifetime.
+			everReady = true
 			now := time.Now()
 			m.setStatus(clirest.FeishuStatus{Phase: clirest.FeishuConnected, AppID: creds.AppID, ConnectedAt: &now})
 		})
@@ -231,6 +241,16 @@ func (m *FeishuManager) startConnection(lock *ChannelLock, creds FeishuCredentia
 			// see "connecting" (not a stale "connected") while the SDK
 			// is re-establishing the WebSocket.
 			m.setStatus(clirest.FeishuStatus{Phase: clirest.FeishuConnecting, AppID: creds.AppID})
+		})
+		ch.SetOnError(func(err error) {
+			// Never connected successfully (bad credentials, bootstrap
+			// rejection): surface the failure instead of the SDK's silent
+			// auto-reconnect loop, which would keep the status stuck on
+			// "connecting" forever. Once ready, transient reconnect
+			// failures keep "connecting" (the SDK is retrying).
+			if !everReady {
+				m.setStatus(clirest.FeishuStatus{Phase: clirest.FeishuDisconnected, AppID: creds.AppID, LastError: err.Error()})
+			}
 		})
 		err := ch.Start(connCtx, feishuMessageHandler(m.cfg, m.deps))
 		lock.Release()
@@ -249,6 +269,43 @@ func (m *FeishuManager) startConnection(lock *ChannelLock, creds FeishuCredentia
 // profile's channel dir so the frontend can re-fetch it after a refresh.
 func (m *FeishuManager) QR() (url, imgBase64 string) {
 	return loadFeishuQR(m.profiles)
+}
+
+// ClearCredentials removes the feishu credentials: the settings.json
+// channels.feishu key (all other settings fields preserved) and the
+// in-memory copy. A running connection keeps working with the old
+// credentials until the next connect — credentials and connection are
+// separate. The frontend's "re-register" flow is clear + connect (the
+// connect then has no credentials and runs QR registration).
+func (m *FeishuManager) ClearCredentials() error {
+	m.mu.Lock()
+	registering := m.status.Phase == clirest.FeishuRegistering
+	m.mu.Unlock()
+	if registering {
+		return clirest.ErrFeishuRegistrationInFlight
+	}
+	err := config.UpdateSettings(func(raw map[string]json.RawMessage) error {
+		channels := map[string]json.RawMessage{}
+		if c, ok := raw["channels"]; ok {
+			if uerr := json.Unmarshal(c, &channels); uerr != nil {
+				return fmt.Errorf("feishu: parse settings channels: %w", uerr)
+			}
+		}
+		delete(channels, "feishu")
+		if len(channels) == 0 {
+			delete(raw, "channels") // no channels left — drop the key
+		} else {
+			raw["channels"], _ = json.Marshal(channels)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.feishuCfg = nil
+	m.mu.Unlock()
+	return nil
 }
 
 // Disconnect tears down the feishu connection and WAITS for the

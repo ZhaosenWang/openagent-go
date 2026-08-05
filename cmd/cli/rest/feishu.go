@@ -69,6 +69,13 @@ type FeishuChannel interface {
 	// and applies them to the in-memory copy (next connect uses them).
 	SetCredentials(appID, appSecret string) error
 
+	// ClearCredentials removes the feishu credentials from settings.json
+	// and the in-memory copy. A running connection keeps working with the
+	// old credentials until the next connect; a subsequent POST /connect
+	// then runs the QR registration flow (frontend "re-register" = clear
+	// + connect).
+	ClearCredentials() error
+
 	// QR returns the cached registration QR (URL + base64 PNG image);
 	// empty strings when no registration is in flight.
 	QR() (url, imgBase64 string)

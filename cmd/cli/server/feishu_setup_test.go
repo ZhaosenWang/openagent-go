@@ -1,11 +1,14 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
+
+	"github.com/yusheng-g/openagent-go/kernel"
 )
 
 // isolateSettings points the settings file at a temp directory via
@@ -117,5 +120,58 @@ func TestSaveFeishuToSettingsConcurrent(t *testing.T) {
 	}
 	if !json.Valid(raw) {
 		t.Fatalf("settings corrupt after concurrent saves: %s", raw)
+	}
+}
+
+// ClearCredentials removes channels.feishu while preserving every other
+// settings field (and drops the channels key when nothing remains).
+func TestClearCredentialsPreservesOtherFields(t *testing.T) {
+	p := isolateSettings(t)
+	existing := map[string]any{
+		"provider": map[string]any{"openai": map[string]any{"api_key": "sk-old"}},
+		"channels": map[string]any{
+			"feishu": map[string]string{"app_id": "cli_old", "app_secret": "secret_old"},
+			"slack":  map[string]string{"token": "xoxb"},
+		},
+	}
+	data, _ := json.MarshalIndent(existing, "", "  ")
+	if err := os.WriteFile(p, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := saveFeishuToSettings("cli_new", "secret_new"); err != nil {
+		t.Fatal(err)
+	}
+	// Now clear via the manager path used by the DELETE endpoint.
+	m := NewFeishuManager(context.Background(), ".openagent/profile", nil, nil, kernel.Deps{})
+	if err := m.ClearCredentials(); err != nil {
+		t.Fatal(err)
+	}
+	if id, _ := m.Credentials(); id != "" {
+		t.Fatalf("in-memory credentials not cleared: %q", id)
+	}
+
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("settings corrupt: %v", err)
+	}
+	// feishu gone, slack preserved.
+	var channels map[string]json.RawMessage
+	if err := json.Unmarshal(got["channels"], &channels); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := channels["feishu"]; ok {
+		t.Fatal("channels.feishu not removed")
+	}
+	if _, ok := channels["slack"]; !ok {
+		t.Fatal("channels.slack lost")
+	}
+	// Unrelated fields survive.
+	if !json.Valid(got["provider"]) {
+		t.Fatal("provider mangled")
 	}
 }

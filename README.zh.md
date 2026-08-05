@@ -151,8 +151,9 @@ export BOCHA_API_KEY=<你的-key>   # 在 https://open.bochaai.com 获取
 | `POST /api/channels/feishu/disconnect` | 断开连接（释放机器锁）；之后 `POST /connect` 重新建立 |
 | `GET /api/settings/channels/feishu` | 飞书配置（`app_id`、脱敏 `app_secret`）——secret 绝不完整出服务端 |
 | `PUT /api/settings/channels/feishu` | 保存飞书配置（`{app_id, app_secret}`，secret 留空 = 保持原值）——写入 settings.json，下次连接生效 |
+| `DELETE /api/settings/channels/feishu` | 清除飞书凭据（运行中的连接继续用旧凭据直到下次连接）——"重新注册"流程 = DELETE + `POST /connect`（此时无凭据，走扫码注册） |
 
-**配置与连接分离**：`PUT /api/settings/channels/feishu` 只保存（持久化到 settings.json 的 `channels.feishu`，并更新运行中服务的内存配置）；让新值生效是前端的显式两步——`POST /disconnect` + `POST /connect`（断开后的 connect 不会被"已连接"短路）。settings.json 是唯一凭据源：手写配置、界面提交、扫码注册产物都落在这里。前端流程：加载 → `GET status` → 显示状态 → "连接"按钮（扫码注册）或配置表单（`GET/PUT /api/settings/channels/feishu`）→ 轮询 `status` 直到 `connected`。
+**配置与连接分离**：`PUT /api/settings/channels/feishu` 只保存（持久化到 settings.json 的 `channels.feishu`，并更新运行中服务的内存配置）；让新值生效是前端的显式两步——`POST /disconnect` + `POST /connect`（断开后的 connect 不会被"已连接"短路）。settings.json 是唯一凭据源：手写配置、界面提交、扫码注册产物都落在这里。前端流程：加载 → `GET status` → 显示状态 → "连接"按钮（扫码注册）、配置表单（`GET/PUT/DELETE /api/settings/channels/feishu`）、或凭据失败时"重新注册"（DELETE + connect）→ 轮询 `status` 直到 `connected`。
 
 **每个 profile 单实例：** 一个飞书 app = 一个活跃 WebSocket。服务在连接期间持有机器级锁（`$profile/channel/feishu/feishu.lock`）——第二个 `--channel feishu` 实例会快速失败报错，而不是静默抢走事件。进程死亡时锁由内核自动释放。生产部署建议用 systemd/Docker 托管进程（及其连接）。
 
