@@ -143,7 +143,7 @@ func applyContextProviders(cfg *config.Config, deps *kernel.Deps) error {
 	if cfg.OpenViking.Endpoint == "" {
 		return nil
 	}
-	client, err := openviking.NewClient(cfg.OpenViking.Endpoint)
+	client, err := openviking.NewClient(cfg.OpenViking.Endpoint, cfg.OpenViking.APIKey)
 	if err != nil {
 		return fmt.Errorf("openviking: %w", err)
 	}

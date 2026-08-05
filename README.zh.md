@@ -171,6 +171,33 @@ MCP 工具在启动时即可用，每次工具调用以卡片形式展示在飞�
 所有字段都是可选的。默认值：`~/.openagent/logs/openagent.log`，10 MB 轮转，保留 5 个备份，info 级别。
 单位是 MB。日志同时输出到 stderr 和文件。设为 `"debug"` 可查看每次 API 请求详情。
 
+### OpenViking 集成
+
+OpenViking 是一个上下文数据库，提供服务端记忆、技能和资源管理。配置 endpoint 后，三个域均从本地存储切换到 OpenViking 服务端 — 一个地址即可。
+
+```json
+{
+  "openviking": {
+    "endpoint": "http://127.0.0.1:1933",
+    "api_key": "ov-xxxxxxxxxxxx"
+  }
+}
+```
+
+- `endpoint` — OpenViking 服务端地址。必填，留空则不启用。
+- `api_key` — Bearer token，以 `Authorization: Bearer <key>` 发送。可选；留空 = 不认证（仅限 dev 模式）。
+
+若部分域仍使用本地存储，其余使用 OpenViking：
+
+```json
+{
+  "openviking": { "endpoint": "http://127.0.0.1:1933", "api_key": "ov-xxx" },
+  "context_providers": { "memory": "builtin" }
+}
+```
+
+`context_providers` 对 `memory`、`skill`、`resource` 各域可设为 `"builtin"` 或 `"openviking"`。留空 = 跟随 endpoint 默认值。
+
 ## 架构
 
 ```
