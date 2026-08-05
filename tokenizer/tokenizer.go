@@ -68,8 +68,20 @@ func ForModel(modelID string) *tiktoken.Tiktoken {
 	return tke
 }
 
+// sampleLimit is the byte size above which Count switches from a full BPE
+// encode to a sampled estimate. Full BPE is O(n) with a huge constant
+// (~72µs/byte in tiktoken-go): counting a 4MB tool result would take
+// minutes, which the result policy's truncation decision cannot afford.
+// BPE token density is stable within one text, so extrapolating from the
+// first sampleLimit bytes is accurate to a few percent — plenty for
+// budget/threshold decisions. A var (not const) so tests can shrink it.
+var sampleLimit = 8 * 1024
+
 // Count returns the token count for text using the tokenizer appropriate
 // for the given model ID. Returns 0 for empty strings.
+//
+// Texts longer than sampleLimit are counted by sampling the head and
+// extrapolating linearly (density-stable; ~1-3% error).
 //
 // If the tokenizer cannot be loaded (e.g. no network for downloading encoder
 // files on first use), it falls back to a heuristic (~4 chars per token for
@@ -93,7 +105,14 @@ func Count(modelID, text string) (n int) {
 			n = heuristicCount(text)
 		}
 	}()
-	return len(tke.EncodeOrdinary(text))
+	if len(text) <= sampleLimit {
+		return len(tke.EncodeOrdinary(text))
+	}
+	// Sampled estimate for large texts. A byte-sliced sample may split a
+	// UTF-8 rune at the boundary — tiktoken treats the broken tail as a
+	// replacement char, a sub-token error that is negligible here.
+	sample := tke.EncodeOrdinary(text[:sampleLimit])
+	return int(float64(len(sample)) * float64(len(text)) / float64(sampleLimit))
 }
 
 // heuristicCount is a fast fallback (~4 chars/token, conservative for CJK).
