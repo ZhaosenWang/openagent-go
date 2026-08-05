@@ -40,12 +40,15 @@ openagent-go/
 ├── agent/        Agent configuration (pure): Agent, options, Team, Router
 ├── kernel/       Runtime engine: 8-node loop, Runtime + Deps, per-node methods
 ├── context/      Context Runtime: AgentContext, ContextScope, MemoryProvider
-│                 interface, Extractor (knowledge self-evolution)
+│                 interface, LLMExtractor + AsyncExtractor (self-evolution)
 ├── execution/    Execution Runtime: tool calls, built-in tools, jobs, retry
-├── governance/   Policy engine (layered approval), ApprovalMemory
+├── governance/   Policy engine (layered approval), ApprovalMemory,
+│                 ToolClassifier (platform-side read-only classification)
 ├── session/      SessionStore + Compressor interfaces
-├── provider/     Provider implementations (memory/…)
-├── memory/       Backend implementations (sqlite, file) of the three interfaces
+├── session/sqlite, session/file
+│                 Session backends (conversation + compression markers)
+├── provider/     Provider interfaces + backends: memory/(sqlite|file),
+│                 skill/, resource/, openviking/ (remote context DB)
 ├── tool/         Built-in Tool implementations (shell, file, grep, web, acp_*)
 ├── mcp/          MCP client/server adapters
 ├── acp/          Agent Client Protocol integration
@@ -55,9 +58,9 @@ openagent-go/
                   ToolResult, RunHooks, Guard, Approver, tokens helpers
 ```
 
-Dependency direction (acyclic): `root ← session ← memory/sqlite,file`;
-`root ← governance ← guard/llm,rest,acp,tui`; `root ← agent`;
-`root+session ← context`; `root ← provider/memory ← execution`;
+Dependency direction (acyclic): `root ← session ← session/sqlite,file`;
+`root ← governance ← guard/llm,rest,acp`; `root ← agent`;
+`root+session ← context`; `root ← provider/* ← execution`;
 `root+agent+context+execution+governance+session+provider ← kernel`;
 `… ← rest/acp/cmd` (application layer). The root package is the core type
 layer: it imports only `tokenizer`.
@@ -83,9 +86,13 @@ rt.Run(ctx, session, input) | rt.RunStream(...) | rt.RunGoal(...)
 ```
 
 Each node is a method on `kernel.Runtime` (run.go, prompt.go, modelcall.go,
-cancel.go, prepare.go, execute.go) so stages can be unit-tested and extended
-independently. Cancellation persists unresolved tool results
-("cancelled by user") before aborting.
+cancel.go, prepare.go, execute.go, compress.go, subagent.go) so stages can
+be unit-tested and extended independently. Cancellation is
+persistence-complete: completed results are committed with a background
+context (a cancelled ctx would fail the store transaction and orphan the
+tool_call), a streaming tool interrupted mid-flight persists an explicit
+`cancelled` error result (never a truncated "success"), and unresolved
+tool_calls get a "cancelled by user" compensation before the run aborts.
 
 ## Layered Approval (governance)
 
@@ -100,8 +107,9 @@ Policy.Evaluate(call) →
 `Decision{Action, Reason, ModifiedArgs}` replaces the boolean approver. The
 default engine (no `Deps.Policy`) auto-allows `transfer_to_*` handoffs and
 delegates the human layer to the configured `Approver` (nil = allow all).
-Legacy `SelfApproving.CanSelfApprove` is a pre-policy gate: tool
-self-declaration, runtime keeps final say.
+Read-only classification lives on the platform side (`governance.ToolClassifier`),
+not on tools — the legacy `SelfApproving.CanSelfApprove` self-declaration
+pattern was removed; the runtime keeps final say.
 
 ## Structured Tool Results
 
@@ -119,36 +127,45 @@ type ToolResult struct {
 The runtime applies a `ResultPolicy` after hooks and before memory: output
 exceeding 5% of the model's context window is saved to
 `<ArtifactRoot()>/sess-<id>/` and replaced with a short pointer (the model
-reads or greps the file on demand). Retryable errors trigger automatic
-retries with backoff. `Message.Result` carries the structured outcome;
-`RunHooks.OnToolEnd` receives `*ToolResult` so hooks can mutate it
-(redaction, etc.).
+reads or greps the file on demand). Artifacts are made read-friendly:
+single lines longer than 32K runes are broken at rune boundaries (both
+`\n` and `\r` count as line terminators), each artificial break marked
+`[line wrapped; continues below]` so the model can tell a wrapped
+continuation from a real newline — the `read`/`grep` tools cap a single
+line at 1MB, and an unwrapped minified blob would be unreadable.
+Retryable errors trigger automatic retries with backoff (declare
+`Retryable` only on idempotent tools). `Message.Result` carries the
+structured outcome; `RunHooks.OnToolEnd` receives `*ToolResult` so hooks
+can mutate it (redaction, etc.).
 
 ## Memory (Three Providers)
 
 | Provider | Lifecycle | Methods |
 |---|---|---|
-| `session.SessionStore` | current conversation | Append / Recent / Count / DeleteSession |
+| `session.SessionStore` | current conversation | Append / Recent / RecentAfter / Count / DeleteSession |
 | `session.Compressor` | summary layer | Compact / Compressed (ThroughIndex contract) |
 | `context.MemoryProvider` | durable knowledge | Recall(scope, query) / Store(scope, item) |
 
-Backends (`memory/sqlite`, `memory/file`) implement all three over the same
-storage — zero schema migration. `SafeCompressionBoundary` keeps
-tool_call/tool_result pairs intact.
+Session and knowledge live in separate packages over the same physical
+storage (`session/sqlite` + `provider/memory/sqlite`, WAL-safe, no schema
+migration). `RecentAfter` reads only the post-summary increment (messages
+are never deleted, so the summary's ThroughIndex marks what to skip).
+`SafeCompressionBoundary` keeps tool_call/tool_result pairs intact.
 
 ## Self-Evolution (Knowledge Loop)
 
 ```
 finished run
-  → context.Extractor (rule-based: "I prefer X", "we use Y", ...)
+  → context.LLMExtractor (Mem0-style ADD/UPDATE/SKIP classification)
+  → AsyncExtractor (background worker, dedupes per user)
   → MemoryProvider.Store(scope, item)
   → next session: ContextRuntime.Build recalls (query = goal/input)
   → prompt "## Recalled Knowledge" section (kind-tagged)
 ```
 
 Scope (`ContextScope{UserID, ProjectID, SessionID, Partition}`) keeps
-knowledge owned by the right user/project. An LLM-based extractor can
-replace the rule-based one without touching store/recall.
+knowledge owned by the right user/project. The extractor is an interface —
+swap in another classifier without touching store/recall.
 
 ## Event Model
 
@@ -161,11 +178,13 @@ are emitted non-blocking — bounded loss under backpressure is by design.
 ## ACP v1 Protocol
 
 The agent speaks the Agent Client Protocol natively. `acp.NewAgentServer(cfg,
-deps, store, models)` wraps a config + deps as an ACP-compliant handler;
-per-turn `agentForTurn` clones the config and derives per-turn deps
-(mode-gated tool injection, approver wiring). Plan mode uses
-`plan_create`/`plan_update` tools; `exit_plan_mode` injects execution tools
-into the running runtime under the tools lock (concurrency-guarded).
+deps, store, models)` wraps a config + deps as an ACP-compliant handler. The
+session-scoped `kernel.Runtime` is built once per session and reused across
+turns — per-turn changes are incremental (config/model/mode live-swaps under
+the session lock, plan tools rebound per prompt). Mode transitions swap the
+tool set and approver via `applyModeTools` (modeMu + runtime locks, safe
+from the serve loop, the prompt goroutine, and tool callbacks alike).
+Plan mode uses `plan_create`/`plan_update` tools.
 
 ## Slash Commands
 

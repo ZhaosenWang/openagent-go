@@ -1,115 +1,129 @@
-# openagent-go Architecture
+# openagent-go 架构
 
 > [English](DESIGN.md) | [README](README.md) | [README (中文)](README.zh.md)
 
 ## 概述
 
-openagent-go 是一个**全系统可插拔**的开源 AI Agent。核心是一条极简的主线 loop，所有能力通过插拔模块叠加。
+openagent-go 是一个 **Agent Runtime Kernel** —— Go 语言实现的事件驱动、上下文驱动的可扩展执行系统。核心是一条极简的主线循环，所有能力通过可插拔模块叠加。
 
-**设计原则：**
+**设计原则（Context Architecture v2.1）：**
 
-- 遵循业界标准（OpenAI API、ACP v1 协议），不自定义协议
-- Runner 是唯一中介者，模块之间不互相调用
-- 没插模块 = 没有那个能力，nil 则跳过对应节点
-- 避免代码膨胀：先想清楚再写，不做预判式抽象
-- 库代码不使用环境变量，环境变量属于应用层
+- **Agent 是配置。** `agent.Agent` 结构体是纯描述（模型、提示词、守卫、子 agent、限额）。它不持有工具、记忆、审批器、hooks 或 observer —— 那些是注入 `kernel.Runtime` 的运行时依赖（`kernel.Deps`）。
+- **Context 是 agent 的输入。** agent 从不直接触碰存储。Context Runtime 组装 agent 所见（工作消息 + 召回的知识）；Runtime State（执行、审批）是独立的簿记。
+- **Memory 不是 Context —— memory 是 Context 的来源。** 旧的单一 `Memory` 接口按生命周期拆成三个 Provider：
+  - `session.SessionStore` —— 当前会话（短期）
+  - `session.Compressor` —— token 预算压缩 / 摘要
+  - `context.MemoryProvider` —— 持久知识（偏好、事实、经验）
+- **审批是分层策略引擎**，不是布尔门（规则 → 安全 → 记忆 → 人工）。
+- **工具结果是结构化的**（`*ToolResult`），输出超过上下文预算时由运行时自动截断落盘。
+- **运行时自我进化**：完成的对话扫描出持久知识，存储并在未来会话自动召回。
+- **Event 是审计，不是状态。** 不做 Event Sourcing；仅日志/可观测性。
+- 没配置模块 = 没有那个能力；nil 则跳过对应节点。
+- 库代码不读环境变量（那是应用层的职责）。
 
 **两种扩展方式：**
 
 | 方式 | 适用场景 | 机制 |
 |------|---------|------|
-| **编译时扩展** | 平台开发者 | 实现 Go 接口 → `WithXxx()` 注入 |
-| **运行时扩展** | 社区/终端用户 | 插件文件放入目录 → Agent 动态加载 |
+| **编译时扩展** | 平台开发者 | 实现 Go 接口 → 注入 `kernel.Deps` |
+| **运行时扩展** | 社区/终端用户 | `.wasm` 插件放入目录 → 自动加载 |
 
 两者并存，不互斥。编译时接口是"主干"，运行时插件是接口的一种实现来源。
 
 ---
 
-## 主线 8 节点
+## 包结构
 
 ```
-Agent.Run(ctx, session, input)
-  │
-  ├─ turn 1 only:
-  │   ① Memory.Compact()    ← Token 驱动的增量压缩（Runner 决策）
-  │      Memory.Recent()    ← 纯查询，无副作用
-  │   ③ Guard.in.Check()    ← 输入安全检查
-  │
-  └─ for turn in 1..maxTurns:
-      ② PromptBuilder() 或 defaultBuildPrompt()
-         ├─ 静态 system prompts
-         ├─ 动态上下文（plan entries、mode 指令）
-         ├─ compressed summary + hints（自动注入）
-         ├─ skill catalog + loaded skills
-         └─ working messages
-      ④ Model.ChatCompletionStream()  → fallback ChatCompletion()
-         ├─ 429/503 → RetryableError → 指数退避重试（max 3）
-         └─ StreamTextDelta 实时推送
-      ⑤ Guard.out.Check()
-      ⑥ Approver.Approve() → Tool.Execute() (并发 goroutine)
-         └─ tool result → Guard.out 再次检查
-      ⑧ Memory.Append()
-      has tool_calls → 回到 ②
-      无 tool_calls → StreamDone → 返回
+openagent-go/
+├── agent/        Agent 配置（纯）：Agent、options、Team、Router
+├── kernel/       Runtime 引擎：8 节点循环、Runtime + Deps、按节点拆方法
+├── context/      Context Runtime：AgentContext、ContextScope、MemoryProvider
+│                 接口、LLMExtractor + AsyncExtractor（自我进化）
+├── execution/    Execution Runtime：工具调用、内置工具、任务（job）、重试
+├── governance/   策略引擎（分层审批）、ApprovalMemory、
+│                 ToolClassifier（平台侧只读分类）
+├── session/      SessionStore + Compressor 接口
+├── session/sqlite, session/file
+│                 会话后端（对话 + 压缩标记）
+├── provider/     Provider 接口与后端：memory/(sqlite|file)、
+│                 skill/、resource/、openviking/（远程上下文数据库）
+├── tool/         内置工具实现（shell、file、grep、web、acp_*）
+├── mcp/          MCP 客户端/服务端适配器
+├── acp/          Agent Client Protocol 集成
+├── rest/         REST + SSE API
+├── orchestrate/  多 agent DAG 规划 + 执行
+└── 根包           核心类型：Message、Tool、Model、Session、StreamEvent、
+                  ToolResult、RunHooks、Guard、Approver、token 辅助
 ```
 
-每个节点：`if module != nil { module.Call(...) }`。
+依赖方向（无环）：`根包 ← session ← session/sqlite,file`；`根包 ← governance ← guard/llm,rest,acp`；`根包 ← agent`；`根包+session ← context`；`根包 ← provider/* ← execution`；`根包+agent+context+execution+governance+session+provider ← kernel`；`… ← rest/acp/cmd`（应用层）。根包是核心类型层：只依赖 `tokenizer`。
+
+---
+
+## 主线 8 节点（kernel）
+
+```
+cfg := agent.New("name", agent.WithModel(m), ...)
+deps := kernel.Deps{Tools: ..., SessionStore: ..., Policy: ...}
+rt := kernel.New(cfg, deps)
+rt.Run(ctx, session, input) | rt.RunStream(...) | rt.RunGoal(...)
+```
+
+```
+① SessionStore 拉取（压缩 + 工作集，仅 turn 1）
+② Context Build（知识召回）→ Prompt 构建（静态 + 动态 + 知识）
+③ Guard.in
+④ 模型调用（优先流式，RetryableError 重试）
+⑤ Guard.out
+⑥ Policy.Evaluate（规则 → 安全 → 记忆 → 人工）逐工具调用
+⑦ Execution Runtime：Start 任务 → 按调用顺序 Wait（并行执行、顺序收集）
+⑧ SessionStore Append（Commit）
+```
+
+每个节点是 `kernel.Runtime` 上的方法（run.go、prompt.go、modelcall.go、cancel.go、prepare.go、execute.go、compress.go、subagent.go），可独立单测与扩展。**取消是持久化完备的**：已完成结果用 background context 提交（已取消的 ctx 会让存储事务立即失败，留下孤儿 tool_call）；流式工具被中断时持久化显式 `cancelled` 错误结果（绝不报半截"成功"）；未决的 tool_calls 在 run 中止前写入 "cancelled by user" 补偿。
 
 **两层 prompt 模型：**
 
 | 层 | 来源 | 内容 |
 |----|------|------|
-| Static | `Agent.SystemPrompts` + `Description` | 构造时设定，不变 |
+| Static | `Agent.SystemPrompts` + `ProjectContext` | 组装时设定，不变 |
 | Dynamic | `Session.DynamicContext` | 每 turn 构建：plan entries + mode 指令 |
-
-Runner 将 `Session.DynamicContext` 传递给 `PromptInput` → `defaultBuildPrompt`。ACP 层从 session 运行时状态构建。
 
 ---
 
-## 核心类型
+## 核心类型（根包）
 
-### Agent
+### Agent（纯配置）
 
 ```go
 type Agent struct {
     Name, Description string
-    SystemPrompts   []string   // 静态系统提示词（替代单字段 Instructions）
-    Model           Model
-    Tools           []Tool
-    Memory          Memory
-    Prompt          PromptBuilder    // nil = default
-    InGuard         InputGuard
-    OutGuard        OutputGuard
-    Approver        Approver
-    Hooks           RunHooks
-    Observer        RunObserver      // nil = no stage events
-    SkillLoader     SkillLoader
-    MaxTurns        int             // default 20
-    MaxWorkingTokens    int         // default 0 = 上下文窗口的 70%
-    MaxCompressedTokens int         // default 2048
-    ReasoningEffort    string       // "none","minimal","low","medium","high","xhigh"
+    SystemPrompts     []string
+    Model             Model
+    Prompt            PromptBuilder    // nil = default
+    InGuard           InputGuard
+    OutGuard          OutputGuard
+    SubAgents         []SubAgent       // 配置声明的委托工具
+    MaxTurns          int              // default 20
+    MaxWorkingTokens  int              // default 0 = 上下文窗口的 70%
+    MaxCompressedTokens int            // default 8192
+    ReasoningEffort   string
 }
-
-agent.Run(ctx, session, input) → (*RunResult, error)
-agent.RunStream(ctx, session, input) → <-chan StreamEvent
-agent.RunGoal(ctx, session, goal) → (*RunResult, error)
-agent.RunGoalStream(ctx, session, goal) → <-chan StreamEvent
-agent.Clone() → *Agent
 ```
 
-Runner 是私有类型，`Agent.Run()` 内部创建。`Clone()` 返回浅拷贝，Tools 底层数组独立；
-被 `AgentServer.agentForTurn()` 用于 per-session 隔离。
+Agent 不持有 Tools/Memory/Approver/Hooks/Observer —— 全部通过 `kernel.Deps` 注入运行时。运行时构建时把 `SubAgents` 注册为委托工具（模型只传 task，子 agent 用自己的系统提示、工具白名单，治理继承策略链）。
 
 ### StreamEvent
 
 ```go
 const (
-    StreamThought      = "thought"        // 推理内容 (o1, deepseek-r1)
+    StreamThought      = "thought"        // 推理内容
     StreamTextDelta    = "text_delta"     // 逐字符输出
     StreamToolCall     = "tool_call"      // 工具调用开始
     StreamToolProgress = "tool_progress"  // 流式工具输出 chunk
     StreamToolResult   = "tool_result"    // 工具结果（最终）
-    StreamRetrying     = "retrying"       // 429 重试中
+    StreamRetrying     = "retrying"       // 瞬时错误重试中
     StreamDone         = "done"           // 正常完成
     StreamError        = "error"          // 执行失败
     StreamAborted      = "aborted"        // 外部中断（cancel/timeout）
@@ -130,39 +144,43 @@ type Session struct {
 }
 ```
 
-纯数据载体，应用层管理 CRUD。Runner 不创建 Session。
+纯数据载体，应用层管理 CRUD。Runtime 不创建 Session。
 
 ---
 
 ## 模块接口
 
-### ① Memory（三层模型）
+### ① Memory（三个 Provider）
 
 ```
-Layer 1: Working    — Recent() 纯查询；Runner 按 MaxWorkingTokens 管理 token 预算
-Layer 2: Compressed — Compressed() 自动注入；Compact() 增量压缩
-Layer 3: Archive    — Search() + recall 工具；消息永不删除
+Layer 1: Working    — SessionStore.Recent() / RecentAfter()；kernel 按预算管理
+Layer 2: Compressed — Compressor.Compressed() 自动注入；Compact() 增量压缩
+Layer 3: Archive    — MemoryProvider.Recall() + Store()；消息永不删除
 ```
 
 ```go
-type Memory interface {
-    io.Closer
+type SessionStore interface {              // 当前会话（短期）
+    Append(ctx, sessionID, msg) error
+    Recent(ctx, sessionID, n, offset) ([]Message, error)
+    RecentAfter(ctx, sessionID, throughIndex, n) ([]Message, error) // 摘要后的增量
     Count(ctx, sessionID) (int, error)
-    Recent(ctx, sessionID, n int, offset int) ([]Message, error)         // 纯查询
-    Compact(ctx, sessionID, throughIndex int, messages []Message) error  // Runner 驱动
-    Compressed(ctx, sessionID) (*CompressedContext, error)
-    Search(ctx, sessionID, query string, limit int) ([]SearchResult, error)
-    Append(ctx, sessionID, msg Message) error
     DeleteSession(ctx, sessionID) error
+}
+
+type Compressor interface {                // token 预算压缩（中期）
+    Compact(ctx, sessionID, throughIndex, messages) error
+    Compressed(ctx, sessionID) (*CompressedContext, error)
+}
+
+type MemoryProvider interface {            // 持久知识（长期）
+    Recall(ctx, scope, query, limit) ([]MemoryEntry, error)
+    Store(ctx, scope, item) error
 }
 ```
 
-Runner 驱动压缩：从末尾向前数 token，对 MaxWorkingTokens 进行截断，调整到安全边界，
-调用 Compact()。后端仅压缩新溢出的消息，增量/滚动压缩。CJK 内容自动分词（`ftsTokenizeCJK`）。
+会话与知识**物理分域**：`session/sqlite` + `provider/memory/sqlite` 各自独立连接打开同一 .db（WAL 安全），知识表独立，零 schema 迁移。`RecentAfter` 只读摘要覆盖之后的增量——消息永不删除，所以摘要的 ThroughIndex 标记了要跳过的部分。`SafeCompressionBoundary` 保证 tool_call/tool_result 配对完整。
 
-实现：`memory/file`（JSONL，零依赖）、`memory/sqlite`（SQLite + FTS5 + CJK 分词 + 可选向量搜索）。
-
-### Summarizer（Memory 的依赖）
+### Summarizer（Compressor 的依赖）
 
 ```go
 type Summarizer interface {
@@ -170,9 +188,9 @@ type Summarizer interface {
 }
 ```
 
-nil = 不压缩。通过 `WithSummarizer()` 配置。实现：`summarizer/llm.go` — LLM 增量压缩。
+nil = 不压缩（Compact 静默 no-op，工作集不裁剪——fail-loud 交给硬窗口检查）。实现：`summarizer/llm.go` —— LLM 增量压缩。
 
-### Embedder（Memory 的依赖）
+### Embedder（知识后端的依赖）
 
 ```go
 type Embedder interface {
@@ -181,26 +199,17 @@ type Embedder interface {
 }
 ```
 
-nil = 降级为 FTS5 搜索。通过 `WithEmbedder()` 配置。
+nil = 降级为 FTS5 搜索。内置 BGE embedder（onnxruntime，离线内嵌二进制）。
 
-### ② PromptBuilder
+### ② Context Runtime（组装 agent 的输入）
+
+Context Runtime 组装 AgentContext（工作消息 + 知识召回 + 技能匹配 + 资源），PromptBuilder 只负责把 AgentContext 格式化为 messages：
 
 ```go
-type PromptBuilder func(ctx context.Context, input PromptInput) ([]Message, error)
-
-type PromptInput struct {
-    AgentDescription, Instructions string
-    WorkingMessages   []Message
-    Compressed        *CompressedContext
-    Tools             []FunctionDefinition
-    AvailableSkills   []SkillInfo
-    LoadedSkills      map[string]string
-    UserProfile, ProjectContext string
-    DynamicContext    string   // 每轮 plan + mode 信息
+type Runtime interface {
+    Build(ctx, BuildRequest) (*AgentContext, error)
 }
 ```
-
-函数类型 — 单一方法，无需状态。nil = `defaultBuildPrompt()`。
 
 ### ③ / ⑤ Guard
 
@@ -219,7 +228,7 @@ type GuardResult struct {
 }
 ```
 
-InGuard 在循环前检查一次。OutGuard 检查每次 model 输出 + 每个 tool result。实现：`guard/llm`。
+InGuard 在循环前检查一次。OutGuard 检查每次 model 输出 + 每个 tool result。被拒内容**绝不落库**（guard 在 Commit 之前）。实现：`guard/llm`。
 
 ### ④ Model
 
@@ -231,21 +240,18 @@ type Model interface {
 }
 ```
 
-实现：`model/openai`（openai-go v3 SDK）。`ChatCompletionRequest.ReasoningEffort` 从
-`Agent.ReasoningEffort` 传递到模型的 `reasoning_effort` 参数。
+实现：`model/openai`（openai-go v3 SDK）。`ReasoningEffort` 透传到模型的 `reasoning_effort` 参数。
 
-### Tool
+### Tool（结构化结果）
 
 ```go
 type Tool interface {
     Definition() FunctionDefinition
-    Execute(ctx context.Context, args json.RawMessage) (string, error)
+    Execute(ctx context.Context, args json.RawMessage) *ToolResult   // 单返回，错误进 Result.Error
 }
 ```
 
-内置工具：`shell`、`read`、`write`、`ls`、`grep`。自动注入工具：`load_skill`、`reload_skills`、
-`recall`、`subagent`。ACP RPC 工具：`read_client_file`、`write_client_file`、
-`terminal_create/output/wait/kill/release`。Plan 工具：`plan_create`、`plan_update`。
+内置工具：`shell`、`read`、`write`、`ls`、`grep`、`websearch`、`webfetch`。自动注入：`load_skill`、`reload_skills`、`recall`。子 agent 委托工具由配置声明。ACP RPC 工具：`read_client_file`、`write_client_file`、`terminal_*`。Plan 工具：`plan_create`、`plan_update`、`enter_plan_mode`、`exit_plan_mode`。
 
 ### Sandbox
 
@@ -256,58 +262,90 @@ type Sandbox interface {
 }
 ```
 
-`CWD()` 返回沙箱内部视角的路径 — bwrap 下为 `/workspace`，否则为宿主路径。Shell 工具从 sandbox 获取工作目录而非自己携带。实现：`sandbox/native`（Linux bwrap、macOS Seatbelt）。
+`CWD()` 返回沙箱内部视角的路径 —— bwrap 下为 `/workspace`，否则为宿主路径。实现：`sandbox/native`（Linux bwrap、macOS Seatbelt）。
 
-### ⑥ Approver
+### ⑥ 审批策略引擎（governance）
 
-```go
-type Approver interface {
-    Approve(ctx, call ToolCall, def FunctionDefinition, session Session) (allowed bool, reason string)
-}
+```
+Policy.Evaluate(call) →
+  1. Rules      设置驱动：工具+参数模式 → allow/deny/ask
+  2. Safety     运行时分类（只读自动放行，平台侧 ToolClassifier）
+  3. Memory     会话级审批记忆（Allow-Always 持久化）
+  4. Human      Ask → Allow / Deny / Always / ModifiedArgs
 ```
 
-nil = 全部放行。ACP 模式通过 `session/request_permission` RPC 桥接到客户端。
+`Decision{Action, Reason, ModifiedArgs}` 取代布尔审批器。默认引擎（无 `Deps.Policy`）自动放行 `transfer_to_*` 交接，人工层委托给配置的 `Approver`（nil = 全放行）。只读分类在平台侧（`governance.ToolClassifier`），工具不自报——旧的 `SelfApproving.CanSelfApprove` 自声明模式已删除。
 
 ### ⑦ RunHooks
 
-Start 方法返回不透明 `any` 值，Runner 传递给对应的 End 方法。实现：`hooks/slog`、`hooks/otel`。
+Start 方法返回不透明 `any` 值，Runtime 传递给对应的 End 方法。实现：`hooks/slog`、`hooks/otel`、`hooks/redact`。
 
 ### RunObserver
 
-每阶段 enter/leave 事件，含耗时。多个 observer 通过 `MultiObserver()` 组合。
+每个阶段 enter/leave 事件，含耗时与 detail 元数据。**观察者必须线程安全**（`tool.execute` 事件来自并行工具 goroutine）。detail 只放元数据（计数/状态/长度），不放内容全文。多个 observer 通过 `MultiObserver()` 组合。
+
+---
+
+## 结构化工具结果
+
+```go
+type ToolResult struct {
+    Content   string          // 展示文本（超限时替换为指针）
+    JSON      json.RawMessage // 可选结构化数据
+    Metadata  map[string]any  // 退出码、耗时、mime ...
+    Truncated bool
+    FileRef   string          // 落盘 artifact 的路径
+    Error     *ToolError      // {Message, Retryable, Code}
+}
+```
+
+运行时在 hooks 之后、落库之前应用 `ResultPolicy`：输出超过模型上下文窗口 5% 时保存到 `<ArtifactRoot()>/sess-<id>/`，替换为短指针（模型按需 read/grep 该文件）。**Artifact 可读性保障**：超过 32K rune 的单行在 rune 边界拆行（`\n` 与 `\r` 都是行终止符），每处人工断点标记 `[line wrapped; continues below]`——`read`/`grep` 工具单行上限 1MB，不拆行的 minified 单行 blob 会完全不可读。Retryable 错误触发退避重试（仅在幂等工具上声明 `Retryable`）。`Message.Result` 携带结构化结果；`RunHooks.OnToolEnd` 收到 `*ToolResult`，hooks 可修改（脱敏等）。
+
+**token 计数**：`tokenizer/`（tiktoken，模型感知）对超过 8KB 的文本改用头部抽样线性外推（BPE 密度稳定，误差 ~1-3%）——纯 Go 的 tiktoken-go 全量编码约 72µs/字节，4MB 工具结果的截断判断全量编码需 ~5 分钟，抽样后 ~0.6s。精确计数对预算/阈值决策不敏感，可接受。
+
+---
+
+## 自我进化（知识闭环）
+
+```
+完成的 run
+  → context.LLMExtractor（Mem0 式 ADD/UPDATE/SKIP 分类）
+  → AsyncExtractor（后台 worker，按 user 合并去重）
+  → MemoryProvider.Store(scope, item)
+  → 下一会话：ContextRuntime.Build 召回（query = goal/input）
+  → prompt "## Recalled Knowledge" 段落（kind 标记）
+```
+
+Scope（`ContextScope{UserID, ProjectID, SessionID, Partition}`）保证知识归属正确的用户/项目。Extractor 是接口——换别的分类器不动存储/召回。
+
+---
+
+## 事件模型
+
+事件是审计/可观测性辅助，不是状态。`RunHooks`（start/end 对携带不透明状态）覆盖 agent/工具生命周期；`RunObserver` 覆盖循环各阶段；REST 层经 `eventbus` 桥接 SSE。流事件（`text_delta`、`tool_call`、`tool_result`...）非阻塞发送——背压下有界丢失是设计使然。
 
 ---
 
 ## ACP v1 协议
 
-Agent 原生支持 ACP 协议。`AgentServer` 将 `openagent.Agent` 包装为 ACP handler：
-
-```go
-agent := openagent.NewAgent("bot", ...)
-srv := acp.NewAgentServer(agent, mem, store, models)
-server := openacpsdk.NewServer("openagent-acp", "1.0.0", srv)
-server.Run(ctx)  // 阻塞在 stdin/stdout
-```
+Agent 原生支持 ACP 协议。`acp.NewAgentServer(cfg, deps, store, models)` 把配置 + 依赖包装为 ACP 兼容 handler。**会话级 `kernel.Runtime` 每个会话构建一次、跨 turn 复用**——每轮变更都是增量的（config/model/mode 在会话锁内热切换，plan 工具每 prompt 重绑）。模式切换通过 `applyModeTools` 换工具集与审批器（modeMu + 运行时锁，serve 循环、prompt goroutine、工具回调三流并发安全）。Plan 模式使用 `plan_create`/`plan_update` 工具。
 
 **协议层次：**
 
 | 层 | 包 | 角色 |
 |----|----|------|
-| 类型 | `acp/sdk/` | ACP v1 schema — 958 行，零依赖 |
+| 类型 | `acp/sdk/` | ACP v1 schema，零依赖 |
 | 传输 | `acp/sdk/` | JSON-RPC 2.0 over stdio — mux、client session、Agent→Client RPC |
 | 集成 | `acp/server.go` | AgentServer — session CRUD、prompt turns、plan mode、MCP、slash 命令 |
-
-**ACP 模式：** `chat`（对话+工具）和 `plan`（通过 `plan_create`/`plan_update` 工具结构化规划）。
-Model 注册表支持多模型选择。
 
 ---
 
 ## Plan 模式
 
-使用 `plan_create` 和 `plan_update` 工具 — LLM 通过 function-calling 参数直接输出结构化 plan 条目：
+使用 `plan_create` 和 `plan_update` 工具 —— LLM 通过 function-calling 参数直接输出结构化 plan 条目：
 
 ```
-用户目标 → agent.RunStream
+用户目标 → OnPrompt
   → agent 调用 plan_create(goal, steps[{id, content, priority}])
   → plan 文本进入对话上下文
   → agent 调用 plan_update(updates[{id, status}]) 更新进度
@@ -315,7 +353,7 @@ Model 注册表支持多模型选择。
   → 每轮：DynamicContext 注入当前 plan 状态到 system prompt
 ```
 
-**Orchestrate** (`orchestrate/`) 独立 — 多 agent DAG 分解 + 并行执行。非 ACP plan 模式。
+模式状态机（auto/manual/plan）在 modeMu 下维护；`enter_plan_mode`/`exit_plan_mode` 工具让 agent 自主切换。
 
 ---
 
@@ -325,116 +363,41 @@ Model 注册表支持多模型选择。
 
 ```
 /help      — 列出可用命令
-/mode      — 切换会话模式 (chat/plan)
+/mode      — 切换会话模式 (auto/manual/plan)
 /model     — 列出或切换模型
-/context   — 显示 token 使用
+/context   — 显示 token 使用（分 layer：摘要/工作集/窗口）
 /cwd       — 显示工作目录
 /clear     — 重置会话消息
 /rename    — 重命名会话标题
 /sessions  — 列出所有会话
+/compact   — 手动全量压缩
 ```
 
 命令通过 `slash/` Registry 注册，从 `OnPrompt` 分发。未知 `/` 命令传递给 agent 处理。
 
 ---
 
-## 目录结构
-
-```
-openagent-go/
-├── agent.go              Agent + Run/RunStream/RunGoal/Clone + StreamEvent
-├── runner.go             private runner + 8-node loop + defaultBuildPrompt
-├── model.go              Model、Embedder、Summarizer 接口 + 请求/响应类型
-├── message.go            Message + ContentPart（多模态）
-├── tool.go               Tool 接口 + FunctionDefinition + StreamExecutor
-├── sandbox.go            Sandbox 接口 + Command/Result 类型 + CWD()
-├── memory.go             Memory 接口 + CompressedContext
-├── tokenizer/            模型感知 token 计数（tiktoken）
-├── prompt.go             PromptInput + PromptBuilder + RetrievalHint
-├── guard.go              InputGuard / OutputGuard
-├── approver.go           Approver
-├── hooks.go              RunHooks
-├── observer.go           RunObserver + StageEvent
-├── skill.go              SkillLoader + SkillInfo
-├── router.go             Router + FirstAgentRouter + LLMRouter
-├── team.go               Team + TeamResult + HandoffEntry + handoffTool
-├── options.go            WithXxx() AgentOption + TeamOption
-├── session.go            Session (+ DynamicContext)
-├── doc.go                包文档
-│
-├── tool/                 内置工具实现
-│   ├── shell.go          Shell（CWD 从 sandbox 获取）
-│   ├── file.go           ReadFile / WriteFile / ListDir
-│   ├── grep.go           Grep
-│   ├── acp_fs.go         ACPReadFile / ACPWriteFile（Agent→Client RPC）
-│   └── acp_terminal.go   ACPTerminal（create/output/wait/kill/release）
-│
-├── plan/                 Plan 模式工具
-│   ├── entry.go          Entry + Priority + Status 类型
-│   └── tool.go           CreateTool (plan_create) + UpdateTool (plan_update)
-│
-├── slash/                Slash 命令注册表
-│   └── slash.go          Registry、Context、Command、Handler
-│
-├── summarizer/           LLM 压缩
-│   └── llm.go            Compressor（实现 Summarizer 接口）
-│
-├── sandbox/native/       OS 原生沙箱
-├── acp/                  ACP 协议集成
-│   ├── sdk/              ACP v1 SDK（类型、JSON-RPC 2.0 mux、客户端）
-│   ├── server.go         AgentServer（Agent → ACP handler）
-│   └── commands.go       内置 slash 命令注册
-├── orchestrate/          多 agent DAG 分解 + 执行
-├── model/openai/         OpenAI 模型实现
-├── memory/file/          JSONL 文件记忆
-├── memory/sqlite/        SQLite + FTS5 + CJK 分词 + 向量搜索
-├── guard/llm/            LLM 守卫
-├── hooks/slog/           slog 日志钩子
-├── hooks/otel/           OpenTelemetry 追踪钩子
-├── skill/fs/             文件系统技能加载
-├── plugin/wasmhost/      共享 WASM host 层
-├── plugin/agent/wasm/    Agent WASM 插件运行时
-├── plugin/cli/           CLI 插件宿主
-├── plugin/cli/wasm/      CLI WASM 加载器、observer hub
-├── plugin/pdk/rust/      插件 SDK（Rust crate）
-├── mcp/                  MCP 协议客户端
-├── eventbus/             发布订阅事件总线
-├── session/              会话元数据类型 + 存储接口
-├── rest/                 REST API
-├── cmd/tui/              终端聊天
-├── cmd/cli/              完整 CLI
-├── examples/             示例
-│
-├── DESIGN.md             架构（英文）
-├── DESIGN.zh.md          架构（中文）
-└── README.md
-```
-
-所有接口在根包。实现在子包。无循环依赖。
-
----
-
 ## 关键设计决策
 
-**1. 为什么 Runner 是私有的？** 用户调用 `Agent.Run()`，从不直接构造 Runner。
+**1. 为什么 Agent 是纯配置？** 能力（工具/存储/策略）是运行时依赖，与"agent 是谁"正交。配置与执行分离让同一个配置能跑在 ACP/REST/CLI 不同宿主下，也让运行时可以被单测驱动。
 
-**2. 为什么 Runner 触发压缩？** Token 预算由模型的上下文窗口决定，只有 Runner 知道。Runner 计数 token 并决定何时压缩。
+**2. 为什么 Runtime 按 8 节点拆方法？** 每个节点可独立单测；run() 只编排。取代了旧的 1700 行 runner.go 巨型函数。
 
-**3. 为什么无自动搜索？** Archive 检索由模型通过 `recall` 工具驱动。模型决定何时搜、搜什么。
+**3. 为什么 Memory 一拆三？** 会话（短期）、压缩（中期）、知识（长期）生命周期不同、访问模式不同。一个接口扛三种职责导致方法死亡（Search 被知识 Recall 取代）。
 
-**4. 为什么 Embedder/Summarizer 不在 Agent 上？** 它们是 Memory 的依赖，不是 Agent 的能力。
+**4. 为什么审批是策略引擎而不是布尔门？** 布尔 `Approve() (bool, string)` 无法表达"编辑参数后放行"、"always allow"、"只读自动放行"的组合。分层链让每层各司其职，Decision 携带 ModifiedArgs。
 
-**5. 为什么默认流式？** `callModelOnce` 优先流式，fallback 非流式。最低首 token 延迟。
+**5. 为什么工具结果是单返回 `*ToolResult`？** 错误进 `Result.Error` 单通道——调用方不必处理 (string, error) 双返回的中间态；截断/落盘是运行时内建行为而非 hooks hack。
 
-**6. 为什么 PromptBuilder 是函数类型？** 单一方法，无需状态。
+**6. 为什么超长结果落盘而不是截断字符串？** 截断丢失信息；落盘保留全文，模型按需 read/grep。指针文案 + 行包装标记让 artifact 可读、可区分人工断点。
 
-**7. 为什么 Handoff 是 Tool？** 模型有完整上下文，比路由器更擅长交接决策。
+**7. 为什么 token 计数对超长文本抽样？** 纯 Go tiktoken 全量编码 ~72µs/字节（4MB 需 ~5 分钟）。BPE 密度在单一文本内稳定，8KB 样本外推误差 ~1-3%——预算/阈值决策完全不敏感。若未来需要精确计数（计费对齐），换 cgo + tiktoken-rs 内核即可。
 
-**8. 为什么 agentForTurn 需要 Clone？** `s.Agent` 被所有 session 共享。Clone 创建隔离副本。
+**8. 为什么 Runtime 跨 turn 复用而不是每轮重建？** 技能缓存、沙箱状态、工具集值得跨 turn 存活；每轮变化（模型/模式/plan 工具）都是增量热切换。代价是并发安全要求——会话状态在 modeMu 下、运行时可变字段在 rt.mu 下。
 
-**9. 为什么 ToolFactory 每 turn 创建工具？** 工具需要 session 的 cwd（Docker 容器/bwrap 下与进程 cwd 不同）。
+**9. 为什么取消要持久化？** 取消的 turn 已产生的输出（模型回答、工具结果）是真实进展；用已取消 ctx 提交会让存储事务立即失败，留下孤儿 tool_call 在历史里，下一轮模型读到破坏配对的格式。
 
-**10. 为什么 Session 上有 DynamicContext？** Plan entries 和 mode 每 turn 变化。Runner 不应知道 ACP 或 plan — Session 是中性传输通道。
+**10. 为什么 Session 上有 DynamicContext？** Plan entries 和 mode 每 turn 变化。Runtime 不应知道 ACP 或 plan —— Session 是中性传输通道。
 
 ---
 
@@ -444,13 +407,13 @@ openagent-go/
 
 | 类型 | 用途 | ABI 导出 |
 |------|------|---------|
-| `agent:tools` | 向 agent 添加新工具 | `alloc`、`metadata`、`execute` |
-| `agent:observers` | 观测 pipeline 阶段、中止运行 | `alloc`、`metadata`、`run` |
-| `cli:settings` | 注入凭证、修改 settings JSON | `alloc`、`metadata`、`init` |
-| `cli:commands` | 添加自定义 cobra 子命令 | `alloc`、`metadata`、`commands`、`run_<name>` |
-| `cli:observers` | 生命周期事件记录 | `alloc`、`metadata`、事件处理函数 |
+| `agent:tools` | 向 agent 添加新工具 | `openagent_agent_tools()` / `openagent_execute()` |
+| `agent:observers` | 观测 pipeline 阶段（stage enter/leave） | `openagent_on_stage(event_json)` |
+| `cli:settings` | 注入凭证、修改 settings JSON | `openagent_cli_init()` |
+| `cli:commands` | 添加自定义 cobra 子命令 | `openagent_cli_commands()` / `openagent_cli_run()` |
+| `cli:observers` | 生命周期事件记录 | `openagent_cli_on_startup()` / `..._on_shutdown()` |
 
-WASM 运行时：[wazero](https://github.com/tetratelabs/wazero) — 纯 Go，零 CGO。
+WASM 运行时：[wazero](https://github.com/tetratelabs/wazero) —— 纯 Go，零 CGO。宿主函数（`log_info`、`keyring_get`、`http_request`、`utc_now`）由 `plugin/wasmhost/` 提供。
 
 ---
 
@@ -504,7 +467,7 @@ cwd := sb.CWD()  // bwrap 下为 "/workspace"，否则为宿主路径
 | 流式 | PTY-based | Bash tool | Shell tool (line streaming) |
 | 多 agent | Handoff chain | — | Team + Orchestrate |
 | Plan 模式 | — | 工具驱动 | plan_create/plan_update 工具 |
-| 可观测性 | — | — | RunObserver + StageEvent |
+| 可观测性 | — | — | RunObserver + StageEvent（含 detail 元数据） |
 | 插件 | — | — | WASM (wazero, 零 CGO) |
 | Slash 命令 | — | — | 注册表 + 内置 + 可扩展 |
 | Memory 压缩 | — | — | LLM 增量 summarizer |
