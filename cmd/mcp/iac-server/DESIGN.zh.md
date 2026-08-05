@@ -7,7 +7,7 @@
 1. **消费方不固定。** 任何 MCP client 都能用,server 不能依赖消费方有 workflow / event / approval / checkpoint 能力,也不能假设 client 的工具调用超时。长任务用**异步 job 模式**(工具立即返回 job_id,client 轮询),与 client 的超时策略无关。
 2. **server 不是 dumb wrapper。** 资源推荐、规格选型、费用优化、错误排错是域专家推理,需要 LLM。server 自带一个 LLM,与消费方的 LLM 各司其职。
 3. **云不固定。** server 依赖 `CloudProvider` 接口(见 `provider/doc.md`),华为云是一个实现。加一个云 = 实现接口 + 提供技能树 + 提供角色提示词,不改 server 核心。
-4. **`iac/` 是纯执行单元。** 只管 terraform 二进制 + 命令执行 + 结构化结果。不管模板、不管费用、不管 LLM、不管 workflow(见 `iac/doc.md`)。
+4. **`iac/` 是纯执行单元。** 只管 terraform 二进制 + 命令执行 + 结构化结果。不管模板、不管费用、不管 LLM、不管 workflow(见 `iac/DESIGN.zh.md`)。
 5. **状态在磁盘,不在 server 内存。** DAG 契约在 `dag.json`、报价门槛在 `cost.json`、部署进度在 terraform state——server 进程无状态,死了不丢。
 
 ## 分层
@@ -182,7 +182,7 @@ cmd/mcp/iac-server/
 
 ## 与 iac/ 的关系
 
-`iac/` 在这整套里的角色不变(见 `iac/doc.md`):
+`iac/` 在这整套里的角色不变(见 `iac/DESIGN.zh.md`):
 
 - server handler 调 `iac.NewClient` → `client.Init/Plan/Apply/Destroy`
 - `iac/` 不知道 deployment_id、不管 .tf 谁生成、不管 LLM、不管费用、不管云是哪个
