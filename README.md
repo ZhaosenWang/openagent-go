@@ -12,7 +12,10 @@ A fully pluggable, multi-agent AI agent framework in Go.
 - **Multi-agent team** — agents hand off tasks via `transfer_to_*` tools; each agent has independent memory, tools, and guard
 - **Multi-agent orchestration** — LLM-driven DAG decomposition, parallel execution, and auto-replan via `orchestrate/`
 - **Streaming SSE** — real-time token-by-token output, reasoning display, tool call cards
-- **Three-layer memory** — Working (token-driven), Compressed (LLM incremental summary via `summarizer/`), Archive (FTS5/vector searchable, never deleted)
+- **Structured tool results** — `ToolResult` carries content/JSON/error/truncation; oversized output spills to disk automatically (line-wrapped, read/grep-friendly) instead of flooding the model context
+- **Approval policy engine** — layered chain (rules → safety → approval memory → human) with argument editing and persistent "always allow" decisions
+- **Self-evolution** — LLM extractor turns finished runs into durable knowledge, recalled into later sessions
+- **Three-layer memory** — Working (token-driven), Compressed (LLM incremental summary via `summarizer/`), Archive (FTS5/vector searchable, never deleted); all three are provider-pluggable, including a remote OpenViking context database
 - **Sandbox** — native OS-level confinement (Linux bwrap, macOS Seatbelt) for shell, file, and network operations
 - **WASM plugins** — agent-level: `agent:tools` and `agent:observers` plug into the tool/observer pipeline. CLI-level: `cli:settings`, `cli:commands`, `cli:observers` for settings injection, command extension, and lifecycle monitoring
 - **Static context profiles** — `AGENTS.md` (working rules) and `SOUL.md` (persona & limits) with user-level and project-level resolution
@@ -172,17 +175,27 @@ Each `max_size` unit is megabytes. Logs go to both stderr *and* the file. Set `l
 
 ```
 ┌──────────────────────────────────────────────┐
-│  Agent                                       │
-│  ├── Model        (LLM provider)             │
-│  ├── Memory       (conversation storage)     │
-│  ├── Tools        (shell, file, grep, ...)   │
-│  ├── InGuard      (input validation)         │
-│  ├── OutGuard     (output validation)        │
-│  ├── Approver     (tool call confirmation)   │
-│  ├── Hooks        (lifecycle callbacks)      │
-│  └── Observer     (pipeline monitoring)      │
+│  Application (rest / acp / cmd/cli)          │
+│    assembles agent config + runtime deps     │
+└──────────────────┬───────────────────────────┘
+                   ▼
+┌──────────────────────────────────────────────┐
+│  kernel.Runtime  (8-node execution engine)   │
+│  ├─ context     (AgentContext assembly +     │
+│  │               knowledge recall)           │
+│  ├─ execution   (tool jobs, retry, stream)   │
+│  ├─ governance  (approval policy chain:      │
+│  │               rules→safety→memory→human)  │
+│  ├─ session     (store + token-budget        │
+│  │               compression)                │
+│  ├─ provider/   (memory | skill | resource)  │
+│  └─ eventbus    (audit events)               │
 └──────────────────────────────────────────────┘
 ```
+
+The `agent.Agent` is pure configuration (model, prompts, guards, sub-agents);
+everything executable lives in the runtime and its dependencies — tools,
+stores, policies, hooks, and observers are interfaces injected at assembly.
 
 ## Plugins
 
@@ -311,7 +324,7 @@ Full example: `examples/plugin/`. Rust SDK: `plugin/pdk/rust/`.
 | `examples/acp/` | ACP agent protocol (server + client) |
 | `examples/iac/` | Multi-agent IaC pipeline |
 | `examples/backend/` | Full REST + SSE API server |
-| `examples/artifact/` | Artifact hook — saves large tool results to disk |
+| `examples/artifact/` | Result policy — large tool results spill to disk |
 | `examples/browser-agent/` | Browser agent via Playwright MCP |
 | `examples/mcp-client/` | MCP client demo (IaC pipeline) |
 | `cmd/cli/` | Full-featured CLI with WASM plugin runtime |
@@ -320,7 +333,11 @@ Full example: `examples/plugin/`. Rust SDK: `plugin/pdk/rust/`.
 
 | Package | Purpose |
 |---------|---------|
-| `openagent` | Core types, Agent, Team, Runner, Memory, Sandbox |
+| `openagent` | Core types — Agent (pure config), Team, ToolResult, token helpers |
+| `kernel/` | Runtime — the 8-node execution engine (memory → prompt → guard → model → guard → policy → tools → store) |
+| `execution/` | Tool execution — parallel jobs, retry, streaming, result policy |
+| `governance/` | Approval policy engine — rules → safety → memory → human, persistent decisions |
+| `context/` | AgentContext assembly — knowledge recall, skill match, LLM extractor (self-evolution) |
 | `acp/sdk/` | ACP v1 protocol SDK — types, JSON-RPC 2.0 mux, client |
 | `acp/` | AgentServer — wraps an Agent as an ACP handler |
 | `rest/` | REST + SSE handlers (single, team, orchestrate) |
@@ -328,14 +345,16 @@ Full example: `examples/plugin/`. Rust SDK: `plugin/pdk/rust/`.
 | `plan/` | `plan_create`/`plan_update` tools (ACP plan mode) |
 | `slash/` | Slash command registry and dispatch |
 | `summarizer/` | LLM-based incremental conversation compression |
-| `memory/sqlite/` | SQLite + FTS5 + vector memory backend |
-| `memory/file/` | JSONL file memory backend |
-| `model/openai/` | OpenAI ChatCompletion + streaming |
-| `tokenizer/` | tiktoken model-aware token counting |
-| `sandbox/native/` | OS-level process confinement (bwrap/Seatbelt) |
-| `session/` | Session metadata types and store interface |
+| `session/` | Session store interface + token-budget compression |
 | `session/sqlite/` | SQLite session store |
 | `session/file/` | File-backed session store |
+| `provider/memory/` | Durable knowledge backends (sqlite, file) |
+| `provider/skill/` | On-demand skill matching/loading |
+| `provider/resource/` | External reference resources |
+| `provider/openviking/` | OpenViking context database client (memory/skill/resource over HTTP) |
+| `model/openai/` | OpenAI ChatCompletion + streaming |
+| `tokenizer/` | tiktoken model-aware token counting (sampled estimate for huge texts) |
+| `sandbox/native/` | OS-level process confinement (bwrap/Seatbelt) |
 | `eventbus/` | Session-scoped pub/sub for SSE |
 | `plugin/wasmhost/` | Shared WASM host module (keyring, HTTP, logging, utc_now) |
 | `plugin/agent/wasm/` | Agent-scoped WASM plugin host |
@@ -347,7 +366,6 @@ Full example: `examples/plugin/`. Rust SDK: `plugin/pdk/rust/`.
 | `guard/llm/` | LLM-based input/output guard |
 | `hooks/otel/` | OpenTelemetry hooks |
 | `hooks/slog/` | Structured logging hooks |
-| `hooks/artifact/` | Artifact hook — saves large tool results to disk |
-| `tool/` | Built-in tools (shell, read, write, ls, grep, edit, artifact, websearch, webfetch, ACP fs, ACP terminal) |
+| `tool/` | Built-in tools (shell, read, write, ls, grep, edit, websearch, webfetch, ACP fs, ACP terminal) |
 | `channel/` | IM platform adapters — Feishu WebSocket, card rendering |
 | `cmd/cli/` | CLI runtime, WASM host, Rust SDK examples |

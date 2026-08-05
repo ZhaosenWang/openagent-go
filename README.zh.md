@@ -12,7 +12,10 @@
 - **多智能体团队** — agent 之间通过 `transfer_to_*` 工具交接任务；每个 agent 有独立的记忆、工具和守卫
 - **多智能体编排** — LLM 驱动的 DAG 分解、并行执行和自动重规划（`orchestrate/`）
 - **SSE 流式输出** — 实时逐 token 渲染，支持 reasoning 展示、工具调用卡片
-- **三层记忆系统** — Working（token 驱动）、Compressed（LLM 增量摘要，`summarizer/`）、Archive（FTS5/向量检索，永不删除）
+- **结构化工具结果** — `ToolResult` 携带内容/JSON/错误/截断状态；超长输出自动落盘（按行包装、read/grep 可读），不淹没模型上下文
+- **审批策略引擎** — 分层策略链（规则 → 安全 → 审批记忆 → 人工），支持参数编辑和跨重启的 "始终允许" 决策
+- **自我进化** — LLM 提取器将完成的对话转化为持久知识，在后续会话中召回
+- **三层记忆系统** — Working（token 驱动）、Compressed（LLM 增量摘要，`summarizer/`）、Archive（FTS5/向量检索，永不删除）；三层均可插拔 Provider，含远程 OpenViking 上下文数据库
 - **沙箱环境** — 原生 OS 级别隔离（Linux bwrap、macOS Seatbelt），安全执行 shell、文件、网络操作
 - **WASM 插件** — Agent 级：`agent:tools` 和 `agent:observers` 接入工具/观测器管线。CLI 级：`cli:settings`、`cli:commands`、`cli:observers`，用于设置注入、命令扩展和生命周期监控
 - **静态上下文配置** — `AGENTS.md`（工作规则）和 `SOUL.md`（性格与底线），支持用户级和项目级覆盖
@@ -172,17 +175,24 @@ MCP 工具在启动时即可用，每次工具调用以卡片形式展示在飞�
 
 ```
 ┌──────────────────────────────────────────────┐
-│  Agent                                       │
-│  ├── Model        (LLM 提供商)               │
-│  ├── Memory       (对话持久化)               │
-│  ├── Tools        (shell, 读写文件, ...)     │
-│  ├── InGuard      (输入校验)                 │
-│  ├── OutGuard     (输出校验)                 │
-│  ├── Approver     (工具调用的用户确认)       │
-│  ├── Hooks        (生命周期回调)             │
-│  └── Observer     (pipeline 监控)            │
+│  应用层 (rest / acp / cmd/cli)               │
+│    组装 agent 配置 + 运行时依赖              │
+└──────────────────┬───────────────────────────┘
+                   ▼
+┌──────────────────────────────────────────────┐
+│  kernel.Runtime  (8 节点执行引擎)            │
+│  ├─ context     (AgentContext 组装 +         │
+│  │               知识召回)                   │
+│  ├─ execution   (工具任务、重试、流式)       │
+│  ├─ governance  (审批策略链：                │
+│  │               规则→安全→记忆→人工)        │
+│  ├─ session     (存储 + token 预算压缩)      │
+│  ├─ provider/   (memory | skill | resource)  │
+│  └─ eventbus    (审计事件)                   │
 └──────────────────────────────────────────────┘
 ```
+
+`agent.Agent` 是纯配置（模型、提示词、守卫、子 agent）；所有可执行逻辑都在运行时及其依赖中——工具、存储、策略、hooks、observer 均为组装时注入的接口。
 
 ## 插件
 
@@ -311,7 +321,7 @@ pub extern "C" fn openagent_on_stage(event_json: &str) {
 | `examples/acp/` | ACP agent 协议（server + client） |
 | `examples/iac/` | 多 agent IaC 流水线 |
 | `examples/backend/` | 完整 REST + SSE API 服务 |
-| `examples/artifact/` | Artifact 钩子 — 将大型工具结果保存到磁盘 |
+| `examples/artifact/` | 结果策略 — 大型工具结果落盘 |
 | `examples/browser-agent/` | 基于 Playwright MCP 的浏览器 agent |
 | `examples/mcp-client/` | MCP 客户端示例（IaC 流水线） |
 | `cmd/cli/` | 完整 CLI，含 WASM 插件运行时 |
@@ -320,7 +330,11 @@ pub extern "C" fn openagent_on_stage(event_json: &str) {
 
 | 包 | 用途 |
 |----|------|
-| `openagent` | 核心类型、Agent、Team、Runner、Memory、Sandbox |
+| `openagent` | 核心类型 — Agent（纯配置）、Team、ToolResult、token 辅助 |
+| `kernel/` | Runtime — 8 节点执行引擎（记忆 → 提示词 → 守卫 → 模型 → 守卫 → 策略 → 工具 → 存储） |
+| `execution/` | 工具执行 — 并行任务、重试、流式、结果策略 |
+| `governance/` | 审批策略引擎 — 规则 → 安全 → 记忆 → 人工，持久化决策 |
+| `context/` | AgentContext 组装 — 知识召回、技能匹配、LLM 提取器（自我进化） |
 | `acp/sdk/` | ACP v1 协议 SDK — 类型定义、JSON-RPC 2.0 mux、客户端 |
 | `acp/` | AgentServer — 将 Agent 包装为 ACP handler |
 | `rest/` | REST + SSE 处理器（单 agent / team / orchestrate） |
@@ -328,14 +342,16 @@ pub extern "C" fn openagent_on_stage(event_json: &str) {
 | `plan/` | `plan_create`/`plan_update` 工具（ACP plan 模式） |
 | `slash/` | Slash 命令注册表和分发 |
 | `summarizer/` | 基于 LLM 的增量对话压缩 |
-| `memory/sqlite/` | SQLite + FTS5 + 向量记忆后端 |
-| `memory/file/` | JSONL 文件记忆后端 |
-| `model/openai/` | OpenAI ChatCompletion + 流式 |
-| `tokenizer/` | tiktoken 模型感知 token 计数 |
-| `sandbox/native/` | OS 级进程隔离（bwrap/Seatbelt） |
-| `session/` | 会话元数据类型和存储接口 |
+| `session/` | 会话存储接口 + token 预算压缩 |
 | `session/sqlite/` | SQLite 会话存储 |
 | `session/file/` | 文件会话存储 |
+| `provider/memory/` | 持久知识后端（sqlite、file） |
+| `provider/skill/` | 按需技能匹配/加载 |
+| `provider/resource/` | 外部参考资料 |
+| `provider/openviking/` | OpenViking 上下文数据库客户端（memory/skill/resource 走 HTTP） |
+| `model/openai/` | OpenAI ChatCompletion + 流式 |
+| `tokenizer/` | tiktoken 模型感知 token 计数（超长文本抽样估算） |
+| `sandbox/native/` | OS 级进程隔离（bwrap/Seatbelt） |
 | `eventbus/` | 会话级发布订阅（SSE） |
 | `plugin/wasmhost/` | 共享 WASM host 模块（keyring、HTTP、日志、utc_now） |
 | `plugin/agent/wasm/` | Agent 级 WASM 插件宿主 |
@@ -347,7 +363,6 @@ pub extern "C" fn openagent_on_stage(event_json: &str) {
 | `guard/llm/` | 基于 LLM 的输入/输出守卫 |
 | `hooks/otel/` | OpenTelemetry 钩子 |
 | `hooks/slog/` | 结构化日志钩子 |
-| `hooks/artifact/` | Artifact 钩子 — 将大型工具结果保存到磁盘 |
-| `tool/` | 内置工具 (shell, read, write, ls, grep, edit, artifact, websearch, webfetch, ACP fs, ACP terminal) |
+| `tool/` | 内置工具 (shell, read, write, ls, grep, edit, websearch, webfetch, ACP fs, ACP terminal) |
 | `channel/` | IM 平台适配器 — 飞书 WebSocket、卡片渲染 |
 | `cmd/cli/` | CLI 运行时、WASM 宿主、Rust SDK 示例 |
