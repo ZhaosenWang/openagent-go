@@ -31,6 +31,12 @@ type Channel struct {
 	client *lark.Client
 	ws     *larkws.Client
 	once   sync.Once
+
+	// onReady is invoked by the SDK once the WebSocket is connected and
+	// ready to receive messages (nil = ignore). Used by the connection
+	// manager to flip its status from connecting → connected.
+	onReady        func()
+	onReconnecting func()
 }
 
 // New returns a Feishu Channel. The Channel must be started via Start() to
@@ -38,6 +44,14 @@ type Channel struct {
 func New(appID, appSecret string) *Channel {
 	return &Channel{appID: appID, appSecret: appSecret}
 }
+
+// SetOnReady registers the connection-ready callback (nil clears it).
+// Fired on every successful WebSocket connection, including reconnects.
+func (c *Channel) SetOnReady(f func()) { c.onReady = f }
+
+// SetOnReconnecting registers the reconnecting callback (nil clears it).
+// Fired when the SDK loses the connection and starts auto-reconnecting.
+func (c *Channel) SetOnReconnecting(f func()) { c.onReconnecting = f }
 
 // Name implements channel.Channel.
 func (c *Channel) Name() string { return "feishu" }
@@ -68,6 +82,12 @@ func (c *Channel) Start(ctx context.Context, handler channel.MessageHandler) err
 		larkws.WithEventHandler(dh),
 		larkws.WithLogLevel(larkcore.LogLevelError),
 	)
+	if c.onReady != nil {
+		c.ws.SetOnReady(c.onReady)
+	}
+	if c.onReconnecting != nil {
+		c.ws.SetOnReconnecting(c.onReconnecting)
+	}
 
 	return c.ws.Start(ctx)
 }

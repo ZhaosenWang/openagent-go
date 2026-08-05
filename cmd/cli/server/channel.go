@@ -12,55 +12,34 @@ import (
 	openagent "github.com/yusheng-g/openagent-go"
 	"github.com/yusheng-g/openagent-go/agent"
 	"github.com/yusheng-g/openagent-go/channel"
-	"github.com/yusheng-g/openagent-go/channel/feishu"
 	"github.com/yusheng-g/openagent-go/kernel"
 
 	"github.com/yusheng-g/openagent-go/cmd/cli/config"
 )
 
-// RunChannels starts all configured IM channels.
-// cfg is the agent configuration (pure); deps carry the runtime
-// capabilities (Tools, Memory, Hooks, Observer).
-func RunChannels(ctx context.Context, cfg *agent.Agent, deps kernel.Deps, channelsCfg config.ChannelsConfig) error {
-	var channels []channel.Channel
-
-	if channelsCfg.Feishu != nil {
-		channels = append(channels, feishu.New(channelsCfg.Feishu.AppID, channelsCfg.Feishu.AppSecret))
+// RunChannels wires the feishu connection manager. The manager is ALWAYS
+// created — the frontend control panel needs the status/connect endpoints
+// even when no channel is configured at startup; connection is only
+// auto-started when the channel is configured (--channel flag or settings
+// channels.feishu).
+//
+// Start failure is fail-fast for an explicitly flagged channel
+// (--channel feishu): the user asked for the bot, so running silently
+// without it would read as "connected" while delivering nothing. A
+// settings-only channel degrades to a warning and the server continues.
+func RunChannels(ctx context.Context, profiles string, cfg *agent.Agent, deps kernel.Deps, channelsCfg config.ChannelsConfig) (*FeishuManager, error) {
+	mgr := NewFeishuManager(ctx, profiles, channelsCfg.Feishu, cfg, deps)
+	if channelsCfg.Feishu == nil {
+		return mgr, nil // not configured — frontend triggers connect via the API
 	}
-
-	if len(channels) == 0 {
-		return nil
+	if err := mgr.Connect(); err != nil {
+		if channelsCfg.Feishu.Explicit {
+			return nil, err
+		}
+		slog.Warn("feishu channel not started (settings-only channel)", "error", err)
+		return mgr, nil
 	}
-
-	for _, ch := range channels {
-		slog.Info("channel starting", "name", ch.Name())
-		go func(ch channel.Channel) {
-			handler := channel.MessageHandler(func(msgCtx context.Context, msg channel.IncomingMessage, reply channel.ReplyFunc) {
-				sessionID := ch.Name() + "_" + msg.ChatID
-
-				go func() {
-					// Carry the resolved Model instance so downstream
-					// consumers (RunHooks via SessionFromContext, e.g. the
-					// artifact hook's context-window threshold) read the
-					// same model the runner uses. cfg.Model was injected in
-					// acp.go before RunChannels.
-					session := openagent.Session{
-						ID:        sessionID,
-						Model:     cfg.Model,
-						CreatedAt: time.Now(),
-					}
-					stream := kernel.New(cfg, deps).RunStream(msgCtx, session, openagent.UserMessage(msg.Text))
-					streamReply(reply, stream)
-				}()
-			})
-
-			if err := ch.Start(ctx, handler); err != nil {
-				slog.Warn("channel stopped", "name", ch.Name(), "error", err)
-			}
-		}(ch)
-	}
-
-	return nil
+	return mgr, nil
 }
 
 // patchQueue decouples card rendering from Feishu API calls.

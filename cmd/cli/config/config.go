@@ -159,6 +159,12 @@ type ChannelsConfig struct {
 type FeishuConfig struct {
 	AppID     string `json:"app_id"`
 	AppSecret string `json:"app_secret"`
+
+	// Explicit marks a channel requested via --channel on the command
+	// line (never persisted, never read from settings). An explicit
+	// channel fails fast when it cannot start; a settings-only channel
+	// degrades to a warning so the REST/ACP server still runs.
+	Explicit bool `json:"-"`
 }
 
 // SandboxConfig controls the native sandbox used by the CLI server modes.

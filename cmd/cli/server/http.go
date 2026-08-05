@@ -113,10 +113,15 @@ func RunREST(ctx context.Context, cfg *config.Config, caps config.Capabilities) 
 		handler.WithPluginManager(mgr)
 	}
 
-	// Start IM channels in the background.
-	if err := RunChannels(ctx, agentCfg, deps, cfg.Channels); err != nil {
-		slog.Warn("channel error", "error", err)
+	// Start IM channels (immediate-connect; fail-fast for an explicitly
+	// flagged channel). The manager is ALWAYS handed to the REST handler
+	// (even when no channel is configured) so the frontend can query
+	// status and trigger connect/registration on demand.
+	chMgr, err := RunChannels(ctx, cfg.Profiles, agentCfg, deps, cfg.Channels)
+	if err != nil {
+		return err
 	}
+	handler.WithFeishuManager(chMgr)
 
 	mux := http.NewServeMux()
 	handler.Register(mux)

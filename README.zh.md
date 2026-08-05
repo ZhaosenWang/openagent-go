@@ -140,6 +140,19 @@ export BOCHA_API_KEY=<你的-key>   # 在 https://open.bochaai.com 获取
 ./openagent-cli serve --acp --channel feishu
 ```
 
+**前端控制面板：**
+
+飞书连接是**进程级守护任务** —— 前端只负责触发和展示，关闭/刷新页面不影响连接。服务暴露两个接口：
+
+| 接口 | 用途 |
+|------|------|
+| `GET /api/channels/feishu/status` | 连接状态（`connected`、`app_id`、`connected_at`）——页面加载时调用，之后每几秒轮询 |
+| `POST /api/channels/feishu/connect` | 启动连接；无持久化凭据时触发扫码注册，返回 `202 {status:"registration", qr_url}` 供前端渲染二维码 |
+
+前端流程：加载 → `GET status` → 显示状态 → 点"连接" → `POST connect` → 渲染二维码（如返回）→ 轮询 `status` 直到 `connected`。
+
+**每个 profile 单实例：** 一个飞书 app = 一个活跃 WebSocket。服务在连接期间持有机器级锁（`$profile/channel/feishu/feishu.lock`）——第二个 `--channel feishu` 实例会快速失败报错，而不是静默抢走事件。凭据存放在 `$profile/channel/feishu/feishu_app.json`；不同 profile 是独立的 bot（多 bot 用独立 profile 或容器部署）。进程死亡时锁由内核自动释放。生产部署建议用 systemd/Docker 托管进程（及其连接）。
+
 **配置 MCP 工具（可选）：**
 
 ```json

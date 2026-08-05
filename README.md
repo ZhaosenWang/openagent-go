@@ -140,6 +140,19 @@ The `--channel` flag is always required to start the bot — settings.json alone
 ./openagent-cli serve --acp --channel feishu
 ```
 
+**Frontend control panel:**
+
+The Feishu connection is a **process-level daemon** — the frontend only triggers and observes; closing or refreshing the page never affects it. Serve exposes two endpoints:
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /api/channels/feishu/status` | Connection state (`connected`, `app_id`, `connected_at`) — call on page load, then poll every few seconds |
+| `POST /api/channels/feishu/connect` | Start the connection; with no persisted credentials it starts QR registration and returns `202 {status:"registration", qr_url}` for the frontend to render |
+
+Frontend flow: load → `GET status` → show state → "Connect" button → `POST connect` → render QR (if returned) → poll `status` until `connected`.
+
+**Single instance per profile:** one Feishu app = one active WebSocket. The server holds a machine-level lock (`$profile/channel/feishu/feishu.lock`) for the whole connection lifetime — a second `--channel feishu` instance fails fast instead of silently stealing events. Credentials live in `$profile/channel/feishu/feishu_app.json`; different profiles are independent bots (run multiple bots via separate profiles or containers). The lock is released automatically by the kernel if the process dies. For production, run under systemd/Docker so the process (and its connection) is supervised.
+
 **Adding MCP tools (optional):**
 
 ```json

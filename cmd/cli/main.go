@@ -240,25 +240,20 @@ func buildServeCmd(cfg config.Config) *cobra.Command {
 
 			ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 
-			// Channels are only enabled when --channel is explicitly set.
-			// settings.json credentials alone do NOT auto-start a channel.
+			// --channel feishu marks the channel as explicitly requested
+			// (immediate-connect; fail-fast when it cannot start).
+			// Credential resolution, the machine lock, and the connection
+			// itself all live in the channel manager (RunChannels), so
+			// this branch only flags intent. Without the flag, a
+			// settings-only channel still connects at startup but
+			// degrades to a warning when locked.
 			if channelFlag != "feishu" {
 				cfg.Channels = config.ChannelsConfig{}
 			} else {
-				creds, err := server.ResolveFeishuCredentials(ctx)
-				if err != nil {
-					cancel()
-					return fmt.Errorf("feishu: %w", err)
-				}
 				if cfg.Channels.Feishu == nil {
 					cfg.Channels.Feishu = &config.FeishuConfig{}
 				}
-				if cfg.Channels.Feishu.AppID == "" {
-					cfg.Channels.Feishu.AppID = creds.AppID
-				}
-				if cfg.Channels.Feishu.AppSecret == "" {
-					cfg.Channels.Feishu.AppSecret = creds.AppSecret
-				}
+				cfg.Channels.Feishu.Explicit = true
 			}
 			defer cancel()
 			if isACP {

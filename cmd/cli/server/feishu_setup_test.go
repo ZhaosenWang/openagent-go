@@ -7,27 +7,40 @@ import (
 	"testing"
 )
 
-func TestSaveAndLoadFeishuAppFile(t *testing.T) {
-	// Use a temp dir to avoid touching real credentials.
+// isolateProfiles points profile resolution at a temp directory: CWD is
+// moved (resolveProfilesDir prefers $(pwd)/profiles) and HOME is set so
+// the fallback lands in the same sandbox. Real credentials are never
+// touched.
+func isolateProfiles(t *testing.T) string {
+	t.Helper()
 	dir := t.TempDir()
-	orig := feishuAppPath
-	defer func() { feishuAppPath = orig }()
-	feishuAppPath = func() string {
-		return filepath.Join(dir, "feishu_app.json")
+	t.Chdir(dir)
+	t.Setenv("HOME", dir)
+	return ".openagent/profile"
+}
+
+func TestSaveAndLoadFeishuAppFile(t *testing.T) {
+	profiles := isolateProfiles(t)
+	path := feishuAppPath(profiles)
+	if !filepath.IsAbs(path) {
+		t.Fatalf("credential path not absolute: %q", path)
+	}
+	if filepath.Dir(path) != filepath.Join(profilesDir(t, profiles), "channel", "feishu") {
+		t.Fatalf("credential path not under $profile/channel/feishu: %q", path)
 	}
 
 	// Initial load should return false.
-	_, ok := loadFeishuAppFile()
+	_, ok := loadFeishuAppFile(profiles)
 	if ok {
 		t.Fatal("expected no credentials before save")
 	}
 
 	// Save credentials.
 	creds := FeishuCredentials{AppID: "cli_test123", AppSecret: "secret456"}
-	saveFeishuAppFile(creds)
+	saveFeishuAppFile(profiles, creds)
 
-	// Verify file exists and is valid JSON.
-	data, err := os.ReadFile(feishuAppPath())
+	// Verify file exists, is valid JSON, and is 0600.
+	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("failed to read saved file: %v", err)
 	}
@@ -38,9 +51,12 @@ func TestSaveAndLoadFeishuAppFile(t *testing.T) {
 	if decoded.AppID != "cli_test123" || decoded.AppSecret != "secret456" {
 		t.Errorf("decoded = %+v", decoded)
 	}
+	if info, err := os.Stat(path); err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("credential file perms = %v, want 0600", info.Mode().Perm())
+	}
 
 	// Load should succeed.
-	loaded, ok := loadFeishuAppFile()
+	loaded, ok := loadFeishuAppFile(profiles)
 	if !ok {
 		t.Fatal("expected credentials after save")
 	}
@@ -50,31 +66,63 @@ func TestSaveAndLoadFeishuAppFile(t *testing.T) {
 }
 
 func TestLoadFeishuAppFileEmptyFields(t *testing.T) {
-	dir := t.TempDir()
-	orig := feishuAppPath
-	defer func() { feishuAppPath = orig }()
-	feishuAppPath = func() string {
-		return filepath.Join(dir, "feishu_app.json")
-	}
+	profiles := isolateProfiles(t)
 
 	// Save empty credentials — load should return false.
-	_ = os.WriteFile(feishuAppPath(), []byte(`{"app_id":"","app_secret":""}`), 0600)
-	_, ok := loadFeishuAppFile()
+	p := feishuAppPath(profiles)
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte(`{"app_id":"","app_secret":""}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, ok := loadFeishuAppFile(profiles)
 	if ok {
 		t.Fatal("empty credentials should not be considered valid")
 	}
 }
 
 func TestLoadFeishuAppFileMissing(t *testing.T) {
-	dir := t.TempDir()
-	orig := feishuAppPath
-	defer func() { feishuAppPath = orig }()
-	feishuAppPath = func() string {
-		return filepath.Join(dir, "nonexistent", "feishu_app.json")
-	}
-
-	_, ok := loadFeishuAppFile()
+	profiles := isolateProfiles(t)
+	_, ok := loadFeishuAppFile(profiles)
 	if ok {
 		t.Fatal("missing file should return false")
 	}
+}
+
+// Legacy credentials (~/.openagent/data/feishu_app.json) must migrate
+// into the profile location on first load.
+func TestLoadFeishuAppFileMigratesLegacy(t *testing.T) {
+	profiles := isolateProfiles(t)
+	home, _ := os.UserHomeDir()
+	legacy := filepath.Join(home, ".openagent", "data", "feishu_app.json")
+	if err := os.MkdirAll(filepath.Dir(legacy), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	legacyCreds := FeishuCredentials{AppID: "cli_legacy", AppSecret: "legacy_secret"}
+	data, _ := json.Marshal(legacyCreds)
+	if err := os.WriteFile(legacy, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, ok := loadFeishuAppFile(profiles)
+	if !ok {
+		t.Fatal("legacy credentials should load")
+	}
+	if loaded.AppID != "cli_legacy" {
+		t.Fatalf("loaded = %+v", loaded)
+	}
+	// Migrated copy exists in the profile location; legacy file untouched.
+	if _, err := os.Stat(feishuAppPath(profiles)); err != nil {
+		t.Fatalf("migrated copy missing: %v", err)
+	}
+	if _, err := os.Stat(legacy); err != nil {
+		t.Fatalf("legacy file removed: %v", err)
+	}
+}
+
+// profilesDir resolves the profile root the same way feishuAppPath does.
+func profilesDir(t *testing.T, profiles string) string {
+	t.Helper()
+	return resolveProfilesDir(profiles)
 }

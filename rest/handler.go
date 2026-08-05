@@ -55,6 +55,10 @@ type Handler struct {
 	deps      kernel.Deps   // template runtime deps (copied per session)
 	pluginMgr *wasm.Manager // nil = plugins disabled, set by WithPluginManager
 
+	// feishu is the process-level feishu connection manager (nil when
+	// feishu is not configured); status/connect endpoints 404 without it.
+	feishu FeishuChannel
+
 	// approverEnabled gates the per-session WithApprover. Default false
 	// (no approval step — tools run unapproved); the CLI enables it via
 	// --approver=on / settings. Set via WithApproverEnabled.
@@ -216,6 +220,8 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /sessions/{id}", h.handleDeleteSession)
 	mux.HandleFunc("POST /sessions/{id}/chat", h.handleChat)
 	mux.HandleFunc("POST /sessions/{id}/approve", h.handleApprove)
+	mux.HandleFunc("GET /api/channels/feishu/status", h.handleFeishuStatus)
+	mux.HandleFunc("POST /api/channels/feishu/connect", h.handleFeishuConnect)
 	mux.HandleFunc("GET /models", h.handleListModels)
 }
 
