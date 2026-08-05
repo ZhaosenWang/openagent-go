@@ -127,7 +127,7 @@ export BOCHA_API_KEY=<你的-key>   # 在 https://open.bochaai.com 获取
 | 优先级 | 来源 | 场景 |
 |--------|------|------|
 | 1 | `settings.json` → `channels.feishu` | 已有应用凭据 |
-| 2 | `~/.openagent/data/feishu_app.json` | 上次扫码自动保存 |
+| 2 | settings.json `channels.feishu` | 上次扫码自动保存（settings 是唯一凭据源） |
 | 3 | 扫码注册 | 首次使用，无任何凭据 |
 
 **组合其他模式：**
@@ -148,10 +148,13 @@ export BOCHA_API_KEY=<你的-key>   # 在 https://open.bochaai.com 获取
 |------|------|
 | `GET /api/channels/feishu/status` | 连接状态（`connected`、`app_id`、`connected_at`）——页面加载时调用，之后每几秒轮询 |
 | `POST /api/channels/feishu/connect` | 启动连接；无持久化凭据时触发扫码注册，返回 `202 {status:"registration", qr_url}` 供前端渲染二维码 |
+| `POST /api/channels/feishu/disconnect` | 断开连接（释放机器锁）；之后 `POST /connect` 重新建立 |
+| `GET /api/settings/channels/feishu` | 飞书配置（`app_id`、脱敏 `app_secret`）——secret 绝不完整出服务端 |
+| `PUT /api/settings/channels/feishu` | 保存飞书配置（`{app_id, app_secret}`，secret 留空 = 保持原值）——写入 settings.json，下次连接生效 |
 
-前端流程：加载 → `GET status` → 显示状态 → 点"连接" → `POST connect` → 渲染二维码（如返回）→ 轮询 `status` 直到 `connected`。
+**配置与连接分离**：`PUT /api/settings/channels/feishu` 只保存（持久化到 settings.json 的 `channels.feishu`，并更新运行中服务的内存配置）；让新值生效是前端的显式两步——`POST /disconnect` + `POST /connect`（断开后的 connect 不会被"已连接"短路）。settings.json 是唯一凭据源：手写配置、界面提交、扫码注册产物都落在这里。前端流程：加载 → `GET status` → 显示状态 → "连接"按钮（扫码注册）或配置表单（`GET/PUT /api/settings/channels/feishu`）→ 轮询 `status` 直到 `connected`。
 
-**每个 profile 单实例：** 一个飞书 app = 一个活跃 WebSocket。服务在连接期间持有机器级锁（`$profile/channel/feishu/feishu.lock`）——第二个 `--channel feishu` 实例会快速失败报错，而不是静默抢走事件。凭据存放在 `$profile/channel/feishu/feishu_app.json`；不同 profile 是独立的 bot（多 bot 用独立 profile 或容器部署）。进程死亡时锁由内核自动释放。生产部署建议用 systemd/Docker 托管进程（及其连接）。
+**每个 profile 单实例：** 一个飞书 app = 一个活跃 WebSocket。服务在连接期间持有机器级锁（`$profile/channel/feishu/feishu.lock`）——第二个 `--channel feishu` 实例会快速失败报错，而不是静默抢走事件。进程死亡时锁由内核自动释放。生产部署建议用 systemd/Docker 托管进程（及其连接）。
 
 **配置 MCP 工具（可选）：**
 

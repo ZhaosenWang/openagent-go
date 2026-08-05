@@ -127,7 +127,7 @@ The `--channel` flag is always required to start the bot — settings.json alone
 | Priority | Source | When to use |
 |----------|--------|-------------|
 | 1 | `settings.json` → `channels.feishu` | You have the app ID and secret |
-| 2 | `~/.openagent/data/feishu_app.json` | Auto-saved after QR registration |
+| 2 | settings.json `channels.feishu` | Auto-saved after QR registration (settings is the single credential source) |
 | 3 | QR code registration | First time, no credentials at all |
 
 **Combine with other modes:**
@@ -148,10 +148,13 @@ The Feishu connection is a **process-level daemon** — the frontend only trigge
 |----------|---------|
 | `GET /api/channels/feishu/status` | Connection state (`connected`, `app_id`, `connected_at`) — call on page load, then poll every few seconds |
 | `POST /api/channels/feishu/connect` | Start the connection; with no persisted credentials it starts QR registration and returns `202 {status:"registration", qr_url}` for the frontend to render |
+| `POST /api/channels/feishu/disconnect` | Tear down the connection (releases the machine lock); a later `POST /connect` re-establishes it |
+| `GET /api/settings/channels/feishu` | The feishu configuration (`app_id`, masked `app_secret`) — the secret never leaves the server unmasked |
+| `PUT /api/settings/channels/feishu` | Store the feishu configuration (`{app_id, app_secret}`, empty secret keeps the current one) — written to settings.json, applied on the next connect |
 
-Frontend flow: load → `GET status` → show state → "Connect" button → `POST connect` → render QR (if returned) → poll `status` until `connected`.
+Configuration is separate from the connection: `PUT /api/settings/channels/feishu` only saves (persisted to settings.json `channels.feishu`, applied to the running server's in-memory config); applying the new values is the frontend's explicit two-step — `POST /disconnect` + `POST /connect` (a connect after disconnect cannot short-circuit on a stale "connected"). settings.json is the single credential source: manual config, frontend submissions, and QR-registration artifacts all land there. Frontend flow: load → `GET status` → show state → "Connect" button (QR registration) or the config form (`GET/PUT /api/settings/channels/feishu`) → poll `status` until `connected`.
 
-**Single instance per profile:** one Feishu app = one active WebSocket. The server holds a machine-level lock (`$profile/channel/feishu/feishu.lock`) for the whole connection lifetime — a second `--channel feishu` instance fails fast instead of silently stealing events. Credentials live in `$profile/channel/feishu/feishu_app.json`; different profiles are independent bots (run multiple bots via separate profiles or containers). The lock is released automatically by the kernel if the process dies. For production, run under systemd/Docker so the process (and its connection) is supervised.
+**Single instance per profile:** one Feishu app = one active WebSocket. The server holds a machine-level lock (`$profile/channel/feishu/feishu.lock`) for the whole connection lifetime — a second `--channel feishu` instance fails fast instead of silently stealing events. The lock is released automatically by the kernel if the process dies. For production, run under systemd/Docker so the process (and its connection) is supervised.
 
 **Adding MCP tools (optional):**
 

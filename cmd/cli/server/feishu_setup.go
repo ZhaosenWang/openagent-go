@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -10,6 +11,9 @@ import (
 
 	"github.com/larksuite/oapi-sdk-go/v3/scene/registration"
 	"github.com/mdp/qrterminal/v3"
+	"github.com/skip2/go-qrcode"
+
+	"github.com/yusheng-g/openagent-go/cmd/cli/config"
 )
 
 // FeishuCredentials holds resolved app credentials.
@@ -18,107 +22,93 @@ type FeishuCredentials struct {
 	AppSecret string
 }
 
-// ResolveFeishuCredentials obtains Feishu app credentials. Resolution order:
-//  1. settings.json channels.feishu (already loaded into cfg — checked by caller)
-//  2. $profile/channel/feishu/feishu_app.json (persisted from previous registration)
-//  3. QR code registration flow (blocks until user authorizes)
+// ResolveFeishuCredentials runs the QR code registration flow (blocks
+// until the user authorizes) and persists the created app's credentials
+// to settings.json — settings is the single credential source.
 //
 // onQR, when non-nil, receives the registration QR info (an API-driven
 // caller renders it for the user instead of the terminal); when nil the
 // QR is printed to stderr.
 func ResolveFeishuCredentials(ctx context.Context, profiles string, onQR func(url string, expireIn int)) (FeishuCredentials, error) {
-	// Try persisted file first.
-	creds, ok := loadFeishuAppFile(profiles)
-	if ok {
-		fmt.Fprintln(os.Stderr, "feishu: using persisted credentials from "+feishuAppPath(profiles))
-		return creds, nil
-	}
-
-	// QR code registration.
 	fmt.Fprintln(os.Stderr, "feishu: no credentials found. Starting one-click app registration...")
 	return registerFeishuApp(ctx, profiles, onQR)
 }
 
-// ── Persisted credential file ──
+// ── QR cache ──
 
-// feishuAppPath returns the credential file path under the profile's
-// channel directory. Credentials travel with the profile — different
-// profiles are different bots, and the channel lock lives next to them.
-func feishuAppPath(profiles string) string {
-	return filepath.Join(resolveProfilesDir(profiles), "channel", "feishu", "feishu_app.json")
+// feishuQRPath returns the QR cache paths under the profile's channel
+// directory: the registration URL and the QR image as base64-encoded
+// PNG. Cached so the frontend can re-fetch the QR after a refresh — the
+// connect endpoint is idempotent while registering and does not re-issue
+// the URL.
+func feishuQRPath(profiles string) (urlPath, imgPath string) {
+	dir := filepath.Join(resolveProfilesDir(profiles), "channel", "feishu")
+	return filepath.Join(dir, "qr_url"), filepath.Join(dir, "qr_img_base64")
 }
 
-// legacyFeishuAppPath is the pre-2026-08 location; read for migration only.
-func legacyFeishuAppPath() string {
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".openagent", "data", "feishu_app.json")
-}
-
-func loadFeishuAppFile(profiles string) (FeishuCredentials, bool) {
-	p := feishuAppPath(profiles)
-	data, err := os.ReadFile(p)
+// saveFeishuQR persists the registration QR (URL + base64 PNG image).
+// Best-effort cache: a failed write only costs a re-registration.
+func saveFeishuQR(profiles, url string) error {
+	urlPath, imgPath := feishuQRPath(profiles)
+	if err := os.MkdirAll(filepath.Dir(urlPath), 0o755); err != nil {
+		return err
+	}
+	png, err := qrcode.Encode(url, qrcode.Medium, 256)
 	if err != nil {
-		// Migration: the legacy file (~/.openagent/data/feishu_app.json)
-		// predates profile-scoped credentials. Copy it into the profile
-		// location (leaving the old file untouched) so existing users
-		// keep working without re-registering.
-		if legacy, lerr := os.ReadFile(legacyFeishuAppPath()); lerr == nil {
-			var c FeishuCredentials
-			if json.Unmarshal(legacy, &c) == nil && c.AppID != "" && c.AppSecret != "" {
-				saveFeishuAppFile(profiles, c)
-				return c, true
+		return err
+	}
+	// Image first, URL last — the URL file is the "ready" marker.
+	if err := os.WriteFile(imgPath, []byte(base64.StdEncoding.EncodeToString(png)), 0o600); err != nil {
+		return err
+	}
+	return os.WriteFile(urlPath, []byte(url), 0o600)
+}
+
+// loadFeishuQR reads the cached registration QR (empty strings when none).
+func loadFeishuQR(profiles string) (url, imgBase64 string) {
+	urlPath, imgPath := feishuQRPath(profiles)
+	if b, err := os.ReadFile(urlPath); err == nil {
+		url = string(b)
+	}
+	if b, err := os.ReadFile(imgPath); err == nil {
+		imgBase64 = string(b)
+	}
+	return url, imgBase64
+}
+
+// clearFeishuQR removes the QR cache (registration finished, expired).
+func clearFeishuQR(profiles string) {
+	urlPath, imgPath := feishuQRPath(profiles)
+	os.Remove(urlPath)
+	os.Remove(imgPath)
+}
+
+// saveFeishuToSettings persists the feishu credentials into the settings
+// file (channels.feishu). The "interface is configuration" path: a
+// submission from the control panel is user-level config, so it lives in
+// settings.json — the single credential source — and takes effect for
+// the running process via the manager's in-memory copy (no restart
+// needed). Concurrency is handled by config.UpdateSettings (process-wide
+// serialized read-modify-write).
+func saveFeishuToSettings(appID, appSecret string) error {
+	return config.UpdateSettings(func(raw map[string]json.RawMessage) error {
+		channels := map[string]json.RawMessage{}
+		if c, ok := raw["channels"]; ok {
+			if err := json.Unmarshal(c, &channels); err != nil {
+				return fmt.Errorf("feishu: parse settings channels: %w", err)
 			}
 		}
-		return FeishuCredentials{}, false
-	}
-	var c FeishuCredentials
-	if err := json.Unmarshal(data, &c); err != nil {
-		return FeishuCredentials{}, false
-	}
-	if c.AppID == "" || c.AppSecret == "" {
-		return FeishuCredentials{}, false
-	}
-	return c, true
-}
-
-func saveFeishuAppFile(profiles string, c FeishuCredentials) {
-	p := feishuAppPath(profiles)
-	if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {
-		fmt.Fprintf(os.Stderr, "feishu: failed to create credential directory: %v\n", err)
-		return
-	}
-	data, err := json.MarshalIndent(c, "", "  ")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "feishu: failed to marshal credentials: %v\n", err)
-		return
-	}
-	// Atomic write (temp file + rename): a crash or a concurrent writer
-	// mid-write can never leave a truncated credential file that would
-	// silently break the next startup.
-	tmp, err := os.CreateTemp(filepath.Dir(p), "feishu_app-*.tmp")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "feishu: failed to create temp credential file: %v\n", err)
-		return
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName) // no-op after successful rename
-	if err := tmp.Chmod(0600); err != nil {
-		tmp.Close()
-		fmt.Fprintf(os.Stderr, "feishu: failed to chmod credentials: %v\n", err)
-		return
-	}
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		fmt.Fprintf(os.Stderr, "feishu: failed to write credentials: %v\n", err)
-		return
-	}
-	if err := tmp.Close(); err != nil {
-		fmt.Fprintf(os.Stderr, "feishu: failed to close credentials: %v\n", err)
-		return
-	}
-	if err := os.Rename(tmpName, p); err != nil {
-		fmt.Fprintf(os.Stderr, "feishu: failed to save credentials to %s: %v\n", p, err)
-	}
+		feishu, err := json.Marshal(map[string]string{"app_id": appID, "app_secret": appSecret})
+		if err != nil {
+			return fmt.Errorf("feishu: marshal credentials: %w", err)
+		}
+		channels["feishu"] = feishu
+		raw["channels"], err = json.Marshal(channels)
+		if err != nil {
+			return fmt.Errorf("feishu: marshal channels: %w", err)
+		}
+		return nil
+	})
 }
 
 // ── Registration flow ──
@@ -148,6 +138,12 @@ func registerFeishuApp(ctx context.Context, profiles string, onQR func(url strin
 			},
 		},
 		OnQRCode: func(info *registration.QRCodeInfo) {
+			// Cache the QR (URL + base64 PNG) so the frontend can
+			// re-fetch it after a refresh — the connect endpoint is
+			// idempotent while registering and does not re-issue it.
+			if err := saveFeishuQR(profiles, info.URL); err != nil {
+				fmt.Fprintf(os.Stderr, "feishu: failed to cache QR: %v\n", err)
+			}
 			if onQR != nil {
 				// API-driven caller renders the QR for the user.
 				onQR(info.URL, info.ExpireIn)
@@ -174,12 +170,14 @@ func registerFeishuApp(ctx context.Context, profiles string, onQR func(url strin
 		AppID:     result.ClientID,
 		AppSecret: result.ClientSecret,
 	}
-	saveFeishuAppFile(profiles, creds)
+	// Registration artifacts are configuration too — persist to
+	// settings.json (the single credential source).
+	if err := saveFeishuToSettings(creds.AppID, creds.AppSecret); err != nil {
+		return FeishuCredentials{}, fmt.Errorf("feishu registration: persist credentials: %w", err)
+	}
 
 	fmt.Fprintf(os.Stderr, "feishu: app created — App ID: %s\n", creds.AppID)
-	fmt.Fprintln(os.Stderr, "feishu: credentials saved. Add to settings.json to skip registration next time:")
-	fmt.Fprintf(os.Stderr, "  \"channels\": { \"feishu\": { \"app_id\": \"%s\", \"app_secret\": \"%s\" } }\n",
-		creds.AppID, creds.AppSecret)
+	fmt.Fprintln(os.Stderr, "feishu: credentials saved to settings.json (channels.feishu)")
 
 	return creds, nil
 }

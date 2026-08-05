@@ -21,6 +21,7 @@ import (
 	"github.com/yusheng-g/openagent-go/plugin/wasmhost"
 
 	"github.com/yusheng-g/openagent-go/cmd/cli/config"
+	clirest "github.com/yusheng-g/openagent-go/cmd/cli/rest"
 	ctxpkg "github.com/yusheng-g/openagent-go/context"
 )
 
@@ -114,17 +115,19 @@ func RunREST(ctx context.Context, cfg *config.Config, caps config.Capabilities) 
 	}
 
 	// Start IM channels (immediate-connect; fail-fast for an explicitly
-	// flagged channel). The manager is ALWAYS handed to the REST handler
-	// (even when no channel is configured) so the frontend can query
-	// status and trigger connect/registration on demand.
+	// flagged channel). The manager is ALWAYS created (even when no
+	// channel is configured) so the CLI-level REST API can query status
+	// and trigger connect/registration on demand.
 	chMgr, err := RunChannels(ctx, cfg.Profiles, agentCfg, deps, cfg.Channels)
 	if err != nil {
 		return err
 	}
-	handler.WithFeishuManager(chMgr)
 
 	mux := http.NewServeMux()
 	handler.Register(mux)
+	// CLI-level API (channels, settings) — deployment/configuration
+	// endpoints owned by cmd/cli, not the agent-level rest package.
+	clirest.Register(mux, chMgr)
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"status":"ok"}`))

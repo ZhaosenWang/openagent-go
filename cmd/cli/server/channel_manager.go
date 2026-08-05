@@ -13,7 +13,8 @@ import (
 	"github.com/yusheng-g/openagent-go/channel/feishu"
 	"github.com/yusheng-g/openagent-go/cmd/cli/config"
 	"github.com/yusheng-g/openagent-go/kernel"
-	"github.com/yusheng-g/openagent-go/rest"
+
+	clirest "github.com/yusheng-g/openagent-go/cmd/cli/rest"
 )
 
 // FeishuManager owns the feishu connection lifecycle. One instance per
@@ -29,6 +30,8 @@ import (
 // page or a handler returning never affects it. The machine-level flock
 // guarantees a single live connection per profile — a second instance
 // fails fast instead of silently stealing events from the first.
+var _ clirest.FeishuChannel = (*FeishuManager)(nil)
+
 type FeishuManager struct {
 	baseCtx   context.Context
 	profiles  string
@@ -38,19 +41,24 @@ type FeishuManager struct {
 
 	mu     sync.Mutex
 	lock   *ChannelLock
-	status rest.FeishuStatus
+	status clirest.FeishuStatus
 	cancel context.CancelFunc
-	subs   []func(rest.FeishuStatus)
+	done   chan struct{} // closed when the connection goroutine exits (nil = none running)
+	// stopping is the disconnect intent flag: set under the lock at the
+	// START of Disconnect so a registration goroutine checking its
+	// checkpoint can never race the (later) status flip — the status is
+	// only written after the old goroutine has exited, which is exactly
+	// the window the flag must cover. Reset when Disconnect returns.
+	stopping bool
+	subs     []func(clirest.FeishuStatus)
 }
-
-var _ rest.FeishuChannel = (*FeishuManager)(nil)
 
 // NewFeishuManager creates the process-level feishu connection manager.
 // baseCtx is the serve process context — the connection and the QR
 // registration run on it, so neither is torn down by an HTTP request
 // returning. feishuCfg is the settings.json channels.feishu block (nil
-// when the user did not configure credentials — the manager then falls
-// back to the profile credential file or the QR registration flow).
+// when the user did not configure credentials — the manager then runs
+// the QR registration flow).
 func NewFeishuManager(baseCtx context.Context, profiles string, feishuCfg *config.FeishuConfig, cfg *agent.Agent, deps kernel.Deps) *FeishuManager {
 	return &FeishuManager{
 		baseCtx:   baseCtx,
@@ -58,12 +66,12 @@ func NewFeishuManager(baseCtx context.Context, profiles string, feishuCfg *confi
 		feishuCfg: feishuCfg,
 		cfg:       cfg,
 		deps:      deps,
-		status:    rest.FeishuStatus{Phase: rest.FeishuIdle},
+		status:    clirest.FeishuStatus{Phase: clirest.FeishuIdle},
 	}
 }
 
 // Status returns a snapshot of the current connection state.
-func (m *FeishuManager) Status() rest.FeishuStatus {
+func (m *FeishuManager) Status() clirest.FeishuStatus {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.status
@@ -73,17 +81,17 @@ func (m *FeishuManager) Status() rest.FeishuStatus {
 // (connecting / connected / disconnected / error). Used by the REST
 // layer to emit feishu.status events. Callbacks run on the caller's
 // goroutine — keep them quick.
-func (m *FeishuManager) Subscribe(fn func(rest.FeishuStatus)) {
+func (m *FeishuManager) Subscribe(fn func(clirest.FeishuStatus)) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.subs = append(m.subs, fn)
 }
 
-func (m *FeishuManager) setStatus(s rest.FeishuStatus) {
-	s.Connected = s.Phase == rest.FeishuConnected
+func (m *FeishuManager) setStatus(s clirest.FeishuStatus) {
+	s.Connected = s.Phase == clirest.FeishuConnected
 	m.mu.Lock()
 	m.status = s
-	subs := append([]func(rest.FeishuStatus){}, m.subs...)
+	subs := append([]func(clirest.FeishuStatus){}, m.subs...)
 	m.mu.Unlock()
 	for _, fn := range subs {
 		fn(s)
@@ -101,8 +109,8 @@ func (m *FeishuManager) Connect() error {
 	return err
 }
 
-// ConnectAsync starts the feishu connection flow. Resolution order for
-// credentials: settings.json → profile credential file → QR registration.
+// ConnectAsync starts the feishu connection flow. Credentials come from
+// settings (the single source); QR registration when none exist.
 //
 // Returns immediately; the flow runs on the process base context, so
 // the caller (an HTTP handler) returning does not tear it down.
@@ -121,8 +129,8 @@ func (m *FeishuManager) ConnectAsync(onQR func(url string, expireIn int)) (bool,
 	phase := m.status.Phase
 	m.mu.Unlock()
 	switch phase {
-	case rest.FeishuConnecting, rest.FeishuConnected:
-		return false, nil // already starting / connected (idempotent)
+	case clirest.FeishuRegistering, clirest.FeishuConnecting, clirest.FeishuConnected:
+		return false, nil // registration/connection already in flight (idempotent)
 	}
 
 	// Machine-level single instance: a second connection to the same
@@ -132,45 +140,80 @@ func (m *FeishuManager) ConnectAsync(onQR func(url string, expireIn int)) (bool,
 		return false, err
 	}
 
-	// Resolve credentials: settings.json wins, then the profile
-	// credential file, then QR registration.
-	if m.feishuCfg != nil && m.feishuCfg.AppID != "" && m.feishuCfg.AppSecret != "" {
-		m.startConnection(lock, FeishuCredentials{AppID: m.feishuCfg.AppID, AppSecret: m.feishuCfg.AppSecret}, "settings")
-		return false, nil
-	}
-	if c, ok := loadFeishuAppFile(m.profiles); ok {
-		m.startConnection(lock, c, "profile")
+	// Resolve credentials: the in-memory settings copy (updated live by
+	// SetCredentials); QR registration when none.
+	m.mu.Lock()
+	feishuCfg := m.feishuCfg
+	m.mu.Unlock()
+	if feishuCfg != nil && feishuCfg.AppID != "" && feishuCfg.AppSecret != "" {
+		m.startConnection(lock, FeishuCredentials{AppID: feishuCfg.AppID, AppSecret: feishuCfg.AppSecret})
 		return false, nil
 	}
 
-	// No persisted credentials — QR registration. Runs on the process
-	// base context (not the caller's request context): the HTTP handler
-	// must be able to return with the QR URL while the user scans it.
-	m.setStatus(rest.FeishuStatus{Phase: rest.FeishuConnecting, CredentialFrom: "registering"})
+	// No credentials — QR registration (settings is the single
+	// credential source). Runs on a cancelable child of the process base
+	// context: the HTTP handler returning does not tear it down, but
+	// Disconnect can abort it (and a completed registration checks the
+	// phase before connecting, so a disconnect during registration never
+	// ends in an unexpected reconnect).
+	m.setStatus(clirest.FeishuStatus{Phase: clirest.FeishuRegistering})
+	regCtx, regCancel := context.WithCancel(m.baseCtx)
+	regDone := make(chan struct{})
+	m.mu.Lock()
+	m.cancel = regCancel
+	m.done = regDone
+	m.mu.Unlock()
 	go func() {
-		reg, rerr := ResolveFeishuCredentials(m.baseCtx, m.profiles, onQR)
+		defer close(regDone)
+		reg, rerr := ResolveFeishuCredentials(regCtx, m.profiles, onQR)
 		if rerr != nil {
 			lock.Release()
-			m.setStatus(rest.FeishuStatus{Phase: rest.FeishuDisconnected, LastError: fmt.Sprintf("feishu: %v", rerr)})
+			clearFeishuQR(m.profiles)
+			m.mu.Lock()
+			m.cancel = nil
+			m.done = nil
+			m.mu.Unlock()
+			m.setStatus(clirest.FeishuStatus{Phase: clirest.FeishuDisconnected, LastError: fmt.Sprintf("feishu: %v", rerr)})
 			slog.Error("feishu: registration failed", "error", rerr)
 			return
 		}
-		m.startConnection(lock, reg, "registered")
+		// startConnection runs the disconnect checkpoint atomically with
+		// its field replacement — a Disconnect that landed while the user
+		// scanned (the SDK registration cannot always be aborted
+		// mid-flight) is seen there, and no auto-connect happens.
+		clearFeishuQR(m.profiles)
+		m.startConnection(lock, reg)
 	}()
 	return true, nil
 }
 
 // startConnection launches the connection goroutine on the process base
 // context and marks the state. The caller owns lock.
-func (m *FeishuManager) startConnection(lock *ChannelLock, creds FeishuCredentials, from string) {
+func (m *FeishuManager) startConnection(lock *ChannelLock, creds FeishuCredentials) {
 	connCtx, cancel := context.WithCancel(m.baseCtx)
+	connDone := make(chan struct{})
+	// The disconnect checkpoint and the cancel/done field replacement
+	// happen in ONE critical section: either this check sees stopping
+	// (Disconnect already began — abandon, release the flock), or
+	// Disconnect acquires the lock after us and reads the NEW cancel
+	// (which fires, tearing the connection down). There is no interleaving
+	// where the check passes but Disconnect's cancel is stale — that was
+	// the race when the check lived in the registration goroutine.
 	m.mu.Lock()
+	if m.stopping {
+		m.mu.Unlock()
+		cancel() // never used — release the derived context
+		lock.Release()
+		return
+	}
 	m.lock = lock
 	m.cancel = cancel
+	m.done = connDone
 	m.mu.Unlock()
-	m.setStatus(rest.FeishuStatus{Phase: rest.FeishuConnecting, AppID: creds.AppID, CredentialFrom: from})
+	m.setStatus(clirest.FeishuStatus{Phase: clirest.FeishuConnecting, AppID: creds.AppID})
 
 	go func() {
+		defer close(connDone)
 		// The connection blocks until the process context is cancelled
 		// or the connection is permanently lost; the SDK reconnects on
 		// transient failures internally.
@@ -181,37 +224,118 @@ func (m *FeishuManager) startConnection(lock *ChannelLock, creds FeishuCredentia
 			// connected state is observable, since Start() blocks for
 			// the whole connection lifetime.
 			now := time.Now()
-			m.setStatus(rest.FeishuStatus{Phase: rest.FeishuConnected, AppID: creds.AppID, CredentialFrom: from, ConnectedAt: &now})
+			m.setStatus(clirest.FeishuStatus{Phase: clirest.FeishuConnected, AppID: creds.AppID, ConnectedAt: &now})
 		})
 		ch.SetOnReconnecting(func() {
 			// Auto-reconnect kicked in after a drop: the frontend must
 			// see "connecting" (not a stale "connected") while the SDK
 			// is re-establishing the WebSocket.
-			m.setStatus(rest.FeishuStatus{Phase: rest.FeishuConnecting, AppID: creds.AppID, CredentialFrom: from})
+			m.setStatus(clirest.FeishuStatus{Phase: clirest.FeishuConnecting, AppID: creds.AppID})
 		})
 		err := ch.Start(connCtx, feishuMessageHandler(m.cfg, m.deps))
 		lock.Release()
 		m.mu.Lock()
 		m.lock = nil
 		m.cancel = nil
+		m.done = nil
 		m.mu.Unlock()
-		m.setStatus(rest.FeishuStatus{Phase: rest.FeishuDisconnected, AppID: creds.AppID, LastError: errString(err)})
+		m.setStatus(clirest.FeishuStatus{Phase: clirest.FeishuDisconnected, AppID: creds.AppID, LastError: errString(err)})
 		slog.Warn("feishu: connection closed", "error", err)
 	}()
 }
 
-// Disconnect tears down the feishu connection. State flips to
-// disconnected immediately (a subsequent Connect must not short-circuit
-// on a stale "connected"); the connection goroutine releases the machine
-// lock as it exits.
+// QR returns the cached registration QR (URL + base64 PNG image), empty
+// when no registration is in flight. The cache lives on disk under the
+// profile's channel dir so the frontend can re-fetch it after a refresh.
+func (m *FeishuManager) QR() (url, imgBase64 string) {
+	return loadFeishuQR(m.profiles)
+}
+
+// Disconnect tears down the feishu connection and WAITS for the
+// connection goroutine to exit (releasing the machine lock). A
+// subsequent Connect can therefore re-acquire the lock immediately —
+// without the wait, "disconnect → reconnect" (e.g. applying new
+// credentials) would hit the still-held lock and fail.
 func (m *FeishuManager) Disconnect() {
+	// Intent flag first, atomically visible to any in-flight registration
+	// goroutine's checkpoint (it may hold a cancel that already fired —
+	// the registration completed — so the flag, not the cancel, is the
+	// reliable signal).
 	m.mu.Lock()
 	cancel := m.cancel
+	done := m.done
+	m.stopping = true
 	m.mu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
-	m.setStatus(rest.FeishuStatus{Phase: rest.FeishuDisconnected})
+	if done != nil {
+		<-done // goroutine releases the lock and clears state before closing
+	}
+	m.setStatus(clirest.FeishuStatus{Phase: clirest.FeishuDisconnected})
+	m.mu.Lock()
+	m.stopping = false
+	m.mu.Unlock()
+}
+
+// Credentials returns the currently effective credentials (the in-memory
+// settings copy — updated live by SetCredentials). Empty values when
+// none are configured.
+func (m *FeishuManager) Credentials() (appID, appSecret string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.feishuCfg != nil && m.feishuCfg.AppID != "" && m.feishuCfg.AppSecret != "" {
+		return m.feishuCfg.AppID, m.feishuCfg.AppSecret
+	}
+	return "", ""
+}
+
+// SetCredentials stores the submitted credentials to settings.json (the
+// single credential source — written atomically, preserving all other
+// settings fields) and applies them to the in-memory copy. Credentials
+// are separate from the connection: saving never touches a running
+// connection — the frontend reconnects (disconnect + connect) when it
+// wants the new values to take effect.
+//
+// An empty appSecret keeps the current secret (edit-form semantics).
+// Returns an error while QR registration is in flight (the registration
+// would overwrite the submitted values when it completes).
+func (m *FeishuManager) SetCredentials(appID, appSecret string) error {
+	m.mu.Lock()
+	registering := m.status.Phase == clirest.FeishuRegistering
+	m.mu.Unlock()
+	if registering {
+		return clirest.ErrFeishuRegistrationInFlight
+	}
+
+	// Empty secret keeps the current one (edit-form semantics).
+	if appSecret == "" {
+		cur, curSecret := m.Credentials()
+		if curSecret == "" {
+			return fmt.Errorf("feishu: app_secret required (no current secret to keep)")
+		}
+		appSecret = curSecret
+		if appID == "" {
+			appID = cur
+		}
+	}
+	if appID == "" || appSecret == "" {
+		return fmt.Errorf("feishu: app_id and app_secret are required")
+	}
+
+	// Persist to settings.json (atomic, preserves all other fields) and
+	// update the in-memory copy so the value takes effect without a
+	// restart. The "interface is configuration" semantics: submissions
+	// from the control panel are user-level config, so settings (the
+	// highest-priority source) is where they live; QR-registration
+	// artifacts stay in the profile credential file.
+	if err := saveFeishuToSettings(appID, appSecret); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.feishuCfg = &config.FeishuConfig{AppID: appID, AppSecret: appSecret}
+	m.mu.Unlock()
+	return nil
 }
 
 // feishuMessageHandler routes incoming Feishu messages to the agent,
