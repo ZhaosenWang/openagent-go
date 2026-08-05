@@ -52,6 +52,7 @@ type ContextProviderConfig struct {
 // search/remember/read, no SDK).
 type OpenVikingConfig struct {
 	Endpoint string `json:"endpoint,omitempty"` // e.g. "http://127.0.0.1:1933"
+	APIKey   string `json:"api_key,omitempty"`   // Bearer token; empty = no auth
 }
 
 // EmbeddingConfig selects the semantic-embedding backend for knowledge

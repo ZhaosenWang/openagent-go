@@ -90,7 +90,7 @@
 ### B13. OpenViking 客户端资源与安全
 
 - `client.go:105-108` `io.ReadAll` 无大小上限：异常/被攻陷服务端返回 GB 级响应直接耗尽进程内存。修：`io.LimitReader`（如 32MB）。
-- 客户端零认证通道（`OpenVikingConfig` 只有 Endpoint，无 header 注入点）：远程部署时任何能触达端点地址的进程可读可写全部记忆。修：可选 Bearer token / 自定义 header。
+- ~~客户端零认证通道（`OpenVikingConfig` 只有 Endpoint，无 header 注入点）：远程部署时任何能触达端点地址的进程可读可写全部记忆。修：可选 Bearer token / 自定义 header。~~ ✅ 已修复（2026-08-05）：`OpenVikingConfig` 新增 `APIKey` 字段，`doJSON` 注入 `Authorization: Bearer <key>` 头。
 - `Remember`（client.go:199-209）中途失败残留孤儿会话（创建后 commit 失败不清理）。
 
 ### B14. 工具截断产物权限过宽

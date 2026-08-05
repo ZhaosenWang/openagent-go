@@ -99,6 +99,7 @@ func (e *LLMExtractor) Extract(ctx context.Context, scope ContextScope, messages
 	if e == nil || model == nil || e.Provider == nil || len(messages) == 0 {
 		return
 	}
+	slog.Debug("openagent: knowledge extraction triggered", "user", scope.UserID, "messages", len(messages))
 	max := e.MaxItems
 	if max <= 0 {
 		max = maxKnowledgeItems
@@ -191,6 +192,7 @@ func (e *LLMExtractor) Extract(ctx context.Context, scope ContextScope, messages
 		}
 		stored++
 	}
+	slog.Debug("openagent: knowledge extraction done", "user", scope.UserID, "stored", stored, "candidates", len(items))
 }
 
 // buildTranscript renders messages as a compact transcript (role: content).

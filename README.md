@@ -171,6 +171,33 @@ MCP tools are available to the Feishu bot at startup. Each tool call renders as 
 All fields are optional. Defaults: `~/.openagent/logs/openagent.log`, 10 MB rotation, 5 backups, info level.
 Each `max_size` unit is megabytes. Logs go to both stderr *and* the file. Set `level` to `"debug"` to see every API request.
 
+### OpenViking Integration
+
+OpenViking is a context database that provides server-side memory, skill, and resource management. Configuring an endpoint switches all three domains from local storage to the OpenViking server — one address is enough.
+
+```json
+{
+  "openviking": {
+    "endpoint": "http://127.0.0.1:1933",
+    "api_key": "ov-xxxxxxxxxxxx"
+  }
+}
+```
+
+- `endpoint` — OpenViking server address. Required to enable.
+- `api_key` — Bearer token sent as `Authorization: Bearer <key>`. Optional; empty = no auth (dev mode only).
+
+To keep a specific domain on local storage while using OpenViking for the rest:
+
+```json
+{
+  "openviking": { "endpoint": "http://127.0.0.1:1933", "api_key": "ov-xxx" },
+  "context_providers": { "memory": "builtin" }
+}
+```
+
+`context_providers` accepts `"builtin"` or `"openviking"` for each of `memory`, `skill`, `resource`. Empty = follow the endpoint default.
+
 ## Architecture
 
 ```

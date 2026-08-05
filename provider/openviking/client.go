@@ -32,21 +32,23 @@ type Item struct {
 	Score   float64        `json:"score,omitempty"`
 }
 
-// Client talks to an OpenViking server over its HTTP API. Knowledge is
-// scoped by the server's own identity (API key / account / user), not by
-// this client.
+// Client talks to an OpenViking server over its HTTP API. An optional API
+// key is sent as a Bearer token; when empty, the server's own identity
+// (account / user) scopes the knowledge.
 type Client struct {
 	baseURL string
+	apiKey  string
 	http    *http.Client
 }
 
 // NewClient creates a client for an OpenViking server.
-func NewClient(endpoint string) (*Client, error) {
+func NewClient(endpoint, apiKey string) (*Client, error) {
 	if endpoint == "" {
 		return nil, fmt.Errorf("openviking: empty endpoint")
 	}
 	return &Client{
 		baseURL: endpoint,
+		apiKey:  apiKey,
 		http:    &http.Client{Timeout: 120 * time.Second},
 	}, nil
 }
@@ -95,6 +97,9 @@ func (c *Client) doJSON(ctx context.Context, method, path string, query url.Valu
 	}
 	if payload != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	}
 
 	resp, err := c.http.Do(req)
