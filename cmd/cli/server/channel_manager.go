@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -88,9 +89,19 @@ func (m *FeishuManager) Subscribe(fn func(clirest.FeishuStatus)) {
 	m.subs = append(m.subs, fn)
 }
 
-func (m *FeishuManager) setStatus(s clirest.FeishuStatus) {
+// setStatus publishes a state change. guard, when non-nil, is the done
+// channel of the flow that owns the state: the publish is dropped when
+// another flow (or a disconnect) has since taken over the manager — a
+// stale goroutine abandoned by a disconnect timeout must not clobber the
+// new connection's state. Callers that act on the user's behalf (connect,
+// disconnect) pass nil.
+func (m *FeishuManager) setStatus(s clirest.FeishuStatus, guard <-chan struct{}) {
 	s.Connected = s.Phase == clirest.FeishuConnected
 	m.mu.Lock()
+	if guard != nil && m.done != guard {
+		m.mu.Unlock()
+		return // not the current flow — drop the stale publish
+	}
 	m.status = s
 	subs := append([]func(clirest.FeishuStatus){}, m.subs...)
 	m.mu.Unlock()
@@ -157,7 +168,7 @@ func (m *FeishuManager) ConnectAsync(onQR func(url string, expireIn int)) (bool,
 	// Disconnect can abort it (and a completed registration checks the
 	// phase before connecting, so a disconnect during registration never
 	// ends in an unexpected reconnect).
-	m.setStatus(clirest.FeishuStatus{Phase: clirest.FeishuRegistering})
+	m.setStatus(clirest.FeishuStatus{Phase: clirest.FeishuRegistering}, nil)
 	regCtx, regCancel := context.WithCancel(m.baseCtx)
 	regDone := make(chan struct{})
 	m.mu.Lock()
@@ -171,11 +182,33 @@ func (m *FeishuManager) ConnectAsync(onQR func(url string, expireIn int)) (bool,
 			lock.Release()
 			clearFeishuQR(m.profiles)
 			m.mu.Lock()
-			m.cancel = nil
-			m.done = nil
+			// A disconnect cancels the registration context; the SDK then
+			// returns whatever error the cancellation produced (context
+			// canceled, or a decode failure when a poll was mid-flight
+			// and its response got torn). That is a byproduct of the
+			// user's disconnect, not a real failure — surface a clean
+			// "disconnected" without last_error. The flag is read under
+			// the lock: Disconnect sets it before cancelling, so a
+			// registration ending during a disconnect always sees it.
+			disconnecting := m.stopping
 			m.mu.Unlock()
-			m.setStatus(clirest.FeishuStatus{Phase: clirest.FeishuDisconnected, LastError: fmt.Sprintf("feishu: %v", rerr)})
-			slog.Error("feishu: registration failed", "error", rerr)
+			if disconnecting || errors.Is(rerr, context.Canceled) {
+				m.setStatus(clirest.FeishuStatus{Phase: clirest.FeishuDisconnected}, regDone)
+			} else {
+				m.setStatus(clirest.FeishuStatus{Phase: clirest.FeishuDisconnected, LastError: fmt.Sprintf("feishu: %v", rerr)}, regDone)
+				slog.Error("feishu: registration failed", "error", rerr)
+			}
+			// Publish BEFORE the cleanup — the guard compares m.done
+			// against regDone, so clearing the field first would drop the
+			// flow's own terminal publish. Cleanup itself is identity
+			// guarded: a connect that took over since the publish must
+			// not have its fields clobbered.
+			m.mu.Lock()
+			if m.done == regDone {
+				m.cancel = nil
+				m.done = nil
+			}
+			m.mu.Unlock()
 			return
 		}
 		// Register the new credentials in the in-memory copy BEFORE the
@@ -184,7 +217,17 @@ func (m *FeishuManager) ConnectAsync(onQR func(url string, expireIn int)) (bool,
 		// connect must reuse them instead of forcing another scan.
 		m.mu.Lock()
 		m.feishuCfg = &config.FeishuConfig{AppID: reg.AppID, AppSecret: reg.AppSecret}
+		// A disconnect that timed out on <-done has abandoned this flow
+		// (it cleared the fields, then reset stopping — so the
+		// startConnection checkpoint can no longer see the intent). The
+		// credentials are still valid — a later connect reuses them —
+		// but the abandoned flow must NOT auto-connect.
+		abandoned := m.done != regDone
 		m.mu.Unlock()
+		if abandoned {
+			lock.Release()
+			return
+		}
 		// startConnection runs the disconnect checkpoint atomically with
 		// its field replacement — a Disconnect that landed while the user
 		// scanned (the SDK registration cannot always be aborted
@@ -218,7 +261,7 @@ func (m *FeishuManager) startConnection(lock *ChannelLock, creds FeishuCredentia
 	m.cancel = cancel
 	m.done = connDone
 	m.mu.Unlock()
-	m.setStatus(clirest.FeishuStatus{Phase: clirest.FeishuConnecting, AppID: creds.AppID})
+	m.setStatus(clirest.FeishuStatus{Phase: clirest.FeishuConnecting, AppID: creds.AppID}, connDone)
 
 	go func() {
 		defer close(connDone)
@@ -234,13 +277,13 @@ func (m *FeishuManager) startConnection(lock *ChannelLock, creds FeishuCredentia
 			// the whole connection lifetime.
 			everReady = true
 			now := time.Now()
-			m.setStatus(clirest.FeishuStatus{Phase: clirest.FeishuConnected, AppID: creds.AppID, ConnectedAt: &now})
+			m.setStatus(clirest.FeishuStatus{Phase: clirest.FeishuConnected, AppID: creds.AppID, ConnectedAt: &now}, connDone)
 		})
 		ch.SetOnReconnecting(func() {
 			// Auto-reconnect kicked in after a drop: the frontend must
 			// see "connecting" (not a stale "connected") while the SDK
 			// is re-establishing the WebSocket.
-			m.setStatus(clirest.FeishuStatus{Phase: clirest.FeishuConnecting, AppID: creds.AppID})
+			m.setStatus(clirest.FeishuStatus{Phase: clirest.FeishuConnecting, AppID: creds.AppID}, connDone)
 		})
 		ch.SetOnError(func(err error) {
 			// Never connected successfully (bad credentials, bootstrap
@@ -249,26 +292,44 @@ func (m *FeishuManager) startConnection(lock *ChannelLock, creds FeishuCredentia
 			// "connecting" forever. Once ready, transient reconnect
 			// failures keep "connecting" (the SDK is retrying).
 			if !everReady {
-				m.setStatus(clirest.FeishuStatus{Phase: clirest.FeishuDisconnected, AppID: creds.AppID, LastError: err.Error()})
+				m.setStatus(clirest.FeishuStatus{Phase: clirest.FeishuDisconnected, AppID: creds.AppID, LastError: err.Error()}, connDone)
 			}
 		})
 		err := ch.Start(connCtx, feishuMessageHandler(m.cfg, m.deps))
 		lock.Release()
+		// Publish BEFORE the cleanup — the guard compares m.done against
+		// connDone, so clearing the field first would drop the flow's own
+		// terminal publish and leave the status stuck on "connected".
+		m.setStatus(clirest.FeishuStatus{Phase: clirest.FeishuDisconnected, AppID: creds.AppID, LastError: errString(err)}, connDone)
 		m.mu.Lock()
-		m.lock = nil
-		m.cancel = nil
-		m.done = nil
+		// Cleanup is identity guarded: a connect that took over since the
+		// publish must not have its fields clobbered.
+		if m.done == connDone {
+			m.lock = nil
+			m.cancel = nil
+			m.done = nil
+		}
 		m.mu.Unlock()
-		m.setStatus(clirest.FeishuStatus{Phase: clirest.FeishuDisconnected, AppID: creds.AppID, LastError: errString(err)})
 		slog.Warn("feishu: connection closed", "error", err)
 	}()
 }
 
-// QR returns the cached registration QR (URL + base64 PNG image), empty
-// when no registration is in flight. The cache lives on disk under the
-// profile's channel dir so the frontend can re-fetch it after a refresh.
-func (m *FeishuManager) QR() (url, imgBase64 string) {
-	return loadFeishuQR(m.profiles)
+// QR returns the cached registration QR (URL + base64 PNG image) and its
+// remaining lifetime in seconds (0 when expired or none in flight). The
+// cache lives on disk under the profile's channel dir so the frontend can
+// re-fetch it after a refresh; the remaining time is computed from the
+// cached absolute expiry, so a refresh restarts the countdown from where
+// it actually is — not from the original total.
+func (m *FeishuManager) QR() (url, imgBase64 string, expireIn int) {
+	url, imgBase64, expiresAt := loadFeishuQR(m.profiles)
+	if expiresAt <= 0 {
+		return url, imgBase64, 0
+	}
+	remaining := expiresAt - time.Now().Unix()
+	if remaining < 0 {
+		return url, imgBase64, 0
+	}
+	return url, imgBase64, int(remaining)
 }
 
 // ClearCredentials removes the feishu credentials: the settings.json
@@ -308,11 +369,29 @@ func (m *FeishuManager) ClearCredentials() error {
 	return nil
 }
 
+// disconnectTimeout bounds the <-done wait in Disconnect. Normally the
+// cancel makes the SDK return immediately; the exception is a
+// registration poll whose HTTP response body is mid-read — Go's http
+// body reads are NOT cancelled by context, and the SDK polls with
+// http.DefaultClient (no Timeout), so the registration goroutine can be
+// stuck until the server responds. Waiting forever would hang the
+// disconnect endpoint; the timeout gives up and lets the stale goroutine
+// finish whenever its request does.
+const disconnectTimeout = 5 * time.Second
+
 // Disconnect tears down the feishu connection and WAITS for the
 // connection goroutine to exit (releasing the machine lock). A
 // subsequent Connect can therefore re-acquire the lock immediately —
 // without the wait, "disconnect → reconnect" (e.g. applying new
 // credentials) would hit the still-held lock and fail.
+//
+// The wait is bounded by disconnectTimeout: a registration whose poll is
+// stuck on an unresponsive server (see disconnectTimeout) must not hang
+// the caller. On timeout the manager forgets the flow — its state
+// publishes and field cleanup are identity-guarded (setStatus guard,
+// `m.done == <flow>`), so the stale goroutine can never clobber a newer
+// connection; the flock stays held until the goroutine exits, so a
+// reconnect within that window fails fast with the lock error — retry.
 func (m *FeishuManager) Disconnect() {
 	// Intent flag first, atomically visible to any in-flight registration
 	// goroutine's checkpoint (it may hold a cancel that already fired —
@@ -327,9 +406,21 @@ func (m *FeishuManager) Disconnect() {
 		cancel()
 	}
 	if done != nil {
-		<-done // goroutine releases the lock and clears state before closing
+		select {
+		case <-done: // goroutine releases the lock and clears state before closing
+		case <-time.After(disconnectTimeout):
+			// Abandon the wait — the flow may be stuck in a poll body
+			// read. Forget it so its late cleanup and publishes are
+			// identity-guarded away (done must no longer match).
+			m.mu.Lock()
+			if m.done == done {
+				m.cancel = nil
+				m.done = nil
+			}
+			m.mu.Unlock()
+		}
 	}
-	m.setStatus(clirest.FeishuStatus{Phase: clirest.FeishuDisconnected})
+	m.setStatus(clirest.FeishuStatus{Phase: clirest.FeishuDisconnected}, nil)
 	m.mu.Lock()
 	m.stopping = false
 	m.mu.Unlock()

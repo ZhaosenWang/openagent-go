@@ -76,7 +76,10 @@ type FeishuChannel interface {
 	// + connect).
 	ClearCredentials() error
 
-	// QR returns the cached registration QR (URL + base64 PNG image);
-	// empty strings when no registration is in flight.
-	QR() (url, imgBase64 string)
+	// QR returns the cached registration QR (URL + base64 PNG image) and
+	// its remaining lifetime in seconds (0 when none in flight or
+	// expired). The remaining time is computed from the absolute expiry,
+	// so a page refresh can restart the countdown from where it actually
+	// is.
+	QR() (url, imgBase64 string, expireIn int)
 }

@@ -51,11 +51,12 @@ func Register(mux *http.ServeMux, mgr FeishuChannel) {
 		// read from the cache (written by the onQR callback).
 		select {
 		case url := <-qrCh:
-			_, img := mgr.QR()
+			_, img, expireIn := mgr.QR()
 			writeJSON(w, http.StatusAccepted, map[string]any{
-				"status":         "registration",
-				"qr_url":         url,
-				"qr_img_base64": img,
+				"status":          "registration",
+				"qr_url":          url,
+				"qr_img_base64":   img,
+				"expires_in":      expireIn,
 			})
 		case <-r.Context().Done():
 			// Client went away before the URL arrived; the registration
@@ -70,9 +71,10 @@ func Register(mux *http.ServeMux, mgr FeishuChannel) {
 		mgr.Disconnect()
 		writeJSON(w, http.StatusOK, mgr.Status())
 	})
-	// Re-fetch the registration QR (URL + base64 PNG) after a refresh —
-	// POST /connect is idempotent while registering and does not re-issue
-	// it.
+	// Re-fetch the registration QR (URL + base64 PNG + remaining lifetime)
+	// after a refresh — POST /connect is idempotent while registering and
+	// does not re-issue it, so this endpoint restores the QR and restarts
+	// the frontend countdown from the cached absolute expiry.
 	mux.HandleFunc("GET /api/channels/feishu/qr", func(w http.ResponseWriter, r *http.Request) {
 		if mgr == nil {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "feishu channel not configured"})
@@ -84,14 +86,22 @@ func Register(mux *http.ServeMux, mgr FeishuChannel) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "no QR registration in flight"})
 			return
 		}
-		url, img := mgr.QR()
+		url, img, expireIn := mgr.QR()
 		if url == "" {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "no QR registration in flight"})
 			return
 		}
+		if expireIn <= 0 {
+			// The QR is dead but the SDK has not yet surfaced the expiry
+			// (it only happens on the next poll): the frontend must not
+			// keep counting down — tell it to re-register.
+			writeJSON(w, http.StatusOK, map[string]any{"expired": true})
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"qr_url":       url,
+			"qr_url":        url,
 			"qr_img_base64": img,
+			"expires_in":    expireIn,
 		})
 	})
 

@@ -5,10 +5,14 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/yusheng-g/openagent-go/kernel"
+
+	clirest "github.com/yusheng-g/openagent-go/cmd/cli/rest"
 )
 
 // isolateSettings points the settings file at a temp directory via
@@ -173,5 +177,140 @@ func TestClearCredentialsPreservesOtherFields(t *testing.T) {
 	// Unrelated fields survive.
 	if !json.Valid(got["provider"]) {
 		t.Fatal("provider mangled")
+	}
+}
+
+// The QR cache persists URL, image, and the absolute expiry — the
+// frontend re-fetches it after a refresh and restarts its countdown from
+// the remaining time (GET /qr returns expires_in), not the original
+// total.
+func TestFeishuQRCacheRoundTrip(t *testing.T) {
+	profiles := filepath.Join(t.TempDir(), "profile")
+	m := NewFeishuManager(context.Background(), profiles, nil, nil, kernel.Deps{})
+
+	if err := saveFeishuQR(profiles, "https://qr.example/x", 300); err != nil {
+		t.Fatal(err)
+	}
+	url, img, expireIn := m.QR()
+	if url != "https://qr.example/x" {
+		t.Fatalf("url = %q", url)
+	}
+	if img == "" {
+		t.Fatal("image empty")
+	}
+	// Remaining lifetime: at most the total, and > 0 (a fresh cache).
+	if expireIn <= 0 || expireIn > 300 {
+		t.Fatalf("expireIn = %d, want 0 < x <= 300", expireIn)
+	}
+	// The cached expiry is absolute — a re-read must never see MORE
+	// remaining time than the first read (it would mean the countdown
+	// restarted from the total). Same-second reads may be equal (Unix
+	// second granularity); the refresh-page case reads later and sees
+	// strictly less.
+	if _, _, again := m.QR(); again > expireIn {
+		t.Fatalf("second read grew: %d > %d", again, expireIn)
+	}
+
+	clearFeishuQR(profiles)
+	if url, _, expireIn := m.QR(); url != "" || expireIn != 0 {
+		t.Fatalf("cache not cleared: url=%q expireIn=%d", url, expireIn)
+	}
+}
+
+// An expired QR reports expireIn 0 — the frontend stops counting down
+// and asks the user to re-register instead of waiting for the SDK poll
+// to surface the expiry on its next cycle.
+func TestFeishuQRExpired(t *testing.T) {
+	profiles := filepath.Join(t.TempDir(), "profile")
+	m := NewFeishuManager(context.Background(), profiles, nil, nil, kernel.Deps{})
+
+	if err := saveFeishuQR(profiles, "https://qr.example/x", 300); err != nil {
+		t.Fatal(err)
+	}
+	_, _, expiresAtPath := feishuQRPath(profiles)
+	if err := os.WriteFile(expiresAtPath, []byte(strconv.FormatInt(time.Now().Unix()-1, 10)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	url, _, expireIn := m.QR()
+	if url == "" {
+		t.Fatal("url lost")
+	}
+	if expireIn != 0 {
+		t.Fatalf("expireIn = %d, want 0", expireIn)
+	}
+}
+
+// A disconnect whose flow is stuck (SDK poll body read — context does
+// not cancel it, and the SDK polls without a client timeout) must return
+// within disconnectTimeout instead of hanging the endpoint.
+func TestDisconnectTimesOutOnStuckFlow(t *testing.T) {
+	m := NewFeishuManager(context.Background(), filepath.Join(t.TempDir(), "profile"), nil, nil, kernel.Deps{})
+	cancelled := make(chan struct{})
+	m.mu.Lock()
+	m.cancel = func() { close(cancelled) }
+	m.done = make(chan struct{}) // never closes — simulates a stuck poll
+	m.mu.Unlock()
+
+	start := time.Now()
+	m.Disconnect()
+	if elapsed := time.Since(start); elapsed >= disconnectTimeout+2*time.Second {
+		t.Fatalf("Disconnect hung: %v", elapsed)
+	}
+	select {
+	case <-cancelled:
+	default:
+		t.Fatal("cancel not invoked")
+	}
+	if s := m.Status(); s.Phase != clirest.FeishuDisconnected || s.LastError != "" {
+		t.Fatalf("status = %+v", s)
+	}
+}
+
+// setStatus guards: a publish from a flow that no longer owns the
+// manager (a disconnect timeout abandoned it) is dropped, while the
+// current owner publishes normally. Without the guard, a stale
+// registration goroutine finishing late would clobber the state of a
+// newer connection.
+func TestSetStatusGuardDropsStalePublish(t *testing.T) {
+	m := NewFeishuManager(context.Background(), filepath.Join(t.TempDir(), "profile"), nil, nil, kernel.Deps{})
+	current := make(chan struct{})
+	m.mu.Lock()
+	m.done = current
+	m.mu.Unlock()
+
+	stale := make(chan struct{})
+	m.setStatus(clirest.FeishuStatus{Phase: clirest.FeishuConnected}, stale)
+	if s := m.Status(); s.Phase != clirest.FeishuIdle {
+		t.Fatalf("stale publish got through: %+v", s)
+	}
+	m.setStatus(clirest.FeishuStatus{Phase: clirest.FeishuConnected}, current)
+	if s := m.Status(); s.Phase != clirest.FeishuConnected {
+		t.Fatalf("current owner publish dropped: %+v", s)
+	}
+}
+
+// A flow's own terminal publish must not be dropped by its cleanup: the
+// goroutine tail publishes the terminal status with the fields still set
+// (so the guard passes), and only then clears them. Publishing after the
+// cleanup (the buggy ordering) makes the guard see m.done != guard and
+// drop the publish, leaving the status stuck on the previous phase.
+func TestFlowTerminalPublishSurvivesOwnCleanup(t *testing.T) {
+	m := NewFeishuManager(context.Background(), filepath.Join(t.TempDir(), "profile"), nil, nil, kernel.Deps{})
+	done := make(chan struct{})
+	m.mu.Lock()
+	m.done = done
+	m.mu.Unlock()
+
+	// Flow tail, publish-first ordering.
+	m.setStatus(clirest.FeishuStatus{Phase: clirest.FeishuDisconnected}, done)
+	m.mu.Lock()
+	if m.done == done {
+		m.done = nil
+	}
+	m.mu.Unlock()
+
+	if s := m.Status(); s.Phase != clirest.FeishuDisconnected {
+		t.Fatalf("terminal publish dropped by own cleanup: %+v", s)
 	}
 }
