@@ -21,7 +21,7 @@
 - **静态上下文配置** — `AGENTS.md`（工作规则）和 `SOUL.md`（性格与底线），支持用户级和项目级覆盖
 - **Slash 命令** — 内置 `/help`、`/mode`、`/model`、`/context`、`/cwd`、`/clear`、`/rename`、`/sessions`，通过 `slash/` 注册表扩展
 - **完整 CLI** — `openagent-cli`，cobra 命令、配置驱动模型、keyring 密钥管理、WASM 插件运行时
-- **IM 频道** — 接入飞书/Lark WebSocket，基于卡片的流式输出（Markdown 渲染、工具调用卡片），一键扫码创建应用
+- **IM 频道** — 飞书/Lark（WebSocket，卡片式流式输出：Markdown 渲染、工具调用卡片，一键扫码创建应用）、个人微信（腾讯 ilinkai 官方通道，扫码登录 + 配对码）、企业微信（官方长连接，原生流式回复，扫码自动创建机器人）
 - **RunHooks 状态传递** — Start/End 回调共享不透明状态，OTEL 正确嵌套 span，slog 精确计时
 - **动态上下文** — 会话级 plan 状态和 mode 指令每轮自动注入 prompt
 
@@ -187,6 +187,63 @@ MCP 工具在启动时即可用，每次工具调用以卡片形式展示在飞�
 
 所有字段都是可选的。默认值：`~/.openagent/logs/openagent.log`，10 MB 轮转，保留 5 个备份，info 级别。
 单位是 MB。日志同时输出到 stderr 和文件。设为 `"debug"` 可查看每次 API 请求详情。
+
+### 个人微信集成
+
+通过腾讯官方 ilinkai 通道（`ilinkai.weixin.qq.com`）接入**个人微信** —— 纯 HTTP 长轮询，无 SDK。每条消息回复一次（微信协议不支持流式/消息编辑；agent 思考期间显示"对方正在输入"）。回复文本中的媒体标记（`[file: /绝对路径]`）会上传为文件/图片消息。
+
+**首次设置（扫码自动创建 bot）：**
+
+```bash
+./openagent-cli serve --channel wechat
+```
+
+终端出现二维码，用微信扫码确认即可自动创建 bot；如果服务端要求**配对码**（手机微信上显示的数字），在终端输入。凭据保存到 settings.json。
+
+**前端流程：** 该通道有配对码步骤和"已扫码"状态 —— 前端轮询二维码接口获取交互状态位：
+
+| 接口 | 说明 |
+|------|------|
+| `GET /api/channels/wechat/status` | 连接状态（`connected`、`account_id`、`last_error`） |
+| `POST /api/channels/wechat/connect` | 启动连接；无凭据时走扫码登录并返回 `202 {status:"registration", qr_url, qr_img_base64, expires_in}` |
+| `POST /api/channels/wechat/disconnect` | 断开连接 |
+| `GET /api/channels/wechat/qr` | 注册二维码 + `scanned` / `verify_code_required` / `verify_code_retry` 状态位（需要配对码时前端显示输入框） |
+| `POST /api/channels/wechat/verifycode` | 提交配对码（`{code}`）—— `need_verifycode` 步骤的唯一通道 |
+| `GET/PUT/DELETE /api/settings/channels/wechat` | 凭据（`token`、`base_url`、`account_id`、`user_id`；GET 返回脱敏 token） |
+
+服务端会话过期（`errcode -14`）会自动清除凭据 —— 下次连接重新扫码登录。
+
+### 企业微信集成
+
+通过官方长连接 API（`wss://openws.work.weixin.qq.com`）接入**企业微信智能机器人** —— 三个通道中能力最全：**原生流式回复**（一条消息原地增长）、群聊 @、语音自动转文本。
+
+**首次设置（扫码自动创建机器人）：**
+
+```bash
+./openagent-cli serve --channel wecom
+```
+
+出现二维码后用企微 App 扫码，机器人自动创建，BotID/Secret 保存到 settings.json。也可以在企微管理后台手动创建（安全与管理 → 管理工具 → 智能机器人 → API 模式 → 长连接），再通过设置接口配置：
+
+```json
+{
+  "channels": { "wecom": { "bot_id": "aibs...", "secret": "..." } }
+}
+```
+
+**前端控制面板** —— 与飞书同构（仅凭据字段不同）：
+
+| 接口 | 说明 |
+|------|------|
+| `GET /api/channels/wecom/status` | 连接状态（`connected`、`bot_id`、`connected_at`、`last_error`） |
+| `POST /api/channels/wecom/connect` | 启动连接；无凭据时走扫码授权并返回 `202 {status:"registration", qr_url, qr_img_base64, expires_in}` |
+| `POST /api/channels/wecom/disconnect` | 断开连接 |
+| `GET /api/channels/wecom/qr` | 授权二维码（刷新后可重新获取） |
+| `GET/PUT/DELETE /api/settings/channels/wecom` | 凭据（`bot_id`、脱敏 `secret`） |
+
+**流式回复：** agent 的回答以流式消息发送 —— `finish=false` 刷新让同一条消息逐步增长，`finish=true` 结束。会话限流 30 条/分钟。
+
+**连接语义（三个通道一致）：** settings 中的凭据**不会自动触发连接** —— 唯一的自动连接入口是 `--channel <name>`（快速失败）和前端 `POST /connect`。已扫码/已配置的凭据在重启后复用；机器级锁（`$profile/channel/<name>/<name>.lock`）保证每个 profile 只有一个活跃连接。
 
 ### OpenViking 集成
 

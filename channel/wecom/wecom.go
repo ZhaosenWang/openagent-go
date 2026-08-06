@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -333,15 +334,41 @@ func toIncoming(body *MsgCallbackBody) *channel.IncomingMessage {
 	if body.ChatType == "group" {
 		chatType = "group"
 	}
+	// chatid is only present for GROUP chats — a single chat must key its
+	// conversation on the sender (otherwise every single-chat user would
+	// share one session and their histories would bleed into each other).
+	chatID := body.ChatID
+	if chatID == "" {
+		chatID = body.From.UserID
+	}
+	text := body.Text.Content
+	if chatType == "group" {
+		// Group messages arrive with the @-mention prefix — strip it so
+		// the agent sees the actual question.
+		text = stripMention(text)
+	}
 	return &channel.IncomingMessage{
 		ID:       body.MsgID,
-		ChatID:   body.ChatID,
+		ChatID:   chatID,
 		ChatType: chatType,
 		UserID:   body.From.UserID,
 		UserName: body.From.UserID, // wire carries no display name
-		Text:     body.Text.Content,
+		Text:     text,
 		Raw:      body,
 	}
+}
+
+// stripMention removes a leading "@<bot>" mention (e.g. "@RobotA hello").
+func stripMention(text string) string {
+	t := strings.TrimSpace(text)
+	if !strings.HasPrefix(t, "@") {
+		return text
+	}
+	rest := strings.TrimSpace(t[1:])
+	if i := strings.IndexAny(rest, " \t\n"); i >= 0 {
+		return strings.TrimSpace(rest[i+1:])
+	}
+	return "" // only a mention, no content
 }
 
 func mustJSON(v any) json.RawMessage {

@@ -21,7 +21,7 @@ A fully pluggable, multi-agent AI agent framework in Go.
 - **Static context profiles** — `AGENTS.md` (working rules) and `SOUL.md` (persona & limits) with user-level and project-level resolution
 - **Slash commands** — built-in `/help`, `/mode`, `/model`, `/context`, `/cwd`, `/clear`, `/rename`, `/sessions`, extensible via `slash/` registry
 - **Full CLI** — `openagent-cli` with cobra commands, config-driven models, keyring secrets, WASM plugin runtime
-- **IM channels** — connect to Feishu/Lark via WebSocket; card-based streaming output with markdown, tool call cards, and one-click QR code setup
+- **IM channels** — Feishu/Lark (WebSocket, card-based streaming output with markdown and tool call cards, one-click QR setup), personal WeChat (Tencent ilinkai channel, QR login with pairing code), and WeCom 企业微信 (official long connection, native streaming replies, QR robot auto-creation)
 - **RunHooks with state** — start/end callbacks share opaque state; OTEL spans nest, slog logs duration
 - **Dynamic context** — session-level plan status and mode injected into every prompt turn
 
@@ -187,6 +187,63 @@ MCP tools are available to the Feishu bot at startup. Each tool call renders as 
 
 All fields are optional. Defaults: `~/.openagent/logs/openagent.log`, 10 MB rotation, 5 backups, info level.
 Each `max_size` unit is megabytes. Logs go to both stderr *and* the file. Set `level` to `"debug"` to see every API request.
+
+### WeChat (personal) Integration
+
+Connect your agent to your **personal WeChat** via Tencent's official ilinkai channel (`ilinkai.weixin.qq.com`) — no SDK, plain HTTP long-poll. The agent replies once per message (WeChat has no streaming/message-edit API; a "对方正在输入" typing indicator shows while the agent works). Media markers (`[file: /path]` in reply text) are uploaded and sent as file/image messages.
+
+**First-time setup (scan to create the bot):**
+
+```bash
+./openagent-cli serve --channel wechat
+```
+
+A QR code appears in the terminal — scan it with WeChat and confirm. The bot is created automatically; if the server asks for a **pairing code** (digits shown on your phone), type it in the terminal. Credentials are saved to settings.json.
+
+**Frontend flow:** the channel has a pairing-code step and a "scanned" state — the frontend polls the QR endpoint for the interactive flags:
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /api/channels/wechat/status` | Connection state (`connected`, `account_id`, `last_error`) |
+| `POST /api/channels/wechat/connect` | Start the connection; with no credentials it starts QR login and returns `202 {status:"registration", qr_url, qr_img_base64, expires_in}` |
+| `POST /api/channels/wechat/disconnect` | Tear down the connection |
+| `GET /api/channels/wechat/qr` | The registration QR + `scanned` / `verify_code_required` / `verify_code_retry` flags (the frontend shows the pairing-code input box when required) |
+| `POST /api/channels/wechat/verifycode` | Submit the pairing code (`{code}`) — the only channel for the `need_verifycode` step |
+| `GET/PUT/DELETE /api/settings/channels/wechat` | Credentials (`token`, `base_url`, `account_id`, `user_id`; masked token on GET) |
+
+A session that expires server-side (`errcode -14`) clears the credentials automatically — the next connect re-runs the QR login.
+
+### WeCom (企业微信) Integration
+
+Connect your agent to a **WeCom smart robot** via the official long-connection API (`wss://openws.work.weixin.qq.com`) — the richest of the three channels: **native streaming replies** (one message that grows in place), group chats with @-mentions, and voice already transcribed to text.
+
+**First-time setup (scan to auto-create the robot):**
+
+```bash
+./openagent-cli serve --channel wecom
+```
+
+A QR code appears — scan it with the WeCom app; the robot is created automatically and the BotID/Secret are saved to settings.json. Alternatively, create the robot manually in the WeCom admin console (安全与管理 → 管理工具 → 智能机器人 → API 模式 → 长连接) and configure it via the settings endpoint:
+
+```json
+{
+  "channels": { "wecom": { "bot_id": "aibs...", "secret": "..." } }
+}
+```
+
+**Frontend control panel** — same shape as Feishu (only the credential fields differ):
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /api/channels/wecom/status` | Connection state (`connected`, `bot_id`, `connected_at`, `last_error`) |
+| `POST /api/channels/wecom/connect` | Start the connection; with no credentials it starts QR authorization and returns `202 {status:"registration", qr_url, qr_img_base64, expires_in}` |
+| `POST /api/channels/wecom/disconnect` | Tear down the connection |
+| `GET /api/channels/wecom/qr` | The authorization QR (re-fetch after a refresh) |
+| `GET/PUT/DELETE /api/settings/channels/wecom` | Credentials (`bot_id`, masked `secret`) |
+
+**Streaming replies:** the agent's answer is sent as a stream message — `finish=false` refreshes grow the same message until `finish=true` ends it. The session rate limit is 30 messages/minute.
+
+**Connection semantics (all three channels):** settings credentials never auto-connect — the only auto-connect entry points are `--channel <name>` (fail-fast) and the frontend's `POST /connect`. Scanned/configured credentials are reused across restarts; the machine lock (`$profile/channel/<name>/<name>.lock`) keeps one live connection per profile.
 
 ### OpenViking Integration
 

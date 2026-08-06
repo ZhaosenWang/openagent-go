@@ -121,8 +121,52 @@ func TestToIncoming(t *testing.T) {
 	}
 	// Group chat type maps to "group".
 	body.ChatType = "group"
-	if toIncoming(body).ChatType != "group" {
+	msg = toIncoming(body)
+	if msg.ChatType != "group" {
 		t.Fatal("group type not mapped")
+	}
+	if msg.ChatID != "chat-1" {
+		t.Fatalf("group chatid = %q", msg.ChatID)
+	}
+}
+
+// Single chats carry NO chatid — the conversation must key on the
+// sender, or every single-chat user would share one session and their
+// histories would bleed into each other.
+func TestToIncomingSingleChatKeysOnSender(t *testing.T) {
+	body := &MsgCallbackBody{
+		MsgID:    "m-1",
+		ChatType: "single", // chatid omitted — as the protocol documents
+		From:     MsgFrom{UserID: "user-1"},
+		MsgType:  "text",
+		Text:     &TextBody{Content: "hi"},
+	}
+	msg := toIncoming(body)
+	if msg == nil {
+		t.Fatal("nil message")
+	}
+	if msg.ChatID != "user-1" {
+		t.Fatalf("single chat chatid = %q, want sender", msg.ChatID)
+	}
+}
+
+// Group mentions are stripped so the agent sees the question, not
+// "@RobotA hello".
+func TestToIncomingStripsGroupMention(t *testing.T) {
+	body := &MsgCallbackBody{
+		ChatType: "group",
+		From:     MsgFrom{UserID: "user-1"},
+		MsgType:  "text",
+		Text:     &TextBody{Content: "@RobotA 你好世界"},
+	}
+	msg := toIncoming(body)
+	if msg == nil || msg.Text != "你好世界" {
+		t.Fatalf("text = %q, want 你好世界", msg.Text)
+	}
+	// Plain text without a mention passes through untouched.
+	body.Text.Content = "没有艾特"
+	if msg := toIncoming(body); msg == nil || msg.Text != "没有艾特" {
+		t.Fatalf("plain text mangled: %+v", msg)
 	}
 }
 
