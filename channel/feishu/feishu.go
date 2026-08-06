@@ -10,8 +10,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	lark "github.com/larksuite/oapi-sdk-go/v3"
 	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
@@ -41,6 +43,14 @@ type Channel struct {
 	// failed reconnects). Used by the manager to surface first-connect
 	// failures (e.g. bad credentials) instead of a silent reconnect loop.
 	onError func(err error)
+
+	// connectedOnce is set when the SDK has connected at least once (the
+	// Start goroutine has entered its permanent select{}). It gates the
+	// leak counter: only a Start that actually reached the select{} leaks
+	// goroutines — a cancel during the connect/reconnect phase lets the
+	// SDK goroutine return normally, and counting it would be a false
+	// positive.
+	connectedOnce atomic.Bool
 }
 
 // New returns a Feishu Channel. The Channel must be started via Start() to
@@ -90,9 +100,15 @@ func (c *Channel) Start(ctx context.Context, handler channel.MessageHandler) err
 		larkws.WithEventHandler(dh),
 		larkws.WithLogLevel(larkcore.LogLevelError),
 	)
-	if c.onReady != nil {
-		c.ws.SetOnReady(c.onReady)
-	}
+	c.ws.SetOnReady(func() {
+		// Gates the leak counter (see connectedOnce) — the SDK Start
+		// goroutine has entered its permanent select{} only after the
+		// first successful connection.
+		c.connectedOnce.Store(true)
+		if c.onReady != nil {
+			c.onReady()
+		}
+	})
 	if c.onReconnecting != nil {
 		c.ws.SetOnReconnecting(c.onReconnecting)
 	}
@@ -100,31 +116,88 @@ func (c *Channel) Start(ctx context.Context, handler channel.MessageHandler) err
 		c.ws.SetOnError(c.onError)
 	}
 
-	// Context watcher: the SDK's Start blocks in `select {}` once
-	// connected and ignores ctx cancellation — a disconnect would leave
-	// the connection goroutine (and the machine lock) held forever.
-	// Closing the SDK client wakes Start up.
-	watchDone := make(chan struct{})
-	defer close(watchDone)
-	go func() {
-		select {
-		case <-ctx.Done():
-			c.ws.Close()
-		case <-watchDone:
-		}
-	}()
+	// The SDK's Start blocks in `select {}` once connected and NEVER
+	// returns — not on ctx cancellation, not on Close(). Run it in a
+	// goroutine and manage the lifecycle here: on ctx.Done we close the
+	// SDK client (which at least tears down the connection) and return.
+	//
+	// KNOWN LEAK (upstream SDK design): once connected, each Start leaks
+	// TWO permanent goroutines — the one parked in `select {}` and the
+	// SDK's pingLoop (a `for { time.Sleep }` with no exit path, which
+	// even restarts itself on panic). Both close over the ws.Client, so
+	// the whole Channel object graph stays reachable. Disconnect+
+	// reconnect (e.g. applying new credentials) therefore accumulates
+	// leaks without bound; the counter below makes the growth observable.
+	sdkDone := make(chan error, 1)
+	go func() { sdkDone <- c.ws.Start(ctx) }()
 
-	return c.ws.Start(ctx)
+	select {
+	case err := <-sdkDone:
+		// The SDK returned on its own: a first-connect ClientError (bad
+		// credentials) fails fast; anything else surfaces here too.
+		// If the context was cancelled at the same time (a disconnect
+		// during the connect/reconnect phase — the only window where
+		// both branches can be ready), the SDK's error is a byproduct of
+		// our own cancel: report a clean shutdown, not a fake LastError.
+		if ctx.Err() != nil {
+			return nil
+		}
+		return err
+	case <-ctx.Done():
+		c.ws.Close()
+		c.recordSdkLeak()
+		return nil
+	}
 }
 
-// Stop implements channel.Channel. Closes the underlying SDK client —
-// this wakes Start (which otherwise blocks in `select {}` forever).
+// Stop implements channel.Channel. Closes the underlying SDK connection,
+// which makes the SDK's receiveMessageLoop exit (the channel.Channel
+// contract "no further handler calls after Stop" holds) — but it does
+// NOT terminate the SDK's Start goroutine (see the leak note above); the
+// Start context is the only thing that ends the Start lifecycle.
 func (c *Channel) Stop() error {
 	if c.ws != nil {
 		c.ws.Close()
 	}
+	// Same leak accounting as the ctx path — Stop terminates the same
+	// parked goroutines when the SDK had connected. Gated by
+	// connectedOnce so a Stop before the first connect (nothing leaked)
+	// or racing a connect-phase cancel is not double-counted.
+	c.recordSdkLeak()
 	return nil
 }
+
+// sdkLeakCount counts Start terminations that leak the SDK's select{}
+// and pingLoop goroutines (gated by connectedOnce — a Start that never
+// reached the permanent select{} returns normally and leaks nothing).
+// Exposed via the warn in recordSdkLeak so unbounded growth is
+// observable instead of silent.
+var (
+	sdkLeakCount  atomic.Int64
+	sdkLeakMu     sync.Mutex
+	sdkLeakWarned bool
+)
+
+func (c *Channel) recordSdkLeak() {
+	if !c.connectedOnce.Load() {
+		return // never reached the select{} — the SDK goroutine returned
+	}
+	n := sdkLeakCount.Add(1)
+	// Warn once the growth is clearly beyond incidental (the manager's
+	// documented disconnect+reconnect flows for applying credentials).
+	sdkLeakMu.Lock()
+	defer sdkLeakMu.Unlock()
+	if n >= sdkLeakWarnThreshold && !sdkLeakWarned {
+		sdkLeakWarned = true
+		slog.Warn("feishu: SDK Start does not return on close — each disconnect leaks 2 goroutines "+
+			"(select{} + pingLoop) and the client object graph; consider restarting the process periodically",
+			"disconnects", n)
+	}
+}
+
+// sdkLeakWarnThreshold is the disconnect count after which the leak is
+// surfaced (incidental reconnects stay quiet; sustained churn is warned).
+const sdkLeakWarnThreshold = 10
 
 // ── Normalization ──
 

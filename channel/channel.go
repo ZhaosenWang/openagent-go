@@ -28,8 +28,15 @@ type Channel interface {
 	// separate goroutine to avoid blocking the transport.
 	Start(ctx context.Context, handler MessageHandler) error
 
-	// Stop gracefully shuts down the channel. After Stop returns, no
-	// further calls to the handler will be made.
+	// Stop shuts down the channel. After Stop returns, no further calls
+	// to the handler will be made (the platform event loop has exited).
+	//
+	// Contract caveat: Stop guarantees the EVENT LOOP stops; it does not
+	// necessarily terminate the Start goroutine. Some platform SDKs (e.g.
+	// the larksuite WebSocket client) block Start forever and ignore
+	// both ctx cancellation and close — for those, Start's termination
+	// is driven by its context, and Stop only tears the connection down.
+	// Implementations document their specific behavior.
 	Stop() error
 }
 
