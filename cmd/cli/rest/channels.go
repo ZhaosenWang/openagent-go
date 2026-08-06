@@ -232,9 +232,88 @@ func Register(mux *http.ServeMux, feishu FeishuChannel, wechat WechatChannel, we
 		writeJSON(w, http.StatusOK, map[string]any{"submitted": true})
 	})
 
+	// ── Wecom ──
+
+	mux.HandleFunc("GET /api/channels/wecom/status", func(w http.ResponseWriter, r *http.Request) {
+		if wecom == nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "wecom channel not configured"})
+			return
+		}
+		writeJSON(w, http.StatusOK, wecom.Status())
+	})
+	mux.HandleFunc("POST /api/channels/wecom/connect", func(w http.ResponseWriter, r *http.Request) {
+		if wecom == nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "wecom channel not configured"})
+			return
+		}
+		qrCh := make(chan string, 1)
+		registration, err := wecom.ConnectAsync(func(url string, _ int) {
+			select {
+			case qrCh <- url:
+			default:
+			}
+		})
+		if err != nil {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+			return
+		}
+		if !registration {
+			writeJSON(w, http.StatusOK, wecom.Status())
+			return
+		}
+		select {
+		case url := <-qrCh:
+			_, img, expireIn := wecom.QR()
+			writeJSON(w, http.StatusAccepted, map[string]any{
+				"status":        "registration",
+				"qr_url":        url,
+				"qr_img_base64": img,
+				"expires_in":    expireIn,
+			})
+		case <-r.Context().Done():
+			// Client went away before the URL arrived; the authorization
+			// itself continues on the process context.
+		}
+	})
+	mux.HandleFunc("POST /api/channels/wecom/disconnect", func(w http.ResponseWriter, r *http.Request) {
+		if wecom == nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "wecom channel not configured"})
+			return
+		}
+		wecom.Disconnect()
+		writeJSON(w, http.StatusOK, wecom.Status())
+	})
+	// Re-fetch the authorization QR after a refresh — same semantics as
+	// the other channels.
+	mux.HandleFunc("GET /api/channels/wecom/qr", func(w http.ResponseWriter, r *http.Request) {
+		if wecom == nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "wecom channel not configured"})
+			return
+		}
+		if wecom.Status().Phase != WecomRegistering {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "no QR registration in flight"})
+			return
+		}
+		url, img, expireIn := wecom.QR()
+		if url == "" {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "no QR registration in flight"})
+			return
+		}
+		if expireIn <= 0 {
+			writeJSON(w, http.StatusOK, map[string]any{"expired": true})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"qr_url":        url,
+			"qr_img_base64": img,
+			"expires_in":    expireIn,
+		})
+	})
+
 	// Configuration endpoints (generic settings domain).
 	registerSettings(mux, feishu)
 	registerWechatSettings(mux, wechat)
+	registerWecomSettings(mux, wecom)
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

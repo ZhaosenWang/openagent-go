@@ -128,6 +128,62 @@ func registerWechatSettings(mux *http.ServeMux, mgr WechatChannel) {
 	})
 }
 
+// registerWecomSettings mounts the wecom settings routes — GET (masked
+// secret), PUT (store BotID/Secret from the admin console), DELETE
+// (clear — the "re-register" flow is DELETE + POST /connect, which then
+// runs the QR authorization).
+func registerWecomSettings(mux *http.ServeMux, mgr WecomChannel) {
+	mux.HandleFunc("GET /api/settings/channels/wecom", func(w http.ResponseWriter, r *http.Request) {
+		if mgr == nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "wecom channel not configured"})
+			return
+		}
+		botID, secret := mgr.Credentials()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"bot_id": botID,
+			"secret": maskSecret(secret),
+		})
+	})
+	mux.HandleFunc("PUT /api/settings/channels/wecom", func(w http.ResponseWriter, r *http.Request) {
+		if mgr == nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "wecom channel not configured"})
+			return
+		}
+		var req struct {
+			BotID  string `json:"bot_id"`
+			Secret string `json:"secret"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+			return
+		}
+		if err := mgr.SetCredentials(req.BotID, req.Secret); err != nil {
+			if errors.Is(err, ErrWecomRegistrationInFlight) {
+				writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+				return
+			}
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"saved": true})
+	})
+	mux.HandleFunc("DELETE /api/settings/channels/wecom", func(w http.ResponseWriter, r *http.Request) {
+		if mgr == nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "wecom channel not configured"})
+			return
+		}
+		if err := mgr.ClearCredentials(); err != nil {
+			if errors.Is(err, ErrWecomRegistrationInFlight) {
+				writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+				return
+			}
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"cleared": true})
+	})
+}
+
 // maskSecret masks a secret for display: "****" + last 4 chars (or
 // "****" alone when shorter). The full value is never returned to the
 // frontend.
