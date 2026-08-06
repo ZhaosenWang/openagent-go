@@ -11,6 +11,7 @@ package wechat
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -106,7 +107,8 @@ func (c *Channel) Start(ctx context.Context, handler channel.MessageHandler) err
 			if ctx.Err() != nil {
 				return nil
 			}
-			if apiErr, ok := err.(*protocol.APIError); ok && apiErr.IsSessionExpired() {
+			var apiErr *protocol.APIError
+			if errors.As(err, &apiErr) && apiErr.IsSessionExpired() {
 				return ErrSessionExpired
 			}
 			if ready {
@@ -140,7 +142,7 @@ func (c *Channel) Start(ctx context.Context, handler channel.MessageHandler) err
 			if wire.MessageType != protocol.MessageTypeUser {
 				continue // bot echoes and system messages
 			}
-			msg := c.toIncoming(&wire)
+			msg := c.toIncoming(ctx, &wire)
 			if msg == nil {
 				continue
 			}
@@ -173,11 +175,12 @@ func (c *Channel) SendTyping(ctx context.Context, userID string) error {
 
 // toIncoming converts a wire message to a channel.IncomingMessage. Media
 // items are downloaded and saved under mediaDir; each becomes a marker in
-// Text ([image: path] / [file: path] / [video: path], [voice] for voice).
-// A download failure degrades to a marker without a path rather than
-// blocking the message flow.
-func (c *Channel) toIncoming(wire *protocol.WireMessage) *channel.IncomingMessage {
-	text := c.renderText(wire)
+// Text ([image: path] / [file: path], [video] / [voice] markers without
+// download — videos are large and would stall the long-poll loop). A
+// download failure degrades to a bare marker rather than blocking the
+// message flow.
+func (c *Channel) toIncoming(ctx context.Context, wire *protocol.WireMessage) *channel.IncomingMessage {
+	text := c.renderText(ctx, wire)
 	if strings.TrimSpace(text) == "" {
 		return nil
 	}
@@ -196,16 +199,16 @@ func (c *Channel) toIncoming(wire *protocol.WireMessage) *channel.IncomingMessag
 
 // renderText builds the message text: text items verbatim, media items as
 // markers (with the downloaded file path when available).
-func (c *Channel) renderText(wire *protocol.WireMessage) string {
+func (c *Channel) renderText(ctx context.Context, wire *protocol.WireMessage) string {
 	var parts []string
-	for _, item := range wire.ItemList {
+	for i, item := range wire.ItemList {
 		switch item.Type {
 		case protocol.ItemText:
 			if item.TextItem != nil {
 				parts = append(parts, item.TextItem.Text)
 			}
 		case protocol.ItemImage:
-			parts = append(parts, c.mediaMarker(item.ImageItem.Media, item.ImageItem.AESKey, wire, "image", ".jpg", "image"))
+			parts = append(parts, c.mediaMarker(ctx, item.ImageItem.Media, item.ImageItem.AESKey, wire, i, "image", ".jpg", "image"))
 		case protocol.ItemVoice:
 			// v1: no silk transcode (needs ffmpeg/wasm) — marker only.
 			parts = append(parts, "[voice]")
@@ -214,9 +217,12 @@ func (c *Channel) renderText(wire *protocol.WireMessage) string {
 			if item.FileItem != nil && item.FileItem.FileName != "" {
 				ext = filepath.Ext(item.FileItem.FileName)
 			}
-			parts = append(parts, c.mediaMarker(item.FileItem.Media, "", wire, "file", ext, "file"))
+			parts = append(parts, c.mediaMarker(ctx, item.FileItem.Media, "", wire, i, "file", ext, "file"))
 		case protocol.ItemVideo:
-			parts = append(parts, c.mediaMarker(item.VideoItem.Media, "", wire, "video", ".mp4", "video"))
+			// Videos are large (tens of MB) — downloading them inline
+			// would stall the long-poll loop for seconds-to-minutes.
+			// Marker only; the agent cannot consume video anyway.
+			parts = append(parts, "[video]")
 		}
 	}
 	return strings.Join(parts, "\n")
@@ -224,8 +230,8 @@ func (c *Channel) renderText(wire *protocol.WireMessage) string {
 
 // mediaMarker downloads one media item and returns its marker
 // ([kind: /abs/path] or bare [kind] when the download failed).
-func (c *Channel) mediaMarker(media *protocol.CDNMedia, keyOverride string, wire *protocol.WireMessage, kind, ext, marker string) string {
-	path, err := c.downloadMedia(media, keyOverride, wire, kind, ext)
+func (c *Channel) mediaMarker(ctx context.Context, media *protocol.CDNMedia, keyOverride string, wire *protocol.WireMessage, idx int, kind, ext, marker string) string {
+	path, err := c.downloadMedia(ctx, media, keyOverride, wire, idx, kind, ext)
 	if err != nil {
 		return "[" + marker + "]"
 	}
@@ -234,13 +240,15 @@ func (c *Channel) mediaMarker(media *protocol.CDNMedia, keyOverride string, wire
 
 // downloadMedia fetches, decrypts, and stores a media file under
 // mediaDir/YYYYMMDD/<messageID>_<idx>.<ext>.
-func (c *Channel) downloadMedia(media *protocol.CDNMedia, keyOverride string, wire *protocol.WireMessage, kind, ext string) (string, error) {
+func (c *Channel) downloadMedia(ctx context.Context, media *protocol.CDNMedia, keyOverride string, wire *protocol.WireMessage, idx int, kind, ext string) (string, error) {
 	if c.mediaDir == "" {
 		return "", fmt.Errorf("no media dir")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	// Bounded by the connection context (a disconnect kills in-flight
+	// downloads) with a 2-minute cap on top for the download itself.
+	dlCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	data, err := cdnDownload(ctx, media, keyOverride)
+	data, err := cdnDownload(dlCtx, media, keyOverride)
 	if err != nil {
 		return "", err
 	}
@@ -253,7 +261,8 @@ func (c *Channel) downloadMedia(media *protocol.CDNMedia, keyOverride string, wi
 	if ext == "" {
 		ext = ".bin"
 	}
-	name := fmt.Sprintf("%d_%s%s", wire.MessageID, kind, ext)
+	// idx disambiguates multiple media items within one message.
+	name := fmt.Sprintf("%d_%d_%s%s", wire.MessageID, idx, kind, ext)
 	path := filepath.Join(dir, name)
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		return "", err
@@ -432,11 +441,4 @@ func (c *Channel) reportError(err error) {
 	if c.onError != nil {
 		c.onError(err)
 	}
-}
-
-func min(a, b time.Duration) time.Duration {
-	if a < b {
-		return a
-	}
-	return b
 }

@@ -2,6 +2,7 @@ package wechat
 
 import (
 	"bytes"
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -26,7 +27,7 @@ func TestToIncomingText(t *testing.T) {
 			{Type: protocol.ItemText, TextItem: &protocol.TextItem{Text: " 你好 "}},
 		},
 	}
-	msg := ch.toIncoming(wire)
+	msg := ch.toIncoming(context.Background(), wire)
 	if msg == nil {
 		t.Fatal("nil message")
 	}
@@ -47,14 +48,37 @@ func TestToIncomingText(t *testing.T) {
 func TestToIncomingEmptyIgnored(t *testing.T) {
 	ch := New(&protocol.Credentials{}, "")
 	wire := &protocol.WireMessage{FromUserID: "u", MessageType: protocol.MessageTypeUser}
-	if msg := ch.toIncoming(wire); msg != nil {
+	if msg := ch.toIncoming(context.Background(), wire); msg != nil {
 		t.Fatalf("empty message not ignored: %+v", msg)
 	}
 	// Bot echoes are filtered at the Start loop level; toIncoming itself
 	// does not filter.
 	wire.ItemList = []protocol.MessageItem{{Type: protocol.ItemText, TextItem: &protocol.TextItem{Text: "x"}}}
-	if msg := ch.toIncoming(wire); msg == nil {
+	if msg := ch.toIncoming(context.Background(), wire); msg == nil {
 		t.Fatal("text message dropped")
+	}
+}
+
+// Videos are NOT downloaded (they would stall the long-poll loop) —
+// marker only, like voice.
+func TestToIncomingVideoMarkerOnly(t *testing.T) {
+	ch := New(&protocol.Credentials{}, t.TempDir())
+	wire := &protocol.WireMessage{
+		MessageID:   9,
+		FromUserID:  "u",
+		CreateTimeMs: 1,
+		MessageType: protocol.MessageTypeUser,
+		ContextToken: "c",
+		ItemList: []protocol.MessageItem{
+			{Type: protocol.ItemVideo, VideoItem: &protocol.VideoItem{Media: &protocol.CDNMedia{EncryptQueryParam: "x", AESKey: "k"}}},
+		},
+	}
+	msg := ch.toIncoming(context.Background(), wire)
+	if msg == nil {
+		t.Fatal("nil message")
+	}
+	if msg.Text != "[video]" {
+		t.Fatalf("text = %q, want [video]", msg.Text)
 	}
 }
 
@@ -106,7 +130,7 @@ func TestToIncomingMediaDownload(t *testing.T) {
 		},
 	}
 
-	msg := ch.toIncoming(wire)
+	msg := ch.toIncoming(context.Background(), wire)
 	if msg == nil {
 		t.Fatal("nil message")
 	}
@@ -144,7 +168,7 @@ func TestToIncomingMediaDownloadFailureDegrades(t *testing.T) {
 			{Type: protocol.ItemVoice, VoiceItem: &protocol.VoiceItem{}},
 		},
 	}
-	msg := ch.toIncoming(wire)
+	msg := ch.toIncoming(context.Background(), wire)
 	if msg == nil {
 		t.Fatal("nil message")
 	}

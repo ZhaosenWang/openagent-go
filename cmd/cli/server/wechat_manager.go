@@ -167,7 +167,11 @@ func (m *WechatManager) ConnectAsync(onQR func(url string, expireIn int), onScan
 	m.mu.Unlock()
 	go func() {
 		defer close(regDone)
+		// Read under the lock: SetCredentials/ClearCredentials write the
+		// in-memory copy concurrently — an unlocked read is a data race.
+		m.mu.Lock()
 		localCreds := wechatConfigFromSettings(m.wechatCfg)
+		m.mu.Unlock()
 		creds, rerr := ResolveWechatCredentials(regCtx, m.profiles, localCreds, onQR, func() {
 			// QR scanned — the frontend flips its hint from "scan" to
 			// "confirm on your phone". Guarded like every other publish
@@ -223,12 +227,14 @@ func (m *WechatManager) ConnectAsync(onQR func(url string, expireIn int), onScan
 }
 
 // waitVerifyCode blocks the registration goroutine until the frontend
-// submits a pairing code (or the entry times out). Marks the status so
-// the frontend knows a pairing code is requested / retry. All publishes
-// are guarded by the flow's own done channel: a disconnect that took
-// over the manager (and possibly started a new connection) must not have
-// its state clobbered by this flow's late status writes.
-func (m *WechatManager) waitVerifyCode(isRetry bool) (string, error) {
+// submits a pairing code (or the entry times out, or the login context
+// is cancelled — a disconnect must not wait out the full timeout holding
+// the flock). Marks the status so the frontend knows a pairing code is
+// requested / retry. All publishes are guarded by the flow's own done
+// channel: a disconnect that took over the manager (and possibly started
+// a new connection) must not have its state clobbered by this flow's
+// late status writes.
+func (m *WechatManager) waitVerifyCode(ctx context.Context, isRetry bool) (string, error) {
 	m.mu.Lock()
 	ch := m.verifyCodeCh
 	guard := m.done // this registration flow's own done (may be nil after an abandoned disconnect)
@@ -241,6 +247,8 @@ func (m *WechatManager) waitVerifyCode(isRetry bool) (string, error) {
 	select {
 	case code := <-ch:
 		return code, nil
+	case <-ctx.Done():
+		return "", ctx.Err()
 	case <-time.After(verifyCodeTimeout):
 		return "", fmt.Errorf("wechat: pairing code entry timed out")
 	}

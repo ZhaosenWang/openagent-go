@@ -40,8 +40,10 @@ func (c WechatCredentials) toProtocol() *protocol.Credentials {
 //
 // onQR, onScanned, onVerifyCode, when non-nil, are forwarded to the login
 // flow (an API-driven caller renders the QR and collects the pairing
-// code; nil = terminal rendering and stdin prompt).
-func ResolveWechatCredentials(ctx context.Context, profiles string, localCreds *protocol.Credentials, onQR func(url string, expireIn int), onScanned func(), onVerifyCode func(isRetry bool) (string, error)) (WechatCredentials, error) {
+// code; nil = terminal rendering and stdin prompt). onVerifyCode receives
+// the login context — a cancelled login (disconnect) must unblock the
+// pairing-code wait.
+func ResolveWechatCredentials(ctx context.Context, profiles string, localCreds *protocol.Credentials, onQR func(url string, expireIn int), onScanned func(), onVerifyCode func(ctx context.Context, isRetry bool) (string, error)) (WechatCredentials, error) {
 	client := protocol.NewClient()
 	baseURL := ""
 	if localCreds != nil {

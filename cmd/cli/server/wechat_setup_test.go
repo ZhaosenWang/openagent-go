@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -231,6 +232,34 @@ func TestWechatSubmitVerifyCodeRacingFailureNoPanic(t *testing.T) {
 	}
 }
 
+// waitVerifyCode must unblock immediately when the login context is
+// cancelled (a disconnect) — otherwise the registration goroutine holds
+// the flock for the full verifyCodeTimeout and reconnects keep failing.
+func TestWechatWaitVerifyCodeCancels(t *testing.T) {
+	m := NewWechatManager(context.Background(), filepath.Join(t.TempDir(), "profile"), nil, nil, kernel.Deps{})
+	m.mu.Lock()
+	m.status = clirest.WechatStatus{Phase: clirest.WechatRegistering}
+	m.verifyCodeCh = make(chan string)
+	m.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := m.waitVerifyCode(ctx, false)
+		done <- err
+	}()
+	time.Sleep(50 * time.Millisecond) // let it block on the channel
+	cancel()
+	select {
+	case err := <-done:
+		if err == nil || !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waitVerifyCode did not unblock on context cancel")
+	}
+}
+
 // A pairing code submitted to an in-flight registration is delivered.
 func TestWechatSubmitVerifyCodeDelivered(t *testing.T) {
 	m := NewWechatManager(context.Background(), filepath.Join(t.TempDir(), "profile"), nil, nil, kernel.Deps{})
@@ -241,7 +270,7 @@ func TestWechatSubmitVerifyCodeDelivered(t *testing.T) {
 
 	done := make(chan string, 1)
 	go func() {
-		code, err := m.waitVerifyCode(false)
+		code, err := m.waitVerifyCode(context.Background(), false)
 		if err != nil {
 			done <- "err: " + err.Error()
 			return

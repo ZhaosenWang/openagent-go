@@ -27,8 +27,10 @@ type LoginOptions struct {
 	OnExpired func()
 	// OnVerifyCode is called when the server requires a pairing code (the
 	// digits shown in WeChat on the user's phone). isRetry is true when a
-	// previously submitted code was rejected. nil = stdin prompt.
-	OnVerifyCode func(isRetry bool) (string, error)
+	// previously submitted code was rejected. The context is the login
+	// context — a cancelled login (disconnect) must unblock the wait.
+	// nil = stdin prompt.
+	OnVerifyCode func(ctx context.Context, isRetry bool) (string, error)
 }
 
 // pollInterval is the QR status poll cadence; a package var so tests can
@@ -134,7 +136,7 @@ func Login(ctx context.Context, client *protocol.Client, opts LoginOptions) (*pr
 				if prompt == nil {
 					prompt = readVerifyCode
 				}
-				code, err := prompt(isRetry)
+				code, err := prompt(ctx, isRetry)
 				if err != nil {
 					return nil, fmt.Errorf("read pairing code: %w", err)
 				}
@@ -179,8 +181,9 @@ func Login(ctx context.Context, client *protocol.Client, opts LoginOptions) (*pr
 }
 
 // readVerifyCode is the default pairing-code prompt: read a line from
-// stdin (the --channel wechat terminal entry point).
-func readVerifyCode(isRetry bool) (string, error) {
+// stdin (the --channel wechat terminal entry point). ctx is accepted for
+// signature uniformity; a terminal prompt cannot be interrupted by it.
+func readVerifyCode(ctx context.Context, isRetry bool) (string, error) {
 	prompt := "Enter the pairing code shown in WeChat on your phone: "
 	if isRetry {
 		prompt = "Code mismatch — enter the pairing code shown in WeChat again: "

@@ -143,7 +143,7 @@ func TestLoginVerifyCodeFlow(t *testing.T) {
 	_, err := Login(context.Background(), protocol.NewClient(), LoginOptions{
 		BaseURL: srv.URL,
 		OnQRURL: func(string) {},
-		OnVerifyCode: func(isRetry bool) (string, error) {
+		OnVerifyCode: func(_ context.Context, isRetry bool) (string, error) {
 			if isRetry {
 				retries++
 			}
@@ -225,7 +225,7 @@ func TestLoginVerifyCodeBlockedRefreshes(t *testing.T) {
 	creds, err := Login(context.Background(), protocol.NewClient(), LoginOptions{
 		BaseURL:      srv.URL,
 		OnQRURL:      func(string) {},
-		OnVerifyCode: func(bool) (string, error) { return "999", nil },
+		OnVerifyCode: func(context.Context, bool) (string, error) { return "999", nil },
 	})
 	if err != nil {
 		t.Fatal(err)
