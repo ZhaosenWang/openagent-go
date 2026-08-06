@@ -90,6 +90,55 @@ func TestSaveFeishuToSettingsPreservesOtherFields(t *testing.T) {
 }
 
 // Creating the settings file from scratch works too.
+// A lock released by a dying goroutine (disconnect timeout abandon)
+// must be re-acquirable by an immediate reconnect — the retry window
+// absorbs the handoff.
+func TestAcquireChannelLockRetryHandsOff(t *testing.T) {
+	profiles := filepath.Join(t.TempDir(), "profile")
+	held, err := AcquireChannelLock(profiles, "feishu")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The retry must NOT succeed while the lock is held.
+	done := make(chan error, 1)
+	go func() {
+		_, err := AcquireChannelLockRetry(profiles, "feishu", 300*time.Millisecond)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("acquired while lock held")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("retry did not finish")
+	}
+
+	// Release and retry again with a longer window: succeeds.
+	held.Release()
+	if _, err := AcquireChannelLockRetry(profiles, "feishu", 2*time.Second); err != nil {
+		t.Fatalf("retry after release failed: %v", err)
+	}
+}
+
+// A lock held by a live holder still fails after the window.
+func TestAcquireChannelLockRetryFailsWhileHeld(t *testing.T) {
+	profiles := filepath.Join(t.TempDir(), "profile")
+	held, err := AcquireChannelLock(profiles, "feishu")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Release()
+
+	start := time.Now()
+	if _, err := AcquireChannelLockRetry(profiles, "feishu", 300*time.Millisecond); err == nil {
+		t.Fatal("acquired while held")
+	}
+	if elapsed := time.Since(start); elapsed < 250*time.Millisecond {
+		t.Fatalf("failed too fast: %v", elapsed)
+	}
+}
+
 func TestSaveFeishuToSettingsCreatesFile(t *testing.T) {
 	p := isolateSettings(t)
 	if err := saveFeishuToSettings("cli_fresh", "secret_fresh"); err != nil {

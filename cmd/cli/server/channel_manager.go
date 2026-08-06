@@ -146,8 +146,11 @@ func (m *FeishuManager) ConnectAsync(onQR func(url string, expireIn int)) (bool,
 	}
 
 	// Machine-level single instance: a second connection to the same
-	// app would silently steal events from the first.
-	lock, err := AcquireChannelLock(m.profiles, "feishu")
+	// app would silently steal events from the first. Retry-windowed: a
+	// disconnect that abandoned a stuck goroutine leaves the flock held
+	// for a moment — the frontend reconnects immediately after, and the
+	// retry absorbs that handoff (see AcquireChannelLockRetry).
+	lock, err := AcquireChannelLockRetry(m.profiles, "feishu", lockRetryWindow)
 	if err != nil {
 		return false, err
 	}
@@ -368,6 +371,13 @@ func (m *FeishuManager) ClearCredentials() error {
 	m.mu.Unlock()
 	return nil
 }
+
+// lockRetryWindow is how long a connect retries the flock after a
+// Disconnect abandoned a stuck goroutine (see AcquireChannelLockRetry).
+// The abandoned goroutine releases the lock when its stuck request
+// finally dies — usually within a second or two; the window covers that
+// without making a genuinely-locked connect wait forever.
+const lockRetryWindow = 5 * time.Second
 
 // disconnectTimeout bounds the <-done wait in Disconnect. Normally the
 // cancel makes the SDK return immediately; the exception is a

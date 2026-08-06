@@ -3,6 +3,7 @@ package server
 import (
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/yusheng-g/openagent-go/utils"
 )
@@ -40,4 +41,33 @@ func AcquireChannelLock(profiles, name string) (*ChannelLock, error) {
 	}
 	l.WritePID()
 	return &ChannelLock{FileLock: l}, nil
+}
+
+// AcquireChannelLockRetry is AcquireChannelLock with a bounded retry
+// window.
+//
+// Why the retry: a Disconnect that times out abandoning a stuck
+// connection goroutine (disconnectTimeout) returns while that goroutine
+// still holds the flock — it releases it when the SDK's shutdown
+// finally completes, usually within a second or two. An immediate
+// reconnect from the frontend would otherwise fail spuriously with
+// "lock held by another process". Retrying for the window absorbs that
+// handoff; a lock genuinely held by another LIVE process still fails
+// after the window (it never releases).
+//
+// The handoff is race-free: the old goroutine releases ITS lock only
+// when it exits (the connection is dead by then), so the new connect
+// can never double-run against a live connection.
+func AcquireChannelLockRetry(profiles, name string, timeout time.Duration) (*ChannelLock, error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		lock, err := AcquireChannelLock(profiles, name)
+		if err == nil {
+			return lock, nil
+		}
+		if time.Now().After(deadline) {
+			return nil, err
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
 }
