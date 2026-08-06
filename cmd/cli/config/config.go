@@ -153,6 +153,23 @@ type McpServerConfig struct {
 type ChannelsConfig struct {
 	Feishu *FeishuConfig `json:"feishu,omitempty"`
 	Wechat *WechatConfig `json:"wechat,omitempty"`
+	Wecom  *WecomConfig  `json:"wecom,omitempty"`
+}
+
+// WecomConfig holds credentials for the WeCom smart-robot channel
+// (official long-connection API). BotID + Secret come from the admin
+// console (manual) or the official QR authorization flow (scan → robot
+// created automatically).
+type WecomConfig struct {
+	BotID  string `json:"bot_id"`
+	Secret string `json:"secret"`
+
+	// Explicit marks a channel requested via --channel on the command
+	// line (never persisted, never read from settings). Only explicit
+	// channels auto-connect at startup (fail-fast when they cannot
+	// start); settings credentials alone never trigger a connection —
+	// the frontend connects via POST /connect.
+	Explicit bool `json:"-"`
 }
 
 // WechatConfig holds credentials for the personal WeChat channel
@@ -166,9 +183,10 @@ type WechatConfig struct {
 	UserID    string `json:"user_id,omitempty"`
 
 	// Explicit marks a channel requested via --channel on the command
-	// line (never persisted, never read from settings). An explicit
-	// channel fails fast when it cannot start; a settings-only channel
-	// degrades to a warning so the REST/ACP server still runs.
+	// line (never persisted, never read from settings). Only explicit
+	// channels auto-connect at startup (fail-fast when they cannot
+	// start); settings credentials alone never trigger a connection —
+	// the frontend connects via POST /connect.
 	Explicit bool `json:"-"`
 }
 
@@ -179,9 +197,10 @@ type FeishuConfig struct {
 	AppSecret string `json:"app_secret"`
 
 	// Explicit marks a channel requested via --channel on the command
-	// line (never persisted, never read from settings). An explicit
-	// channel fails fast when it cannot start; a settings-only channel
-	// degrades to a warning so the REST/ACP server still runs.
+	// line (never persisted, never read from settings). Only explicit
+	// channels auto-connect at startup (fail-fast when they cannot
+	// start); settings credentials alone never trigger a connection —
+	// the frontend connects via POST /connect.
 	Explicit bool `json:"-"`
 }
 

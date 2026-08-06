@@ -16,7 +16,7 @@ import (
 // Register mounts the CLI-level API on mux. feishu and wechat are the
 // process-level connection managers (never nil in practice — RunChannels
 // always creates both; guarded anyway).
-func Register(mux *http.ServeMux, feishu FeishuChannel, wechat WechatChannel) {
+func Register(mux *http.ServeMux, feishu FeishuChannel, wechat WechatChannel, wecom WecomChannel) {
 	mux.HandleFunc("GET /api/channels/feishu/status", func(w http.ResponseWriter, r *http.Request) {
 		if feishu == nil {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "feishu channel not configured"})

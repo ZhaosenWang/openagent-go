@@ -182,7 +182,7 @@ func RunACP(ctx context.Context, cfg *config.Config, caps config.Capabilities) e
 		channelDeps.Tools = buildTools(sb, cwd, []string{"shell", "read", "write", "ls", "grep", "websearch", "webfetch"})
 	}
 
-	if _, _, err := RunChannels(ctx, cfg.Profiles, channelCfg, channelDeps, cfg.Channels); err != nil {
+	if _, _, _, err := RunChannels(ctx, cfg.Profiles, channelCfg, channelDeps, cfg.Channels); err != nil {
 		slog.Warn("channel error", "error", err)
 	}
 

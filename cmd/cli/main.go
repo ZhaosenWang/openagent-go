@@ -240,23 +240,30 @@ func buildServeCmd(cfg config.Config) *cobra.Command {
 
 			ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 
-			// --channel <name> marks that channel as explicitly requested
-			// (immediate-connect; fail-fast when it cannot start), and
-			// disables every other channel — the flag names THE channel.
-			// Credential resolution, the machine lock, and the connection
-			// itself all live in the channel manager (RunChannels), so
-			// this branch only flags intent. Without the flag, a
-			// settings-only channel still connects at startup but
-			// degrades to a warning when locked.
+			// --channel <name> marks that channel as explicitly requested:
+			// auto-connect at startup with fail-fast when it cannot start.
+			// All settings credentials are KEPT (settings is the credential
+			// store; other channels stay configured-but-disconnected and
+			// the frontend can connect them via POST /connect).
 			if channelFlag != "" {
-				cfg.Channels = config.ChannelsConfig{}
 				switch channelFlag {
 				case "feishu":
-					cfg.Channels.Feishu = &config.FeishuConfig{Explicit: true}
+					if cfg.Channels.Feishu == nil {
+						cfg.Channels.Feishu = &config.FeishuConfig{}
+					}
+					cfg.Channels.Feishu.Explicit = true
 				case "wechat":
-					cfg.Channels.Wechat = &config.WechatConfig{Explicit: true}
+					if cfg.Channels.Wechat == nil {
+						cfg.Channels.Wechat = &config.WechatConfig{}
+					}
+					cfg.Channels.Wechat.Explicit = true
+				case "wecom":
+					if cfg.Channels.Wecom == nil {
+						cfg.Channels.Wecom = &config.WecomConfig{}
+					}
+					cfg.Channels.Wecom.Explicit = true
 				default:
-					return fmt.Errorf("unknown channel %q (supported: feishu, wechat)", channelFlag)
+					return fmt.Errorf("unknown channel %q (supported: feishu, wechat, wecom)", channelFlag)
 				}
 			}
 			defer cancel()
@@ -267,7 +274,7 @@ func buildServeCmd(cfg config.Config) *cobra.Command {
 		},
 	}
 	cmd.Flags().Bool("acp", false, "ACP mode over stdio")
-	cmd.Flags().String("channel", "", "Enable IM channel (\"feishu\" or \"wechat\")")
+	cmd.Flags().String("channel", "", "Enable IM channel (\"feishu\", \"wechat\", or \"wecom\")")
 	cmd.Flags().Int("port", 0, "REST port (overrides settings)")
 	cmd.Flags().Bool("sandbox", false, "Enable OS-native sandbox (bwrap/seatbelt) for shell commands")
 	addCapabilityFlags(cmd)
