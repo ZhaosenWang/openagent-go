@@ -100,11 +100,29 @@ func (c *Channel) Start(ctx context.Context, handler channel.MessageHandler) err
 		c.ws.SetOnError(c.onError)
 	}
 
+	// Context watcher: the SDK's Start blocks in `select {}` once
+	// connected and ignores ctx cancellation — a disconnect would leave
+	// the connection goroutine (and the machine lock) held forever.
+	// Closing the SDK client wakes Start up.
+	watchDone := make(chan struct{})
+	defer close(watchDone)
+	go func() {
+		select {
+		case <-ctx.Done():
+			c.ws.Close()
+		case <-watchDone:
+		}
+	}()
+
 	return c.ws.Start(ctx)
 }
 
-// Stop implements channel.Channel.
+// Stop implements channel.Channel. Closes the underlying SDK client —
+// this wakes Start (which otherwise blocks in `select {}` forever).
 func (c *Channel) Stop() error {
+	if c.ws != nil {
+		c.ws.Close()
+	}
 	return nil
 }
 

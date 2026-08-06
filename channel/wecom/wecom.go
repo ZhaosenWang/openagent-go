@@ -63,9 +63,15 @@ func (c *Channel) SetOnError(f func(err error)) { c.onError = f }
 // Name implements channel.Channel.
 func (c *Channel) Name() string { return "wecom" }
 
-// Stop implements channel.Channel. The connection is torn down by
-// cancelling the Start context; there is nothing else to do.
-func (c *Channel) Stop() error { return nil }
+// Stop implements channel.Channel. Closes the underlying WebSocket —
+// this wakes a ReadMessage blocked in Start (gorilla's ReadMessage does
+// NOT respond to context cancellation, so cancelling the Start context
+// alone would leave the connection goroutine stuck forever, holding the
+// machine lock).
+func (c *Channel) Stop() error {
+	c.closeConn()
+	return nil
+}
 
 // Start implements channel.Channel. Connects, subscribes, and runs the
 // read loop (plus heartbeats) until ctx is cancelled or the connection
@@ -136,6 +142,20 @@ func (c *Channel) runOnce(ctx context.Context, handler channel.MessageHandler, e
 	hbCtx, hbCancel := context.WithCancel(ctx)
 	defer hbCancel()
 	go c.heartbeat(hbCtx)
+
+	// Context watcher: cancelling the Start context must terminate the
+	// read loop — gorilla's ReadMessage blocks forever otherwise (a
+	// disconnected manager would leave the connection goroutine stuck,
+	// holding the machine lock). Closing the connection wakes it.
+	watchDone := make(chan struct{})
+	defer close(watchDone)
+	go func() {
+		select {
+		case <-ctx.Done():
+			c.closeConn()
+		case <-watchDone:
+		}
+	}()
 
 	for {
 		_, raw, err := conn.ReadMessage()
