@@ -94,7 +94,10 @@ type AgentServer struct {
 	Summarizer *summarizer.Compressor
 	Extractor  *ctxpkg.AsyncExtractor
 
-	// approvalMemory persists session-scoped "allow always" decisions.
+	// approvalMemory persists session-scoped approval decisions
+	// ("allow always" — the same tool + args no longer asks within this
+	// session; "allow once" is deliberately NOT remembered, per the ACP
+	// allow_once / allow_always semantics).
 	approvalMemory governance.ApprovalMemory
 	modelsMu       sync.Mutex
 
@@ -122,14 +125,14 @@ func (s *AgentServer) defaultMode() string {
 // ModelConfig stores the original apiKey/baseURL for a registered model,
 // so SetModel can preserve values when only model_id changes.
 type ModelConfig struct {
-	Provider                string
-	ModelID                 string
-	APIKey                  string
-	BaseURL                 string
-	MaxOutputTokens         int
-	InputCostPerToken       float64
-	InputCacheCostPerToken  float64
-	OutputCostPerToken      float64
+	Provider               string
+	ModelID                string
+	APIKey                 string
+	BaseURL                string
+	MaxOutputTokens        int
+	InputCostPerToken      float64
+	InputCacheCostPerToken float64
+	OutputCostPerToken     float64
 }
 
 // agentSession holds per-session runtime state.
@@ -2307,7 +2310,7 @@ func (s *AgentServer) renameSession(ctx context.Context, sid openacp.SessionId, 
 type acpApprover struct {
 	client    openacp.ClientRequester
 	sessionID openacp.SessionId
-	memory    governance.ApprovalMemory // session-scoped "always" persistence
+	memory    governance.ApprovalMemory // session-scoped "allow always" persistence
 }
 
 // Ask implements governance.HumanApprover. The ACP permission response
@@ -2328,12 +2331,14 @@ func (a *acpApprover) Ask(ctx context.Context, call openagent.ToolCall, def open
 			Status:     "pending",
 			RawInput:   json.RawMessage(call.Function.Arguments),
 		},
-		// The "always" (Allow Always) option is not offered to the client
-		// for now; the backend handling (write-through to approval memory)
-		// stays, so re-enabling later is a one-line option add.
+		// ACP semantics: allow_once = this call only (never remembered),
+		// allow_always = remembered for the session (same tool + args no
+		// longer asks this session). Cross-session rules are a separate
+		// configuration layer, not a button grant.
 		Options: []openacp.PermissionOption{
-			{OptionID: "allow", Name: "Allow", Kind: openacp.PermissionAllowOnce},
-			{OptionID: "reject", Name: "Reject", Kind: openacp.PermissionRejectOnce},
+			{OptionID: "allow_once", Name: "Allow Once", Kind: openacp.PermissionAllowOnce},
+			{OptionID: "allow_always", Name: "Allow Always", Kind: openacp.PermissionAllowAlways},
+			{OptionID: "reject_once", Name: "Reject", Kind: openacp.PermissionRejectOnce},
 		},
 	})
 	if err != nil {
@@ -2346,17 +2351,25 @@ func (a *acpApprover) Ask(ctx context.Context, call openagent.ToolCall, def open
 		return governance.Decision{Action: governance.Deny, Reason: "no option selected"}, nil
 	}
 	switch *resp.Outcome.OptionID {
-	case "allow":
-		return governance.Decision{Action: governance.Allow}, nil
-	case "always":
-		d := governance.Decision{Action: governance.Allow, Reason: "always allow"}
+	case "allow_once":
+		// Deliberately NOT remembered (ACP allow_once semantics): the
+		// same tool + args asks again next time — a session-level grant
+		// is what "Allow Always" is for.
+		return governance.Decision{Action: governance.Allow, Reason: "allow once"}, nil
+	case "allow_always":
+		// Session-scoped (ACP allow_always semantics): the same tool +
+		// args no longer asks within this session. NOT persisted across
+		// sessions — a cross-session rules layer (settings → governance
+		// Rule) is future work, not a button grant.
+		d := governance.Decision{Action: governance.Allow, Reason: "allow always"}
 		if a.memory != nil {
-			if err := a.memory.Remember(ctx, session.ID, call.Function.Name, d); err != nil {
+			key := governance.ApprovalKey(call.Function.Name, json.RawMessage(call.Function.Arguments))
+			if err := a.memory.Remember(ctx, session.ID, key, d); err != nil {
 				slog.Warn("openagent: approval always persistence failed", "session", session.ID, "error", err)
 			}
 		}
 		return d, nil
-	case "reject":
+	case "reject_once":
 		reason := "rejected by user"
 		if fb, ok := resp.Outcome.Meta["feedback"].(string); ok && fb != "" {
 			reason = fb

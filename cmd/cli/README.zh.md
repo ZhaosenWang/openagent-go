@@ -34,7 +34,7 @@ mkdir -p ~/.openagent/plugins
 ./openagent-cli serve
 ```
 
-REST API 运行在 `http://localhost:8080`。连接[前端](https://github.com/yusheng-g/openagent-go/tree/master/examples/frontend)或任何 OpenAI 兼容客户端。
+REST API 运行在 `http://localhost:8080`。连接任何 OpenAI 兼容客户端。
 
 ACP（Agent 通信协议）模式：
 

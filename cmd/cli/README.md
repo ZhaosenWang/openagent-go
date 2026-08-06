@@ -34,7 +34,7 @@ Start the server:
 ./openagent-cli serve
 ```
 
-The REST API is now on `http://localhost:8080`. Connect the [frontend](https://github.com/yusheng-g/openagent-go/tree/master/examples/frontend) or any OpenAI-compatible client.
+The REST API is now on `http://localhost:8080`. Connect any OpenAI-compatible client.
 
 For ACP (Agent Communication Protocol) over stdio:
 

@@ -2,6 +2,7 @@ package governance
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	openagent "github.com/yusheng-g/openagent-go"
@@ -113,7 +114,7 @@ func TestEngine_RememberedAskRoutesToHuman(t *testing.T) {
 	ctx := context.Background()
 	sess := openagent.Session{ID: "s1"}
 
-	if err := mem.Remember(ctx, sess.ID, "shell", Decision{Action: Ask, Reason: "ask always"}); err != nil {
+	if err := mem.Remember(ctx, sess.ID, ApprovalKey("shell", json.RawMessage("{}")), Decision{Action: Ask, Reason: "ask always"}); err != nil {
 		t.Fatal(err)
 	}
 	d, err := e.Evaluate(ctx, call("shell"), def("shell"), sess)
@@ -184,7 +185,8 @@ func TestEngine_AlwaysRememberedSkipsHuman(t *testing.T) {
 	if d1.Action != Allow {
 		t.Fatalf("first action = %v", d1.Action)
 	}
-	_ = mem.Remember(ctx, sess.ID, "shell", d1)
+	// Memory is keyed by tool + canonical args (the bridge computes this).
+	_ = mem.Remember(ctx, sess.ID, ApprovalKey("shell", json.RawMessage("{}")), d1)
 
 	// Second call: memory layer short-circuits, human not asked again.
 	d2, _ := e.Evaluate(ctx, call("shell"), def("shell"), sess)

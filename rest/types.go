@@ -52,8 +52,9 @@ type ChatRequest struct {
 
 // ApproveRequest is the body for POST /sessions/{id}/approve.
 //
-// Action is one of: "allow" (once), "deny", "always" (remember for the
-// session), "edit" (allow with modified args).
+// Action is one of (ACP permission option names): "allow_once" (this
+// call only), "allow_always" (remember for the session), "deny",
+// "edit" (allow with modified args).
 type ApproveRequest struct {
 	Action   string          `json:"action"`
 	Args     json.RawMessage `json:"args,omitempty"` // edited args (action=edit)

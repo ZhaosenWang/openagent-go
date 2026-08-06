@@ -420,8 +420,6 @@ pub extern "C" fn openagent_on_stage(event_json: &str) {
 | `examples/plugin/` | WASM 工具 + 观测器插件 |
 | `examples/skill/` | 按需加载技能 |
 | `examples/acp/` | ACP agent 协议（server + client） |
-| `examples/iac/` | 多 agent IaC 流水线 |
-| `examples/backend/` | 完整 REST + SSE API 服务 |
 | `examples/artifact/` | 结果策略 — 大型工具结果落盘 |
 | `examples/browser-agent/` | 基于 Playwright MCP 的浏览器 agent |
 | `examples/mcp-client/` | MCP 客户端示例（IaC 流水线） |

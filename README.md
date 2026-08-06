@@ -423,8 +423,6 @@ Full example: `examples/plugin/`. Rust SDK: `plugin/pdk/rust/`.
 | `examples/plugin/` | WASM tool + observer plugins |
 | `examples/skill/` | On-demand skill loading |
 | `examples/acp/` | ACP agent protocol (server + client) |
-| `examples/iac/` | Multi-agent IaC pipeline |
-| `examples/backend/` | Full REST + SSE API server |
 | `examples/artifact/` | Result policy — large tool results spill to disk |
 | `examples/browser-agent/` | Browser agent via Playwright MCP |
 | `examples/mcp-client/` | MCP client demo (IaC pipeline) |

@@ -182,11 +182,12 @@ func (e *Engine) Evaluate(ctx context.Context, call openagent.ToolCall, def open
 		}
 	}
 
-	// 3) Memory layer: remembered decision for this tool. A remembered
-	// Ask never short-circuits — it still routes to the human layer
-	// (otherwise an Ask in memory would silently bypass approval).
+	// 3) Memory layer: remembered decision for this call (tool + args —
+	// a changed argument is a different operation and asks again). A
+	// remembered Ask never short-circuits — it still routes to the human
+	// layer (otherwise an Ask in memory would silently bypass approval).
 	if e.Memory != nil {
-		key := call.Function.Name
+		key := ApprovalKey(call.Function.Name, json.RawMessage(call.Function.Arguments))
 		if d, ok := e.Memory.Recall(ctx, session.ID, key); ok {
 			if d.Action == Ask {
 				return e.askHuman(ctx, call, def, session, "remembered ask")

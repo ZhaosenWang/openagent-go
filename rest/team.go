@@ -370,9 +370,9 @@ func (h *TeamHandler) handleApprove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch body.Action {
-	case "allow", "deny", "always", "edit":
+	case "allow_once", "allow_always", "deny", "edit":
 	default:
-		http.Error(w, `{"error":"action must be allow|deny|always|edit"}`, http.StatusBadRequest)
+		http.Error(w, `{"error":"action must be allow_once|allow_always|deny|edit"}`, http.StatusBadRequest)
 		return
 	}
 

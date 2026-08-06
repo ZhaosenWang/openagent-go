@@ -55,7 +55,6 @@ type Handler struct {
 	deps      kernel.Deps   // template runtime deps (copied per session)
 	pluginMgr *wasm.Manager // nil = plugins disabled, set by WithPluginManager
 
-
 	// approverEnabled gates the per-session WithApprover. Default false
 	// (no approval step — tools run unapproved); the CLI enables it via
 	// --approver=on / settings. Set via WithApproverEnabled.
@@ -280,7 +279,6 @@ type sessionState struct {
 	pendingApproval *pendingApproval
 }
 
-
 func (s *sessionState) sessionInfo() *session.SessionInfo { return &s.info }
 
 // isActive reports whether the session has an ongoing agent run
@@ -312,7 +310,7 @@ type pendingApproval struct {
 }
 
 type approveResponse struct {
-	action       string          // allow|deny|always|edit
+	action       string          // allow_once|allow_always|deny|edit (ACP permission option names)
 	modifiedArgs json.RawMessage // action=edit
 	reason       string
 }
@@ -506,9 +504,9 @@ func handleApproveShared[E sessionEntry](sm *sessionManager[E], w http.ResponseW
 		return
 	}
 	switch body.Action {
-	case "allow", "deny", "always", "edit":
+	case "allow_once", "allow_always", "deny", "edit":
 	default:
-		http.Error(w, `{"error":"action must be allow|deny|always|edit"}`, http.StatusBadRequest)
+		http.Error(w, `{"error":"action must be allow_once|allow_always|deny|edit"}`, http.StatusBadRequest)
 		return
 	}
 
@@ -593,12 +591,14 @@ func (h *Handler) newEntry(ctx context.Context, info session.SessionInfo) *sessi
 
 type restApprover struct {
 	submit func(call openagent.ToolCall, resp chan approveResponse)
-	memory governance.ApprovalMemory // session-scoped "always" persistence
+	memory governance.ApprovalMemory // session-scoped "allow always" persistence
 }
 
 // Ask implements governance.HumanApprover — the single approval entry
-// point. The four UI actions map onto Decisions: always persists to the
-// session approval memory, edit carries the modified args forward.
+// point. The UI actions map onto Decisions (ACP allow_once/allow_always
+// semantics): allow grants THIS call only (never remembered), always
+// persists to the session memory (same tool + args no longer asks this
+// session), edit carries the modified args forward.
 func (a *restApprover) Ask(ctx context.Context, call openagent.ToolCall, def openagent.FunctionDefinition, session openagent.Session) (governance.Decision, error) {
 	resp := make(chan approveResponse, 1)
 	a.submit(call, resp)
@@ -611,18 +611,26 @@ func (a *restApprover) Ask(ctx context.Context, call openagent.ToolCall, def ope
 	}
 
 	switch r.action {
-	case "always":
+	case "allow_always":
 		d := governance.Decision{Action: governance.Allow, Reason: r.reason}
 		if a.memory != nil {
-			_ = a.memory.Remember(ctx, session.ID, call.Function.Name, d)
+			key := governance.ApprovalKey(call.Function.Name, json.RawMessage(call.Function.Arguments))
+			if err := a.memory.Remember(ctx, session.ID, key, d); err != nil {
+				slog.Warn("openagent: approval always persistence failed", "session", session.ID, "error", err)
+			}
 		}
 		return d, nil
 	case "edit":
 		return governance.Decision{Action: governance.Allow, Reason: r.reason, ModifiedArgs: r.modifiedArgs}, nil
 	case "deny":
 		return governance.Decision{Action: governance.Deny, Reason: r.reason}, nil
-	default: // allow
+	case "allow_once": // this call only, never remembered
 		return governance.Decision{Action: governance.Allow, Reason: r.reason}, nil
+	default:
+		// Unrecognized action (malformed request, future protocol value):
+		// fail closed — an approval UI hiccup must never auto-execute.
+		slog.Warn("openagent: approval received unknown action, denying", "action", r.action)
+		return governance.Decision{Action: governance.Deny, Reason: "unknown action: " + r.action}, nil
 	}
 }
 
