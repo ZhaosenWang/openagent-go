@@ -240,20 +240,24 @@ func buildServeCmd(cfg config.Config) *cobra.Command {
 
 			ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 
-			// --channel feishu marks the channel as explicitly requested
-			// (immediate-connect; fail-fast when it cannot start).
+			// --channel <name> marks that channel as explicitly requested
+			// (immediate-connect; fail-fast when it cannot start), and
+			// disables every other channel — the flag names THE channel.
 			// Credential resolution, the machine lock, and the connection
 			// itself all live in the channel manager (RunChannels), so
 			// this branch only flags intent. Without the flag, a
 			// settings-only channel still connects at startup but
 			// degrades to a warning when locked.
-			if channelFlag != "feishu" {
+			if channelFlag != "" {
 				cfg.Channels = config.ChannelsConfig{}
-			} else {
-				if cfg.Channels.Feishu == nil {
-					cfg.Channels.Feishu = &config.FeishuConfig{}
+				switch channelFlag {
+				case "feishu":
+					cfg.Channels.Feishu = &config.FeishuConfig{Explicit: true}
+				case "wechat":
+					cfg.Channels.Wechat = &config.WechatConfig{Explicit: true}
+				default:
+					return fmt.Errorf("unknown channel %q (supported: feishu, wechat)", channelFlag)
 				}
-				cfg.Channels.Feishu.Explicit = true
 			}
 			defer cancel()
 			if isACP {
@@ -263,7 +267,7 @@ func buildServeCmd(cfg config.Config) *cobra.Command {
 		},
 	}
 	cmd.Flags().Bool("acp", false, "ACP mode over stdio")
-	cmd.Flags().String("channel", "", "Enable IM channel (e.g. \"feishu\")")
+	cmd.Flags().String("channel", "", "Enable IM channel (\"feishu\" or \"wechat\")")
 	cmd.Flags().Int("port", 0, "REST port (overrides settings)")
 	cmd.Flags().Bool("sandbox", false, "Enable OS-native sandbox (bwrap/seatbelt) for shell commands")
 	addCapabilityFlags(cmd)

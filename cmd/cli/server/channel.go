@@ -17,29 +17,38 @@ import (
 	"github.com/yusheng-g/openagent-go/cmd/cli/config"
 )
 
-// RunChannels wires the feishu connection manager. The manager is ALWAYS
-// created — the frontend control panel needs the status/connect endpoints
-// even when no channel is configured at startup; connection is only
-// auto-started when the channel is configured (--channel flag or settings
-// channels.feishu).
+// RunChannels wires the feishu and wechat connection managers. Both
+// managers are ALWAYS created — the frontend control panel needs the
+// status/connect endpoints even when no channel is configured at
+// startup; connection is only auto-started when the channel is
+// configured (--channel flag or settings channels.<name>).
 //
 // Start failure is fail-fast for an explicitly flagged channel
-// (--channel feishu): the user asked for the bot, so running silently
-// without it would read as "connected" while delivering nothing. A
-// settings-only channel degrades to a warning and the server continues.
-func RunChannels(ctx context.Context, profiles string, cfg *agent.Agent, deps kernel.Deps, channelsCfg config.ChannelsConfig) (*FeishuManager, error) {
-	mgr := NewFeishuManager(ctx, profiles, channelsCfg.Feishu, cfg, deps)
-	if channelsCfg.Feishu == nil {
-		return mgr, nil // not configured — frontend triggers connect via the API
-	}
-	if err := mgr.Connect(); err != nil {
-		if channelsCfg.Feishu.Explicit {
-			return nil, err
+// (--channel feishu/wechat): the user asked for the bot, so running
+// silently without it would read as "connected" while delivering
+// nothing. A settings-only channel degrades to a warning and the server
+// continues.
+func RunChannels(ctx context.Context, profiles string, cfg *agent.Agent, deps kernel.Deps, channelsCfg config.ChannelsConfig) (*FeishuManager, *WechatManager, error) {
+	feishuMgr := NewFeishuManager(ctx, profiles, channelsCfg.Feishu, cfg, deps)
+	if channelsCfg.Feishu != nil {
+		if err := feishuMgr.Connect(); err != nil {
+			if channelsCfg.Feishu.Explicit {
+				return nil, nil, err
+			}
+			slog.Warn("feishu channel not started (settings-only channel)", "error", err)
 		}
-		slog.Warn("feishu channel not started (settings-only channel)", "error", err)
-		return mgr, nil
 	}
-	return mgr, nil
+
+	wechatMgr := NewWechatManager(ctx, profiles, channelsCfg.Wechat, cfg, deps)
+	if channelsCfg.Wechat != nil {
+		if err := wechatMgr.Connect(); err != nil {
+			if channelsCfg.Wechat.Explicit {
+				return nil, nil, err
+			}
+			slog.Warn("wechat channel not started (settings-only channel)", "error", err)
+		}
+	}
+	return feishuMgr, wechatMgr, nil
 }
 
 // patchQueue decouples card rendering from Feishu API calls.

@@ -152,6 +152,24 @@ type McpServerConfig struct {
 // ChannelsConfig holds per-platform IM channel configuration.
 type ChannelsConfig struct {
 	Feishu *FeishuConfig `json:"feishu,omitempty"`
+	Wechat *WechatConfig `json:"wechat,omitempty"`
+}
+
+// WechatConfig holds credentials for the personal WeChat channel
+// (ilinkai official channel). The token is the bot session credential
+// issued by QR login; base_url may be redirected per-account by the
+// login flow.
+type WechatConfig struct {
+	Token     string `json:"token"`
+	BaseURL   string `json:"base_url,omitempty"`
+	AccountID string `json:"account_id,omitempty"`
+	UserID    string `json:"user_id,omitempty"`
+
+	// Explicit marks a channel requested via --channel on the command
+	// line (never persisted, never read from settings). An explicit
+	// channel fails fast when it cannot start; a settings-only channel
+	// degrades to a warning so the REST/ACP server still runs.
+	Explicit bool `json:"-"`
 }
 
 // FeishuConfig holds credentials for a Feishu (Lark) App Bot.
