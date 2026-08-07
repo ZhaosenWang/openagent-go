@@ -10,14 +10,19 @@
 // actual work in a background goroutine.
 //
 // Jobs persist to <workDir>/jobs/job-<id>.json so a server restart does
-// not lose them. Same-deployment jobs run serially (a deployment's dag.json
-// is a shared mutable contract); different deployments run in parallel.
+// not lose them. Same-deployment jobs supersede: a new submission for a
+// deployment cancels any running job for that deployment (the cancelled
+// job's fn may still be mid-execution — it checks ctx.Err() and returns an
+// interrupted error, but saveDag/saveCost are ctx-unaware so they complete
+// their atomic write before the goroutine exits). Different deployments run
+// in parallel, bounded by a global semaphore.
 package agent
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -86,7 +91,9 @@ type JobManager struct {
 }
 
 // NewJobManager creates a manager rooted at jobsDir (created if missing).
-// Stale job files older than a day are cleaned up at startup.
+// Stale job files older than a day are cleaned up at startup, and any
+// orphaned running jobs (left behind by a process crash mid-job) are marked
+// failed so clients learn to retry instead of polling forever.
 func NewJobManager(jobsDir string) *JobManager {
 	_ = os.MkdirAll(jobsDir, 0o755)
 	m := &JobManager{
@@ -94,8 +101,45 @@ func NewJobManager(jobsDir string) *JobManager {
 		running: make(map[string]*runningJob),
 		sem:     make(chan struct{}, maxConcurrentJobs),
 	}
+	// Fail orphaned running jobs BEFORE cleaning up stale files — a job
+	// that crashed >24h ago would otherwise be deleted by cleanupStale
+	// before failOrphanedRunning can mark it failed, and the client would
+	// get a nil job (unable to distinguish "never existed" from "crashed").
+	m.failOrphanedRunning()
 	m.cleanupStale()
 	return m
+}
+
+// failOrphanedRunning marks any persisted job with status=running as failed.
+// A running job file on disk at startup means the previous process crashed
+// (or was killed) mid-job — no worker will ever complete it. Failing it lets
+// the client detect the interruption and retry, rather than long-polling a
+// status that will never change.
+func (m *JobManager) failOrphanedRunning() {
+	entries, err := os.ReadDir(m.jobsDir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if !strings.HasPrefix(e.Name(), "job-") || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		job, err := m.load(strings.TrimSuffix(e.Name(), ".json"))
+		if err != nil || job == nil {
+			continue
+		}
+		if job.Status == JobRunning {
+			job.Status = JobFailed
+			job.Error = "orphaned by process restart"
+			job.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+			if err := m.saveLocked(job); err != nil {
+				// The orphan stays status=running on disk; the client will
+				// long-poll a job that never completes. Log so operators can
+				// intervene (remove the stale file or fix the disk).
+				slog.Error("failOrphanedRunning: persist failed — orphaned job stays running on disk", "job_id", job.ID, "err", err)
+			}
+		}
+	}
 }
 
 // cleanupStale removes job files older than 24h — a client may poll a job
@@ -122,9 +166,13 @@ func (m *JobManager) cleanupStale() {
 // callback (writing to the job file) and a 15-minute deadline; panics are
 // recovered into a failed job.
 //
-// When deploymentID is non-empty, jobs for the same deployment serialize:
-// fn starts only after any prior job for that deployment finishes, so the
-// shared dag.json/cost.json are never written concurrently.
+// When deploymentID is non-empty, a new submission supersedes any running
+// job for that deployment: the prior job's context is cancelled (so its fn
+// observes ctx.Err() and returns an interrupted error) and is marked
+// cancelled. The new job then acquires the global semaphore and runs. The
+// prior job's goroutine may still be mid-saveDag/saveCost when cancelled —
+// those writes are atomic (tmp+rename) and ctx-unaware, so they complete
+// before the goroutine exits, preventing half-written dag.json/cost.json.
 func (m *JobManager) Submit(ctx context.Context, deploymentID, tool string, fn func(ctx context.Context) (string, error)) (string, error) {
 	job := &Job{
 		ID:           fmt.Sprintf("job-%d", time.Now().UnixNano()),
@@ -214,13 +262,23 @@ func (m *JobManager) Get(ctx context.Context, id string, wait time.Duration) (*J
 }
 
 // cancelLocked marks a superseded job cancelled and persists it. Caller
-// holds m.mu; the superseded goroutine may still be writing the same file,
-// so the actual write happens under the same lock via saveLocked.
+// holds m.mu. A job that already reached a terminal state (done/failed) is
+// NOT overwritten — its real outcome must survive for clients polling the
+// old job_id. This is the symmetric guard to the JobCancelled checks in
+// done()/fail().
 func (m *JobManager) cancelLocked(job *Job) {
+	if job.Status == JobDone || job.Status == JobFailed {
+		return
+	}
 	job.Status = JobCancelled
 	job.Error = "superseded by a newer submission for this deployment"
 	job.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
-	_ = m.saveLocked(job)
+	if err := m.saveLocked(job); err != nil {
+		// The in-memory status is cancelled but the on-disk file may still
+		// show "running" — a client polling the old job_id would long-poll
+		// until restart (failOrphanedRunning). Log so operators can diagnose.
+		slog.Warn("job cancel: persist failed — client may see stale running status", "job_id", job.ID, "err", err)
+	}
 }
 
 func (m *JobManager) save(job *Job) error {
@@ -229,14 +287,17 @@ func (m *JobManager) save(job *Job) error {
 	return m.saveLocked(job)
 }
 
-// saveLocked writes the job file; caller holds m.mu.
+// saveLocked writes the job file atomically (write to temp + rename) so a
+// concurrent load never sees a half-written file. Caller holds m.mu, which
+// serializes all saveLocked calls — no two saveLocked calls run concurrently.
 func (m *JobManager) saveLocked(job *Job) error {
 	data, err := json.MarshalIndent(job, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal job: %w", err)
 	}
-	if err := os.WriteFile(filepath.Join(m.jobsDir, job.ID+".json"), data, 0644); err != nil {
-		return fmt.Errorf("write job: %w", err)
+	path := filepath.Join(m.jobsDir, job.ID+".json")
+	if err := atomicWrite(path, data); err != nil {
+		return fmt.Errorf("write job (jobs dir %s — check it exists and is writable): %w", m.jobsDir, err)
 	}
 	return nil
 }
@@ -285,7 +346,9 @@ func (m *JobManager) appendOutput(job *Job, content string) {
 	}
 	job.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 	m.mu.Unlock()
-	_ = m.save(job)
+	if err := m.save(job); err != nil {
+		slog.Warn("job appendOutput: persist failed", "job_id", job.ID, "err", err)
+	}
 }
 
 func truncate(s string, n int) string {
@@ -306,16 +369,40 @@ func (m *JobManager) progress(job *Job, msg string, cur, tot float64) {
 	job.ProgressTot = tot
 	job.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 	m.mu.Unlock()
-	_ = m.save(job)
+	if err := m.save(job); err != nil {
+		slog.Warn("job progress: persist failed", "job_id", job.ID, "err", err)
+	}
 }
 
 func (m *JobManager) done(job *Job, result string) {
 	m.mu.Lock()
+	if job.Status == JobCancelled {
+		// Superseded jobs keep their "cancelled" status — a late nil-error
+		// return from the fn must not overwrite the supersession marker
+		// with "done" + a stale result the client would act on.
+		m.mu.Unlock()
+		return
+	}
 	job.Status = JobDone
 	job.Result = json.RawMessage(result)
 	job.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	// Reclaim the running entry: a terminal job will never be superseded
+	// again, and calling cancel releases the context.WithTimeout timer.
+	// Without this, m.running grows unbounded over the server lifetime
+	// (one entry per distinct deploymentID that was ever submitted).
+	if entry, ok := m.running[job.DeploymentID]; ok && entry.job == job {
+		entry.cancel()
+		delete(m.running, job.DeploymentID)
+	}
 	m.mu.Unlock()
-	_ = m.save(job)
+	if err := m.save(job); err != nil {
+		// The job is done in memory but the on-disk file may still show
+		// "running" — Get reads from disk, so the client long-polling
+		// get_job_result would block until restart (failOrphanedRunning).
+		// Log so operators can diagnose; we cannot return the error here
+		// because the fn already succeeded and the result is in memory.
+		slog.Error("job done: persist failed — client may see stale running status", "job_id", job.ID, "err", err)
+	}
 }
 
 func (m *JobManager) fail(job *Job, errMsg string) {
@@ -330,6 +417,13 @@ func (m *JobManager) fail(job *Job, errMsg string) {
 	job.Status = JobFailed
 	job.Error = errMsg
 	job.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	// Same reclamation as done().
+	if entry, ok := m.running[job.DeploymentID]; ok && entry.job == job {
+		entry.cancel()
+		delete(m.running, job.DeploymentID)
+	}
 	m.mu.Unlock()
-	_ = m.save(job)
+	if err := m.save(job); err != nil {
+		slog.Error("job fail: persist failed — client may see stale running status", "job_id", job.ID, "err", err)
+	}
 }

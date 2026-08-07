@@ -187,17 +187,17 @@ func contains(list []string, s string) bool {
 	return false
 }
 
-// saveDag writes the DAG to disk with an updated timestamp.
+// saveDag writes the DAG to disk with an updated timestamp. The write is
+// atomic (tmp + rename) so a concurrent loadDag never sees a half-written
+// dag.json — important because JobManager supersession can cancel a job
+// mid-saveDag and start a new one that loadDag's immediately.
 func saveDag(dir string, dag *Dag) error {
 	dag.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 	data, err := json.MarshalIndent(dag, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal dag.json: %w", err)
 	}
-	if err := os.WriteFile(dagPath(dir), data, 0644); err != nil {
-		return fmt.Errorf("write dag.json: %w", err)
-	}
-	return nil
+	return atomicWrite(dagPath(dir), data)
 }
 
 // dagInput serializes the DAG compactly for embedding in an LLM user
@@ -226,14 +226,35 @@ func nodeSpecsFilled(dag *Dag) bool {
 	return len(dag.Nodes) > 0
 }
 
-// saveCost persists an estimate_cost result.
+// saveCost persists an estimate_cost result. Atomic (tmp + rename) for the
+// same reason as saveDag — a concurrent invalidateCost or loadDag must never
+// see a half-written cost.json.
 func saveCost(dir string, c *CostEstimate) error {
 	data, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal cost.json: %w", err)
 	}
-	if err := os.WriteFile(costPath(dir), data, 0644); err != nil {
-		return fmt.Errorf("write cost.json: %w", err)
+	return atomicWrite(costPath(dir), data)
+}
+
+// atomicWrite writes data to path atomically by writing to a temp file then
+// renaming. rename(2) is atomic on the same directory, so a concurrent reader
+// (loadDag, load) never sees a half-written file. The temp file is cleaned up
+// if rename fails.
+//
+// The fixed tmp name (path+".tmp") is safe because no two atomicWrite calls
+// to the same path run concurrently: saveDag/saveCost run inside a job's fn,
+// and fn execution is serialized per deployment by the JobManager semaphore
+// (maxConcurrentJobs); saveLocked (job files) is serialized by JobManager.mu;
+// different deployments / job ids write different paths.
+func atomicWrite(path string, data []byte) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		return fmt.Errorf("write %s: %w", filepath.Base(path), err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("rename %s: %w", filepath.Base(path), err)
 	}
 	return nil
 }
@@ -243,6 +264,34 @@ func saveCost(dir string, c *CostEstimate) error {
 func HasCost(dir string) bool {
 	_, err := os.Stat(costPath(dir))
 	return err == nil
+}
+
+// SetDagStatus loads the DAG, sets its status, and persists it atomically.
+// apply_deployment uses this to advance to DagApplied after a successful
+// apply, and destroy_deployment to advance to DagDestroyed — so clients
+// can distinguish a deployed deployment from a merely cost-estimated one
+// and the state machine actually reaches its terminal states. A save
+// failure is returned but does not undo the apply — the resources exist
+// on the cloud; only the persisted contract is stale.
+func SetDagStatus(dir string, status DagStatus) error {
+	dag, err := loadDag(dir)
+	if err != nil {
+		return fmt.Errorf("set dag status: %w", err)
+	}
+	dag.Status = status
+	return saveDag(dir, dag)
+}
+
+// DagStatusOf returns the persisted DAG status for a deployment, or "" if
+// the dag.json is missing/unreadable. apply_deployment gates on this to
+// ensure the deployment was actually planned (not just cost-estimated on a
+// stale plan).
+func DagStatusOf(dir string) DagStatus {
+	d, err := loadDag(dir)
+	if err != nil {
+		return ""
+	}
+	return d.Status
 }
 
 // invalidateCost deletes the estimate marker. Any DAG or .tf mutation

@@ -76,7 +76,7 @@ func main() {
 	if err != nil {
 		fatal(fmt.Errorf("open log file: %w", err))
 	}
-	defer logFile.Close()
+	defer func() { _ = logFile.Close() }()
 	slog.SetDefault(slog.New(slog.NewTextHandler(logFile, &slog.HandlerOptions{Level: slog.LevelDebug})))
 
 	// ── Select cloud provider ──
@@ -131,12 +131,12 @@ func main() {
 	if err != nil {
 		fatal(fmt.Errorf("create memory: %w", err))
 	}
-	defer ms.Close()
+	defer func() { _ = ms.Close() }()
 	knowledge, err := memorysqlite.New(memoryPath)
 	if err != nil {
 		fatal(fmt.Errorf("create knowledge store: %w", err))
 	}
-	defer knowledge.Close()
+	defer func() { _ = knowledge.Close() }()
 	// Enable conversation compaction: long deployment sessions (specify,
 	// troubleshoot, ...) are summarized instead of hard-truncated when they
 	// outgrow the context window. Same pattern as the CLI.
