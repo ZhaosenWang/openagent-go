@@ -2334,9 +2334,14 @@ func (a *acpApprover) Ask(ctx context.Context, call openagent.ToolCall, def open
 		// allow_always = remembered for the session (same tool + args no
 		// longer asks this session). Cross-session rules are a separate
 		// configuration layer, not a button grant.
+		//
+		// The "Allow Always" option is TEMPORARILY withheld from the ACP
+		// client (session-scoped grants are still offered over REST); the
+		// backend handling below stays so re-enabling is a one-line
+		// option add, and a stale client sending "allow_always" still
+		// works.
 		Options: []openacp.PermissionOption{
 			{OptionID: "allow_once", Name: "Allow Once", Kind: openacp.PermissionAllowOnce},
-			{OptionID: "allow_always", Name: "Allow Always", Kind: openacp.PermissionAllowAlways},
 			{OptionID: "reject_once", Name: "Reject", Kind: openacp.PermissionRejectOnce},
 		},
 	})
