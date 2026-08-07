@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/yusheng-g/openagent-go/kernel"
+	"github.com/yusheng-g/openagent-go/session"
 
 	clirest "github.com/yusheng-g/openagent-go/cmd/cli/rest"
 )
@@ -119,7 +120,7 @@ func TestClearWechatCredentialsPreservesOtherFields(t *testing.T) {
 	if err := saveWechatToSettings(WechatCredentials{Token: "tok-new"}); err != nil {
 		t.Fatal(err)
 	}
-	m := NewWechatManager(context.Background(), ".openagent/profile", nil, nil, kernel.Deps{})
+	m := NewWechatManager(context.Background(), ".openagent/profile", nil, nil, kernel.Deps{}, nil)
 	if err := m.ClearCredentials(); err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +155,7 @@ func TestClearWechatCredentialsPreservesOtherFields(t *testing.T) {
 // never grows the remaining lifetime.
 func TestWechatQRCacheRoundTrip(t *testing.T) {
 	profiles := filepath.Join(t.TempDir(), "profile")
-	m := NewWechatManager(context.Background(), profiles, nil, nil, kernel.Deps{})
+	m := NewWechatManager(context.Background(), profiles, nil, nil, kernel.Deps{}, nil)
 
 	if err := saveWechatQR(profiles, "https://qr.example/x", 300); err != nil {
 		t.Fatal(err)
@@ -182,7 +183,7 @@ func TestWechatQRCacheRoundTrip(t *testing.T) {
 // An expired QR reports expireIn 0.
 func TestWechatQRExpired(t *testing.T) {
 	profiles := filepath.Join(t.TempDir(), "profile")
-	m := NewWechatManager(context.Background(), profiles, nil, nil, kernel.Deps{})
+	m := NewWechatManager(context.Background(), profiles, nil, nil, kernel.Deps{}, nil)
 
 	if err := saveWechatQR(profiles, "https://qr.example/x", 300); err != nil {
 		t.Fatal(err)
@@ -203,7 +204,7 @@ func TestWechatQRExpired(t *testing.T) {
 
 // SubmitVerifyCode is rejected when no registration is waiting.
 func TestWechatSubmitVerifyCodeNotPending(t *testing.T) {
-	m := NewWechatManager(context.Background(), filepath.Join(t.TempDir(), "profile"), nil, nil, kernel.Deps{})
+	m := NewWechatManager(context.Background(), filepath.Join(t.TempDir(), "profile"), nil, nil, kernel.Deps{}, nil)
 	if err := m.SubmitVerifyCode("123456"); err != clirest.ErrWechatVerifyCodeNotPending {
 		t.Fatalf("err = %v, want ErrWechatVerifyCodeNotPending", err)
 	}
@@ -214,7 +215,7 @@ func TestWechatSubmitVerifyCodeNotPending(t *testing.T) {
 // closed channel. The channel is cleared, not closed (see the failure
 // path comment in ConnectAsync).
 func TestWechatSubmitVerifyCodeRacingFailureNoPanic(t *testing.T) {
-	m := NewWechatManager(context.Background(), filepath.Join(t.TempDir(), "profile"), nil, nil, kernel.Deps{})
+	m := NewWechatManager(context.Background(), filepath.Join(t.TempDir(), "profile"), nil, nil, kernel.Deps{}, nil)
 	m.mu.Lock()
 	m.status = clirest.WechatStatus{Phase: clirest.WechatRegistering}
 	m.verifyCodeCh = make(chan string, 1)
@@ -236,7 +237,7 @@ func TestWechatSubmitVerifyCodeRacingFailureNoPanic(t *testing.T) {
 // cancelled (a disconnect) — otherwise the registration goroutine holds
 // the flock for the full verifyCodeTimeout and reconnects keep failing.
 func TestWechatWaitVerifyCodeCancels(t *testing.T) {
-	m := NewWechatManager(context.Background(), filepath.Join(t.TempDir(), "profile"), nil, nil, kernel.Deps{})
+	m := NewWechatManager(context.Background(), filepath.Join(t.TempDir(), "profile"), nil, nil, kernel.Deps{}, nil)
 	m.mu.Lock()
 	m.status = clirest.WechatStatus{Phase: clirest.WechatRegistering}
 	m.verifyCodeCh = make(chan string)
@@ -262,7 +263,7 @@ func TestWechatWaitVerifyCodeCancels(t *testing.T) {
 
 // A pairing code submitted to an in-flight registration is delivered.
 func TestWechatSubmitVerifyCodeDelivered(t *testing.T) {
-	m := NewWechatManager(context.Background(), filepath.Join(t.TempDir(), "profile"), nil, nil, kernel.Deps{})
+	m := NewWechatManager(context.Background(), filepath.Join(t.TempDir(), "profile"), nil, nil, kernel.Deps{}, nil)
 	m.mu.Lock()
 	m.status = clirest.WechatStatus{Phase: clirest.WechatRegistering}
 	m.verifyCodeCh = make(chan string, 1)
@@ -292,13 +293,82 @@ func TestWechatSubmitVerifyCodeDelivered(t *testing.T) {
 	}
 }
 
+// ── Channel session meta ──
+
+// fakeMetaStore is a minimal in-memory session.Store for meta tests.
+type fakeMetaStore struct {
+	sessions map[string]session.SessionInfo
+}
+
+func newFakeMetaStore() *fakeMetaStore { return &fakeMetaStore{sessions: map[string]session.SessionInfo{}} }
+
+func (f *fakeMetaStore) Save(ctx context.Context, info session.SessionInfo) error {
+	f.sessions[info.ID] = info
+	return nil
+}
+func (f *fakeMetaStore) Get(ctx context.Context, id string) (*session.SessionInfo, error) {
+	if s, ok := f.sessions[id]; ok {
+		return &s, nil
+	}
+	return nil, nil
+}
+func (f *fakeMetaStore) List(ctx context.Context) ([]session.SessionInfo, error) {
+	out := make([]session.SessionInfo, 0, len(f.sessions))
+	for _, s := range f.sessions {
+		out = append(out, s)
+	}
+	return out, nil
+}
+func (f *fakeMetaStore) Delete(ctx context.Context, id string) error {
+	delete(f.sessions, id)
+	return nil
+}
+func (f *fakeMetaStore) Close() error { return nil }
+
+// ensureChannelMeta tags a channel session with "_channel" once; a
+// second call is a no-op, and a nil store is a no-op.
+func TestEnsureChannelMeta(t *testing.T) {
+	store := newFakeMetaStore()
+
+	ensureChannelMeta(store, "wechat_user1", "wechat", "第一条消息")
+	info, err := store.Get(context.Background(), "wechat_user1")
+	if err != nil || info == nil {
+		t.Fatalf("session not created: %v", err)
+	}
+	if v, ok := session.GetMeta[string](*info, "_channel"); !ok || v != "wechat" {
+		t.Fatalf("_channel meta = %q, %v", v, ok)
+	}
+	if info.Title != "第一条消息" {
+		t.Fatalf("title = %q, want first message", info.Title)
+	}
+
+	// Second call must not overwrite (idempotent) — even with a new
+	// message.
+	ensureChannelMeta(store, "wechat_user1", "wechat", "第二条消息")
+	list, _ := store.List(context.Background())
+	if len(list) != 1 {
+		t.Fatalf("session duplicated: %d", len(list))
+	}
+	// Title stays the FIRST message (idempotent, like ACP).
+	info, _ = store.Get(context.Background(), "wechat_user1")
+	if info.Title != "第一条消息" {
+		t.Fatalf("title overwritten: %q", info.Title)
+	}
+
+	// Nil store is a silent no-op.
+	ensureChannelMeta(nil, "wechat_user2", "wechat", "x")
+	if _, err := store.Get(context.Background(), "wechat_user2"); err != nil || len(store.sessions) != 1 {
+		t.Fatalf("nil store wrote something: %v", err)
+	}
+}
+
 // ── Guard machinery (ported from the feishu tests — the mechanism is a
 // line-for-line copy and must stay green) ──
 
 // A disconnect whose flow is stuck must return within disconnectTimeout
 // instead of hanging the endpoint.
 func TestWechatDisconnectTimesOutOnStuckFlow(t *testing.T) {
-	m := NewWechatManager(context.Background(), filepath.Join(t.TempDir(), "profile"), nil, nil, kernel.Deps{})
+	m := NewWechatManager(context.Background(), filepath.Join(t.TempDir(), "profile"), nil, nil, kernel.Deps{}, nil)
 	cancelled := make(chan struct{})
 	m.mu.Lock()
 	m.cancel = func() { close(cancelled) }
@@ -323,7 +393,7 @@ func TestWechatDisconnectTimesOutOnStuckFlow(t *testing.T) {
 // setStatus guards: a stale flow's publish is dropped, the current
 // owner's goes through.
 func TestWechatSetStatusGuardDropsStalePublish(t *testing.T) {
-	m := NewWechatManager(context.Background(), filepath.Join(t.TempDir(), "profile"), nil, nil, kernel.Deps{})
+	m := NewWechatManager(context.Background(), filepath.Join(t.TempDir(), "profile"), nil, nil, kernel.Deps{}, nil)
 	current := make(chan struct{})
 	m.mu.Lock()
 	m.done = current
@@ -343,7 +413,7 @@ func TestWechatSetStatusGuardDropsStalePublish(t *testing.T) {
 // A flow's own terminal publish must not be dropped by its cleanup
 // (publish-first ordering).
 func TestWechatFlowTerminalPublishSurvivesOwnCleanup(t *testing.T) {
-	m := NewWechatManager(context.Background(), filepath.Join(t.TempDir(), "profile"), nil, nil, kernel.Deps{})
+	m := NewWechatManager(context.Background(), filepath.Join(t.TempDir(), "profile"), nil, nil, kernel.Deps{}, nil)
 	done := make(chan struct{})
 	m.mu.Lock()
 	m.done = done

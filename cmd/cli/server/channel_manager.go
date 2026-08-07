@@ -16,6 +16,7 @@ import (
 	"github.com/yusheng-g/openagent-go/cmd/cli/config"
 	"github.com/yusheng-g/openagent-go/governance"
 	"github.com/yusheng-g/openagent-go/kernel"
+	"github.com/yusheng-g/openagent-go/session"
 
 	clirest "github.com/yusheng-g/openagent-go/cmd/cli/rest"
 )
@@ -42,6 +43,7 @@ type FeishuManager struct {
 	deps        kernel.Deps
 	feishuCfg   *config.FeishuConfig // settings.json channels.feishu (may be nil)
 	defaultMode string               // "manual" | "auto" (empty = "manual")
+	metaStore   session.Store        // session metadata store (nil = no meta tagging)
 
 	mu     sync.Mutex
 	lock   *ChannelLock
@@ -63,7 +65,7 @@ type FeishuManager struct {
 // returning. feishuCfg is the settings.json channels.feishu block (nil
 // when the user did not configure credentials — the manager then runs
 // the QR registration flow).
-func NewFeishuManager(baseCtx context.Context, profiles string, feishuCfg *config.FeishuConfig, cfg *agent.Agent, deps kernel.Deps, defaultMode string) *FeishuManager {
+func NewFeishuManager(baseCtx context.Context, profiles string, feishuCfg *config.FeishuConfig, cfg *agent.Agent, deps kernel.Deps, defaultMode string, metaStore session.Store) *FeishuManager {
 	return &FeishuManager{
 		baseCtx:     baseCtx,
 		profiles:    profiles,
@@ -71,6 +73,7 @@ func NewFeishuManager(baseCtx context.Context, profiles string, feishuCfg *confi
 		cfg:         cfg,
 		deps:        deps,
 		defaultMode: defaultMode,
+		metaStore:   metaStore,
 		status:      clirest.FeishuStatus{Phase: clirest.FeishuIdle},
 	}
 }
@@ -306,7 +309,7 @@ func (m *FeishuManager) startConnection(lock *ChannelLock, creds FeishuCredentia
 				m.setStatus(clirest.FeishuStatus{Phase: clirest.FeishuDisconnected, AppID: creds.AppID, LastError: err.Error()}, connDone)
 			}
 		})
-		err := ch.Start(connCtx, feishuMessageHandler(m.cfg, deps, ch))
+		err := ch.Start(connCtx, feishuMessageHandler(m.cfg, deps, ch, m.metaStore))
 		lock.Release()
 		// Publish BEFORE the cleanup — the guard compares m.done against
 		// connDone, so clearing the field first would drop the flow's own
@@ -507,7 +510,7 @@ func (m *FeishuManager) SetCredentials(appID, appSecret string) error {
 // feishuMessageHandler routes incoming Feishu messages to the agent,
 // one ephemeral run per message. ch is the concrete channel, used for
 // runCardUpdater / ModeController interface checks.
-func feishuMessageHandler(cfg *agent.Agent, deps kernel.Deps, ch channel.Channel) channel.MessageHandler {
+func feishuMessageHandler(cfg *agent.Agent, deps kernel.Deps, ch channel.Channel, metaStore session.Store) channel.MessageHandler {
 	var updater runCardUpdater
 	if u, ok := ch.(runCardUpdater); ok {
 		updater = u
@@ -520,6 +523,7 @@ func feishuMessageHandler(cfg *agent.Agent, deps kernel.Deps, ch channel.Channel
 
 	return func(msgCtx context.Context, msg channel.IncomingMessage, reply channel.ReplyFunc) {
 		sessionID := "feishu_" + msg.ChatID
+		ensureChannelMeta(metaStore, sessionID, "feishu", msg.Text)
 
 		// Intercept /clear before sending to the agent.
 		if isClearCommand(msg.Text) {

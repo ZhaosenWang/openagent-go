@@ -17,6 +17,7 @@ import (
 	"github.com/yusheng-g/openagent-go/channel/wechat/protocol"
 	"github.com/yusheng-g/openagent-go/cmd/cli/config"
 	"github.com/yusheng-g/openagent-go/kernel"
+	"github.com/yusheng-g/openagent-go/session"
 
 	clirest "github.com/yusheng-g/openagent-go/cmd/cli/rest"
 )
@@ -47,6 +48,7 @@ type WechatManager struct {
 	cfg       *agent.Agent
 	deps      kernel.Deps
 	wechatCfg *config.WechatConfig // settings.json channels.wechat (may be nil)
+	metaStore session.Store       // session metadata store (nil = no meta tagging)
 
 	mu     sync.Mutex
 	lock   *ChannelLock
@@ -65,13 +67,14 @@ type WechatManager struct {
 // NewWechatManager creates the process-level wechat connection manager.
 // baseCtx is the serve process context. wechatCfg is the settings.json
 // channels.wechat block (nil when not configured — QR login then).
-func NewWechatManager(baseCtx context.Context, profiles string, wechatCfg *config.WechatConfig, cfg *agent.Agent, deps kernel.Deps) *WechatManager {
+func NewWechatManager(baseCtx context.Context, profiles string, wechatCfg *config.WechatConfig, cfg *agent.Agent, deps kernel.Deps, metaStore session.Store) *WechatManager {
 	return &WechatManager{
 		baseCtx:   baseCtx,
 		profiles:  profiles,
 		wechatCfg: wechatCfg,
 		cfg:       cfg,
 		deps:      deps,
+		metaStore: metaStore,
 		status:    clirest.WechatStatus{Phase: clirest.WechatIdle},
 	}
 }
@@ -315,7 +318,7 @@ func (m *WechatManager) startConnection(lock *ChannelLock, creds *protocol.Crede
 				m.setStatus(clirest.WechatStatus{Phase: clirest.WechatDisconnected, AccountID: creds.AccountID, LastError: err.Error()}, connDone)
 			}
 		})
-		err := ch.Start(connCtx, wechatMessageHandler(m.cfg, m.deps, ch))
+		err := ch.Start(connCtx, wechatMessageHandler(m.cfg, m.deps, ch, m.metaStore))
 		lock.Release()
 		if errors.Is(err, wechat.ErrSessionExpired) {
 			// The bot session died server-side: clear the credentials so
@@ -458,9 +461,10 @@ const wechatDefaultBaseURL = "https://ilinkai.weixin.qq.com"
 // ONCE when the run finishes (WeChat has no card/message-edit API — no
 // progressive card stream). A typing indicator runs while the agent
 // thinks.
-func wechatMessageHandler(cfg *agent.Agent, deps kernel.Deps, ch *wechat.Channel) channel.MessageHandler {
+func wechatMessageHandler(cfg *agent.Agent, deps kernel.Deps, ch *wechat.Channel, metaStore session.Store) channel.MessageHandler {
 	return func(msgCtx context.Context, msg channel.IncomingMessage, reply channel.ReplyFunc) {
 		sessionID := "wechat_" + msg.ChatID
+		ensureChannelMeta(metaStore, sessionID, "wechat", msg.Text)
 
 		// Intercept /clear before sending to the agent.
 		if isClearCommand(msg.Text) {

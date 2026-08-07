@@ -13,6 +13,7 @@ import (
 	"github.com/yusheng-g/openagent-go/agent"
 	"github.com/yusheng-g/openagent-go/channel"
 	"github.com/yusheng-g/openagent-go/kernel"
+	"github.com/yusheng-g/openagent-go/session"
 	opentool "github.com/yusheng-g/openagent-go/tool"
 
 	"github.com/yusheng-g/openagent-go/cmd/cli/config"
@@ -31,28 +32,76 @@ import (
 // while delivering nothing) and the frontend's POST /connect.
 // defaultMode is the initial session mode for channel chats ("manual"
 // or "auto"; empty = "manual").
-func RunChannels(ctx context.Context, profiles string, cfg *agent.Agent, deps kernel.Deps, channelsCfg config.ChannelsConfig, defaultMode string) (*FeishuManager, *WechatManager, *WecomManager, error) {
-	feishuMgr := NewFeishuManager(ctx, profiles, channelsCfg.Feishu, cfg, deps, defaultMode)
+func RunChannels(ctx context.Context, profiles string, cfg *agent.Agent, deps kernel.Deps, channelsCfg config.ChannelsConfig, defaultMode string, metaStore session.Store) (*FeishuManager, *WechatManager, *WecomManager, error) {
+	feishuMgr := NewFeishuManager(ctx, profiles, channelsCfg.Feishu, cfg, deps, defaultMode, metaStore)
 	if channelsCfg.Feishu != nil && channelsCfg.Feishu.Explicit {
 		if err := feishuMgr.Connect(); err != nil {
 			return nil, nil, nil, err
 		}
 	}
 
-	wechatMgr := NewWechatManager(ctx, profiles, channelsCfg.Wechat, cfg, deps)
+	wechatMgr := NewWechatManager(ctx, profiles, channelsCfg.Wechat, cfg, deps, metaStore)
 	if channelsCfg.Wechat != nil && channelsCfg.Wechat.Explicit {
 		if err := wechatMgr.Connect(); err != nil {
 			return nil, nil, nil, err
 		}
 	}
 
-	wecomMgr := NewWecomManager(ctx, profiles, channelsCfg.Wecom, cfg, deps)
+	wecomMgr := NewWecomManager(ctx, profiles, channelsCfg.Wecom, cfg, deps, metaStore)
 	if channelsCfg.Wecom != nil && channelsCfg.Wecom.Explicit {
 		if err := wecomMgr.Connect(); err != nil {
 			return nil, nil, nil, err
 		}
 	}
 	return feishuMgr, wechatMgr, wecomMgr, nil
+}
+
+// ensureChannelMeta tags a channel session's metadata and title —
+// mirroring the ACP path (saveMeta + first-prompt auto-title): a newly
+// seen session is created with full timestamps, the meta map carries
+// kind="channel" (ACP counterpart: kind="acp") plus the originating
+// channel in "_channel" (feishu/wechat/wecom), and an empty title is
+// set from the first user message's first line (the ACP behavior for
+// first prompts). meta/title are written once per session; best-effort
+// (a missing store or a failed write only costs a re-tag on the next
+// message).
+func ensureChannelMeta(store session.Store, sessionID, channelName, firstMessage string) {
+	if store == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	now := time.Now()
+	info, err := store.Get(ctx, sessionID)
+	if err != nil || info == nil {
+		info = &session.SessionInfo{ID: sessionID, CreatedAt: now, UpdatedAt: now}
+	}
+	if _, ok := session.GetMeta[string](*info, "_channel"); ok {
+		return // already tagged
+	}
+	info.SetMeta("kind", "channel")
+	info.SetMeta("_channel", channelName)
+	if info.Title == "" && strings.TrimSpace(firstMessage) != "" {
+		info.Title = firstLine(firstMessage, 80)
+	}
+	info.UpdatedAt = now
+	if err := store.Save(ctx, *info); err != nil {
+		slog.Warn("channel session meta save failed", "session", sessionID, "error", err)
+	}
+}
+
+// firstLine takes the first line of s, truncated to maxLen runes —
+// shared title derivation for channel sessions (ACP keeps its own copy
+// in acp/server.go).
+func firstLine(s string, maxLen int) string {
+	if idx := strings.IndexByte(s, '\n'); idx >= 0 {
+		s = s[:idx]
+	}
+	runes := []rune(s)
+	if len(runes) > maxLen {
+		return string(runes[:maxLen]) + "..."
+	}
+	return s
 }
 
 // patchQueue decouples card rendering from Feishu API calls.

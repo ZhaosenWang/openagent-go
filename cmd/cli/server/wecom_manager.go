@@ -15,6 +15,7 @@ import (
 	"github.com/yusheng-g/openagent-go/channel/wecom"
 	"github.com/yusheng-g/openagent-go/cmd/cli/config"
 	"github.com/yusheng-g/openagent-go/kernel"
+	"github.com/yusheng-g/openagent-go/session"
 
 	clirest "github.com/yusheng-g/openagent-go/cmd/cli/rest"
 )
@@ -43,6 +44,7 @@ type WecomManager struct {
 	cfg      *agent.Agent
 	deps     kernel.Deps
 	wecomCfg *config.WecomConfig // settings.json channels.wecom (may be nil)
+	metaStore session.Store     // session metadata store (nil = no meta tagging)
 
 	mu     sync.Mutex
 	lock   *ChannelLock
@@ -57,13 +59,14 @@ type WecomManager struct {
 // NewWecomManager creates the process-level wecom connection manager.
 // baseCtx is the serve process context. wecomCfg is the settings.json
 // channels.wecom block (nil when not configured — QR authorization).
-func NewWecomManager(baseCtx context.Context, profiles string, wecomCfg *config.WecomConfig, cfg *agent.Agent, deps kernel.Deps) *WecomManager {
+func NewWecomManager(baseCtx context.Context, profiles string, wecomCfg *config.WecomConfig, cfg *agent.Agent, deps kernel.Deps, metaStore session.Store) *WecomManager {
 	return &WecomManager{
 		baseCtx:  baseCtx,
 		profiles: profiles,
 		wecomCfg: wecomCfg,
 		cfg:      cfg,
 		deps:     deps,
+		metaStore: metaStore,
 		status:   clirest.WecomStatus{Phase: clirest.WecomIdle},
 	}
 }
@@ -230,7 +233,7 @@ func (m *WecomManager) startConnection(lock *ChannelLock, creds *wecom.BotCreds)
 				m.setStatus(clirest.WecomStatus{Phase: clirest.WecomDisconnected, BotID: creds.BotID, LastError: err.Error()}, connDone)
 			}
 		})
-		err := ch.Start(connCtx, wecomMessageHandler(m.cfg, m.deps))
+		err := ch.Start(connCtx, wecomMessageHandler(m.cfg, m.deps, m.metaStore))
 		lock.Release()
 		// Publish before the cleanup (guard semantics — see FeishuManager).
 		m.setStatus(clirest.WecomStatus{Phase: clirest.WecomDisconnected, BotID: creds.BotID, LastError: errString(err)}, connDone)
@@ -349,9 +352,10 @@ func (m *WecomManager) SetCredentials(botID, secret string) error {
 // grows in place (finish=false refreshes → finish=true ends), throttled
 // to ~1 refresh/second so the user sees the answer build up without
 // spamming. req_id is echoed verbatim (the reply func captures it).
-func wecomMessageHandler(cfg *agent.Agent, deps kernel.Deps) channel.MessageHandler {
+func wecomMessageHandler(cfg *agent.Agent, deps kernel.Deps, metaStore session.Store) channel.MessageHandler {
 	return func(msgCtx context.Context, msg channel.IncomingMessage, reply channel.ReplyFunc) {
 		sessionID := "wecom_" + msg.ChatID
+		ensureChannelMeta(metaStore, sessionID, "wecom", msg.Text)
 
 		// Intercept /clear before sending to the agent.
 		if isClearCommand(msg.Text) {
