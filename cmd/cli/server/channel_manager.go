@@ -14,6 +14,7 @@ import (
 	"github.com/yusheng-g/openagent-go/channel"
 	"github.com/yusheng-g/openagent-go/channel/feishu"
 	"github.com/yusheng-g/openagent-go/cmd/cli/config"
+	"github.com/yusheng-g/openagent-go/governance"
 	"github.com/yusheng-g/openagent-go/kernel"
 
 	clirest "github.com/yusheng-g/openagent-go/cmd/cli/rest"
@@ -35,11 +36,12 @@ import (
 var _ clirest.FeishuChannel = (*FeishuManager)(nil)
 
 type FeishuManager struct {
-	baseCtx   context.Context
-	profiles  string
-	cfg       *agent.Agent
-	deps      kernel.Deps
-	feishuCfg *config.FeishuConfig // settings.json channels.feishu (may be nil)
+	baseCtx     context.Context
+	profiles    string
+	cfg         *agent.Agent
+	deps        kernel.Deps
+	feishuCfg   *config.FeishuConfig // settings.json channels.feishu (may be nil)
+	defaultMode string               // "manual" | "auto" (empty = "manual")
 
 	mu     sync.Mutex
 	lock   *ChannelLock
@@ -61,14 +63,15 @@ type FeishuManager struct {
 // returning. feishuCfg is the settings.json channels.feishu block (nil
 // when the user did not configure credentials — the manager then runs
 // the QR registration flow).
-func NewFeishuManager(baseCtx context.Context, profiles string, feishuCfg *config.FeishuConfig, cfg *agent.Agent, deps kernel.Deps) *FeishuManager {
+func NewFeishuManager(baseCtx context.Context, profiles string, feishuCfg *config.FeishuConfig, cfg *agent.Agent, deps kernel.Deps, defaultMode string) *FeishuManager {
 	return &FeishuManager{
-		baseCtx:   baseCtx,
-		profiles:  profiles,
-		feishuCfg: feishuCfg,
-		cfg:       cfg,
-		deps:      deps,
-		status:    clirest.FeishuStatus{Phase: clirest.FeishuIdle},
+		baseCtx:     baseCtx,
+		profiles:    profiles,
+		feishuCfg:   feishuCfg,
+		cfg:         cfg,
+		deps:        deps,
+		defaultMode: defaultMode,
+		status:      clirest.FeishuStatus{Phase: clirest.FeishuIdle},
 	}
 }
 
@@ -271,7 +274,12 @@ func (m *FeishuManager) startConnection(lock *ChannelLock, creds FeishuCredentia
 		// The connection blocks until the process context is cancelled
 		// or the connection is permanently lost; the SDK reconnects on
 		// transient failures internally.
-		ch := feishu.New(creds.AppID, creds.AppSecret)
+		ch := feishu.New(creds.AppID, creds.AppSecret, m.defaultMode)
+		mem := governance.NewSessionApprovalMemory()
+		deps := m.deps
+		deps.HumanApprover = ch.Approver(mem)
+		deps.ApprovalMemory = mem
+		slog.Info("channel approver enabled", "channel", "feishu")
 		everReady := false
 		ch.SetOnReady(func() {
 			// The SDK flips to ready after the WebSocket connects (and
@@ -298,7 +306,7 @@ func (m *FeishuManager) startConnection(lock *ChannelLock, creds FeishuCredentia
 				m.setStatus(clirest.FeishuStatus{Phase: clirest.FeishuDisconnected, AppID: creds.AppID, LastError: err.Error()}, connDone)
 			}
 		})
-		err := ch.Start(connCtx, feishuMessageHandler(m.cfg, m.deps))
+		err := ch.Start(connCtx, feishuMessageHandler(m.cfg, deps, ch))
 		lock.Release()
 		// Publish BEFORE the cleanup — the guard compares m.done against
 		// connDone, so clearing the field first would drop the flow's own
@@ -497,10 +505,40 @@ func (m *FeishuManager) SetCredentials(appID, appSecret string) error {
 }
 
 // feishuMessageHandler routes incoming Feishu messages to the agent,
-// one ephemeral run per message.
-func feishuMessageHandler(cfg *agent.Agent, deps kernel.Deps) channel.MessageHandler {
+// one ephemeral run per message. ch is the concrete channel, used for
+// runCardUpdater / ModeController interface checks.
+func feishuMessageHandler(cfg *agent.Agent, deps kernel.Deps, ch channel.Channel) channel.MessageHandler {
+	var updater runCardUpdater
+	if u, ok := ch.(runCardUpdater); ok {
+		updater = u
+	}
+
+	var sizer CardSizer
+	if s, ok := ch.(CardSizer); ok {
+		sizer = s
+	}
+
 	return func(msgCtx context.Context, msg channel.IncomingMessage, reply channel.ReplyFunc) {
 		sessionID := "feishu_" + msg.ChatID
+
+		// Intercept /clear before sending to the agent.
+		if isClearCommand(msg.Text) {
+			handleClearCommand(deps, reply, msgCtx, sessionID)
+			return
+		}
+
+		// Intercept /mode command before sending to the agent.
+		if mc, ok := ch.(ModeController); ok && isModeCommand(msg.Text) {
+			args := parseModeArgs(msg.Text)
+			if channel.IsValidMode(args) {
+				mc.SetMode(msg.ChatID, args)
+				_, _ = reply(msgCtx, channel.ReplyMessage{Text: "✅ 已切换到 " + args + " 模式"})
+			} else {
+				_, _ = reply(msgCtx, channel.ReplyMessage{Card: mc.BuildModeCard(msg.ChatID)})
+			}
+			return
+		}
+
 		go func() {
 			// Carry the resolved Model instance so downstream consumers
 			// (RunHooks via SessionFromContext, e.g. the artifact hook's
@@ -511,8 +549,15 @@ func feishuMessageHandler(cfg *agent.Agent, deps kernel.Deps) channel.MessageHan
 				Model:     cfg.Model,
 				CreatedAt: time.Now(),
 			}
-			stream := kernel.New(cfg, deps).RunStream(msgCtx, session, openagent.UserMessage(msg.Text))
-			streamReply(reply, stream)
+			rt := kernel.New(cfg, deps)
+			// In auto mode, disable human approval so tools execute
+			// without prompting. In manual mode (default), the
+			// feishu approver wired in startConnection stays active.
+			if mc, ok := ch.(ModeController); ok && mc.GetMode(msg.ChatID) == channel.ModeAuto {
+				rt.SetHumanApprover(nil)
+			}
+			stream := rt.RunStream(msgCtx, session, openagent.UserMessage(msg.Text))
+			streamReply(reply, stream, sessionID, updater, sizer)
 		}()
 	}
 }

@@ -21,7 +21,7 @@
 - **静态上下文配置** — `AGENTS.md`（工作规则）和 `SOUL.md`（性格与底线），支持用户级和项目级覆盖
 - **Slash 命令** — 内置 `/help`、`/mode`、`/model`、`/context`、`/cwd`、`/clear`、`/rename`、`/sessions`，通过 `slash/` 注册表扩展
 - **完整 CLI** — `openagent-cli`，cobra 命令、配置驱动模型、keyring 密钥管理、WASM 插件运行时
-- **IM 频道** — 飞书/Lark（WebSocket，卡片式流式输出：Markdown 渲染、工具调用卡片，一键扫码创建应用）、个人微信（腾讯 ilinkai 官方通道，扫码登录 + 配对码）、企业微信（官方长连接，原生流式回复，扫码自动创建机器人）
+- **IM 频道** — 飞书/Lark（WebSocket，卡片式流式输出：Markdown 渲染、工具调用卡片，一键扫码创建应用，内嵌审批按钮、/clear 和 /mode 命令）、个人微信（腾讯 ilinkai 官方通道，扫码登录 + 配对码，/clear 命令）、企业微信（官方长连接，原生流式回复，扫码自动创建机器人，/clear 命令）
 - **RunHooks 状态传递** — Start/End 回调共享不透明状态，OTEL 正确嵌套 span，slog 精确计时
 - **动态上下文** — 会话级 plan 状态和 mode 指令每轮自动注入 prompt
 
@@ -92,7 +92,7 @@ export BOCHA_API_KEY=<你的-key>   # 在 https://open.bochaai.com 获取
 ./openagent-cli serve --channel feishu
 ```
 
-终端会出现二维码。打开飞书 App 扫码，确认创建应用即可。SDK 会自动创建机器人应用并配置好权限（`im:message`、`im:message:send_as_bot`、`im.message.receive_v1` 事件），凭据保存在本地。
+终端会出现二维码。打开飞书 App 扫码，确认创建应用即可。SDK 会自动创建机器人应用并配置好权限（`im:message`、`im:message:send_as_bot`、`im.message.receive_v1` 事件、`card.action.trigger` 审批/模式按钮回调），凭据保存在本地。
 
 ![首次使用 - 扫码创建应用](.github/images/feishu-first-login.jpg)
 
@@ -187,6 +187,27 @@ MCP 工具在启动时即可用，每次工具调用以卡片形式展示在飞�
 
 所有字段都是可选的。默认值：`~/.openagent/logs/openagent.log`，10 MB 轮转，保留 5 个备份，info 级别。
 单位是 MB。日志同时输出到 stderr 和文件。设为 `"debug"` 可查看每次 API 请求详情。
+
+**IM 中的 Slash 命令：**
+
+三个 IM 通道均支持 `/clear` —— 删除当前会话的对话历史并回复确认。不经过 agent，命令在到达模型前被拦截。
+
+飞书额外支持 `/mode` —— 切换 Manual 和 Auto 执行模式：
+
+| 模式 | 行为 |
+|------|------|
+| **Manual**（默认） | 每个非只读工具调用前弹出审批卡片，点击同意/拒绝后才执行 |
+| **Auto** | 工具自动执行，无需审批（风险较高） |
+
+`/mode` 不带参数时显示模式切换卡片（可点击按钮）。`/mode auto` 或 `/mode manual` 直接切换。模式按聊天隔离（每个群聊/私聊独立记忆）。
+
+新聊天的初始模式默认为 Manual；在 settings.json 中设置 `"default_mode": "auto"` 可更改默认值。
+
+**运行卡片布局（飞书）：**
+
+每次 agent 运行渲染为一张卡片，实时原地更新（防抖 patch）。卡片内容按到达顺序交错排列：思考（折叠面板）→ 文本 → 工具调用（折叠面板，标题显示工具名 + 状态 ✓/✗）→ 文本 → …… 运行完成后卡片切换为展开状态。超长运行超过 28KB 卡片限制时自动轮转：旧卡片折叠为"已完成"状态，新卡片从最后几个块开始。
+
+Manual 模式下的审批请求直接内嵌在运行卡片中（无独立审批卡片）。用户点击同意/拒绝后，卡片原地更新，agent 继续或停止。
 
 ### 个人微信集成
 

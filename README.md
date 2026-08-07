@@ -21,7 +21,7 @@ A fully pluggable, multi-agent AI agent framework in Go.
 - **Static context profiles** — `AGENTS.md` (working rules) and `SOUL.md` (persona & limits) with user-level and project-level resolution
 - **Slash commands** — built-in `/help`, `/mode`, `/model`, `/context`, `/cwd`, `/clear`, `/rename`, `/sessions`, extensible via `slash/` registry
 - **Full CLI** — `openagent-cli` with cobra commands, config-driven models, keyring secrets, WASM plugin runtime
-- **IM channels** — Feishu/Lark (WebSocket, card-based streaming output with markdown and tool call cards, one-click QR setup), personal WeChat (Tencent ilinkai channel, QR login with pairing code), and WeCom 企业微信 (official long connection, native streaming replies, QR robot auto-creation)
+- **IM channels** — Feishu/Lark (WebSocket, card-based streaming output with markdown and tool call cards, one-click QR setup, inline approval buttons, /clear and /mode commands), personal WeChat (Tencent ilinkai channel, QR login with pairing code, /clear command), and WeCom 企业微信 (official long connection, native streaming replies, QR robot auto-creation, /clear command)
 - **RunHooks with state** — start/end callbacks share opaque state; OTEL spans nest, slog logs duration
 - **Dynamic context** — session-level plan status and mode injected into every prompt turn
 
@@ -92,7 +92,7 @@ Connect your agent to Feishu (Lark) so users can chat with it in IM — group ch
 ./openagent-cli serve --channel feishu
 ```
 
-A QR code will appear in your terminal. Open Feishu on your phone, scan it, and confirm the app creation. The SDK automatically provisions a bot app with the correct permissions (`im:message`, `im:message:send_as_bot`, `im.message.receive_v1` event) and saves the credentials locally.
+A QR code will appear in your terminal. Open Feishu on your phone, scan it, and confirm the app creation. The SDK automatically provisions a bot app with the correct permissions (`im:message`, `im:message:send_as_bot`, `im.message.receive_v1` event, `card.action.trigger` for approval/mode button callbacks) and saves the credentials locally.
 
 ![First login - scan QR code](.github/images/feishu-first-login.jpg)
 
@@ -187,6 +187,27 @@ MCP tools are available to the Feishu bot at startup. Each tool call renders as 
 
 All fields are optional. Defaults: `~/.openagent/logs/openagent.log`, 10 MB rotation, 5 backups, info level.
 Each `max_size` unit is megabytes. Logs go to both stderr *and* the file. Set `level` to `"debug"` to see every API request.
+
+**Slash commands in IM:**
+
+All three IM channels support `/clear` — deletes the session's conversation history and replies with a confirmation. No agent round-trip; the command is intercepted before reaching the model.
+
+Feishu additionally supports `/mode` — switches between Manual and Auto execution modes:
+
+| Mode | Behaviour |
+|------|-----------|
+| **Manual** (default) | Each non-readonly tool call shows an approval card with 同意/拒绝 buttons before executing |
+| **Auto** | Tools execute immediately without human approval (higher risk) |
+
+`/mode` with no argument shows a mode-switch card with clickable buttons. `/mode auto` or `/mode manual` switches directly. The mode is per-chat (each group/private chat remembers its own setting).
+
+The initial mode for new chats defaults to Manual; set `"default_mode": "auto"` in settings.json to change the default.
+
+**Run card layout (Feishu):**
+
+Each agent run renders as a single card that updates in place (debounced patches). The body interleaves segments in arrival order: thinking (collapsed panel) → text → tool call (collapsed panel, titled with tool name + status ✓/✗) → text → … When a run completes, the card switches to an expanded state. Long runs that exceed the 28KB card limit auto-rotate: the old card folds to a collapsed "done" state and a fresh card starts with the last few blocks.
+
+Approval requests in Manual mode embed their buttons directly in the run card (no separate approval card). When the user clicks 同意/拒绝, the card updates in-place and the agent continues or stops.
 
 ### WeChat (personal) Integration
 
