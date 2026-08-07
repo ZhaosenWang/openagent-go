@@ -211,13 +211,13 @@ Return JSON:
 	session := openagent.Session{ID: sessionID(depID)}
 	result, err := rt.Run(ctx, session, openagent.UserMessage(request))
 	if err != nil {
-		os.RemoveAll(dir)
+		_ = os.RemoveAll(dir)
 		return "", fmt.Errorf("propose_architecture: LLM run: %w", err)
 	}
 
 	raw := extractJSON(result.FinalOutput)
 	if raw == "" {
-		os.RemoveAll(dir)
+		_ = os.RemoveAll(dir)
 		return "", fmt.Errorf("propose_architecture: LLM returned empty output (FinalOutput=%q)", result.FinalOutput)
 	}
 
@@ -229,7 +229,7 @@ Return JSON:
 		Dag          Dag      `json:"dag"`
 	}
 	if err := json.Unmarshal([]byte(raw), &arch); err != nil {
-		os.RemoveAll(dir)
+		_ = os.RemoveAll(dir)
 		return marshalResult(planResult{
 			Status: "need_input",
 			Questions: []string{
@@ -240,7 +240,7 @@ Return JSON:
 
 	// Information incomplete — ask the client for clarification.
 	if len(arch.Questions) > 0 {
-		os.RemoveAll(dir)
+		_ = os.RemoveAll(dir)
 		return marshalResult(planResult{
 			Status:    "need_input",
 			Questions: arch.Questions,
@@ -252,8 +252,12 @@ Return JSON:
 	arch.Dag.DeploymentID = depID
 	arch.Dag.Architecture = arch.Architecture
 	arch.Dag.Status = DagProposed
+	// Record the region from the cloud env so downstream steps (generate,
+	// estimate) and the persisted contract carry it — the LLM picks AZs per
+	// node, but the provider block and pricing queries need the top-level region.
+	arch.Dag.Region = regionFromEnv(p.cloud.Env())
 	if err := validateDag(&arch.Dag); err != nil {
-		os.RemoveAll(dir)
+		_ = os.RemoveAll(dir)
 		return marshalResult(planResult{
 			Status: "need_input",
 			Questions: []string{
@@ -262,7 +266,7 @@ Return JSON:
 		})
 	}
 	if err := saveDag(dir, &arch.Dag); err != nil {
-		os.RemoveAll(dir)
+		_ = os.RemoveAll(dir)
 		return "", fmt.Errorf("propose_architecture: save dag: %w", err)
 	}
 
@@ -439,13 +443,7 @@ or, when you need more input:
 		if r.Type == "" || r.Name == "" {
 			return "", fmt.Errorf("specify_resources: new node %q missing type or name", r.ID)
 		}
-		dag.Nodes = append(dag.Nodes, DagNode{
-			ID:        r.ID,
-			Type:      r.Type,
-			Name:      r.Name,
-			Spec:      r.Spec,
-			DependsOn: r.DependsOn,
-		})
+		dag.Nodes = append(dag.Nodes, DagNode(r))
 	}
 	dag.Status = DagSpecified
 	if err := saveDag(dir, dag); err != nil {
@@ -629,6 +627,26 @@ Return JSON:
 		msg = retryMessage("generate .tf files", "terraform plan", err, p.workDir, dir)
 	}
 
+	// All 3 attempts failed: .tf files were written but plan never succeeded.
+	// Roll back the DAG status to DagSpecified so the state machine reflects
+	// reality (no valid plan exists) and a subsequent estimate_cost is rejected
+	// at its state gate. Invalidate the cost estimate too — a stale cost.json
+	// must not let apply through on a plan that was never validated.
+	//
+	// Both operations run best-effort: even if one fails, we still attempt the
+	// other so at least one gate (state gate on DagSpecified, or cost gate on
+	// missing cost.json) blocks a subsequent apply. Only a simultaneous double
+	// disk failure (saveDag AND invalidateCost both fail) leaves the window
+	// open — that is a catastrophic ops situation beyond the state machine's
+	// responsibility. Aggregating both errors avoids the short-circuit return
+	// that previously skipped invalidateCost when saveDag failed, which left
+	// status=DagCostEstimated + stale cost.json → apply's double gate passed.
+	dag.Status = DagSpecified
+	saveErr := saveDag(dir, dag)
+	invErr := invalidateCost(dir)
+	if saveErr != nil || invErr != nil {
+		return "", fmt.Errorf("generate_terraform_plan: rollback failed after 3 plan attempts (save=%v invalidate=%v)", saveErr, invErr)
+	}
 	return "", fmt.Errorf("generate_terraform_plan: terraform plan failed after 3 attempts")
 }
 
@@ -640,6 +658,14 @@ Return JSON:
 // Use this when the user wants to adjust an already-planned deployment
 // (e.g. change a flavor, rename a resource, add a tag) without starting
 // from scratch. The change_request is passed as adjustments to specify_resources.
+//
+// Failure recovery: if GenerateTerraformPlan fails, the .tf files are left
+// in the last attempted state but cost.json is invalidated (inside
+// GenerateTerraformPlan), so a subsequent apply is blocked by the cost gate.
+// The correct recovery is to call troubleshoot_deployment to diagnose the
+// plan failure, fix the DAG or .tf, then re-run generate_terraform_plan —
+// NOT to restore old .tf files, because the DAG is the source of truth and
+// .tf files are a derived artifact.
 func (p *Planner) UpdateDeployment(ctx context.Context, deploymentID string, answers []string, changeRequest string) (string, error) {
 	// Re-specify resources with the user's answers/adjustments, then regenerate the plan.
 	if _, err := p.SpecifyResources(ctx, deploymentID, answers, changeRequest); err != nil {
@@ -699,6 +725,14 @@ func (p *Planner) EstimateCost(ctx context.Context, deploymentID, pricingMode st
 	}
 	if !nodeSpecsFilled(dag) {
 		return "", fmt.Errorf("estimate_cost: deployment %s is not fully specified — call specify_resources first", deploymentID)
+	}
+	// State gate: estimate_cost requires a plan that was actually generated
+	// and validated by terraform plan. Without this, a deployment can go
+	// specified→cost_estimated without ever running generate_terraform_plan,
+	// and apply_deployment's state gate (DagPlanned OR DagCostEstimated)
+	// would then let apply proceed with no tfplan file.
+	if dag.Status != DagPlanned && dag.Status != DagCostEstimated {
+		return "", fmt.Errorf("estimate_cost: deployment %s is not in a planned or cost-estimated state (dag.Status=%q) — call generate_terraform_plan first", deploymentID, dag.Status)
 	}
 
 	// Normalize the billing mode: "" defaults to on-demand.
@@ -1009,37 +1043,9 @@ func readTFFiles(dir string) (string, error) {
 		if err != nil {
 			continue
 		}
-		b.WriteString(fmt.Sprintf("--- %s ---\n%s\n\n", filepath.Base(f), data))
+		fmt.Fprintf(&b, "--- %s ---\n%s\n\n", filepath.Base(f), data)
 	}
 	return b.String(), nil
-}
-
-// backupTFFiles reads all .tf and .tfvars files in a directory into a map
-// of filename → content. Used by UpdateDeployment to restore on failure.
-func backupTFFiles(dir string) (map[string]string, error) {
-	patterns := []string{filepath.Join(dir, "*.tf"), filepath.Join(dir, "*.tfvars")}
-	backup := make(map[string]string)
-	for _, pattern := range patterns {
-		files, err := filepath.Glob(pattern)
-		if err != nil {
-			return nil, err
-		}
-		for _, f := range files {
-			data, err := os.ReadFile(f)
-			if err != nil {
-				continue
-			}
-			backup[filepath.Base(f)] = string(data)
-		}
-	}
-	return backup, nil
-}
-
-// restoreTFFiles writes backed-up files back to a directory.
-func restoreTFFiles(dir string, backup map[string]string) {
-	for name, content := range backup {
-		os.WriteFile(filepath.Join(dir, name), []byte(content), 0644)
-	}
 }
 
 // extractJSON finds the first JSON object in a string (LLM output may have
@@ -1068,6 +1074,19 @@ func marshalResult(r planResult) (string, error) {
 	return string(data), nil
 }
 
+// regionFromEnv extracts the cloud region from a provider env map without
+// coupling the server core to a specific cloud's key name. It checks the
+// known per-cloud region keys (HW_REGION for HuaweiCloud, ALICLOUD_REGION
+// for Aliyun) and returns the first non-empty value, or "" if none is set.
+func regionFromEnv(env map[string]string) string {
+	for _, key := range []string{"HW_REGION", "ALICLOUD_REGION"} {
+		if v := env[key]; v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
 // deploymentID allocates a unique deployment ID by atomically creating its
 // directory. Race-safe: two concurrent callers cannot get the same ID.
 func deploymentID(deploymentsDir string) (string, string, error) {
@@ -1080,7 +1099,7 @@ func deploymentID(deploymentsDir string) (string, string, error) {
 		name := entry.Name()
 		if strings.HasPrefix(name, "d-") {
 			var num int
-			fmt.Sscanf(name, "d-%d", &num)
+			_, _ = fmt.Sscanf(name, "d-%d", &num)
 			if num > maxNum {
 				maxNum = num
 			}

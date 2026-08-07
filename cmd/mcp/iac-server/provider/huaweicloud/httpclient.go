@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -125,22 +126,34 @@ func (t *HTTPRequest) Execute(ctx context.Context, args json.RawMessage) *openag
 		return openagent.ErrorResult(fmt.Errorf("http_request: url rejected: %w", err), false, "")
 	}
 
-	// Parse the URL into endpoint, path, and query for signing.
+	// Credential-exfiltration defense: the auto-signed Authorization header
+	// carries the plaintext AK and (when present) the temporary security
+	// token. Without a host allowlist, a prompt-injected LLM could direct
+	// http_request to an attacker-controlled server and exfiltrate the AK.
+	// Restrict to HuaweiCloud API domains. Also enforce HTTPS — sending the
+	// signed Authorization over cleartext HTTP leaks credentials to any
+	// network observer.
 	parsed, err := url.Parse(params.URL)
 	if err != nil {
 		return openagent.ErrorResult(fmt.Errorf("http_request: parse url: %w", err), false, "")
 	}
+	if parsed.Scheme != "https" {
+		return openagent.ErrorResult(fmt.Errorf("http_request: scheme %q not allowed — HuaweiCloud API requests must use HTTPS to protect the signed Authorization header", parsed.Scheme), false, "")
+	}
+	if !isHuaweiCloudHost(parsed.Hostname()) {
+		return openagent.ErrorResult(fmt.Errorf("http_request: host %q is not a HuaweiCloud API domain — the signed Authorization header would exfiltrate credentials to an untrusted host", parsed.Hostname()), false, "")
+	}
+
+	// Parse the URL into endpoint, path, and query for signing.
+	// (parsed already validated above; reuse it.)
 	if err := utils.ResolveAndCheck(parsed.Hostname()); err != nil {
 		return openagent.ErrorResult(fmt.Errorf("http_request: %w", err), false, "")
 	}
 
-	// Build query map for signing (first value of each key).
-	query := make(map[string]string)
-	for k, v := range parsed.Query() {
-		if len(v) > 0 {
-			query[k] = v[0]
-		}
-	}
+	// Query params for signing — pass url.Values directly so repeated keys
+	// (e.g. ?tag=prod&tag=cn-east-3) are all included in the signature per
+	// the SDK-HMAC-SHA256 spec, not just the first value.
+	query := parsed.Query()
 
 	// Endpoint is scheme://host (no path/query).
 	endpoint := fmt.Sprintf("%s://%s", parsed.Scheme, parsed.Host)
@@ -207,7 +220,10 @@ func (t *HTTPRequest) Execute(ctx context.Context, args json.RawMessage) *openag
 	// Send.
 	resp, err := t.client.Do(req)
 	if err != nil {
-		return openagent.ErrorResult(fmt.Errorf("http_request: %w", err), false, "")
+		// http.Client.Do wraps errors as *url.Error containing the full URL
+		// (including query string — which may carry tokens the LLM injected).
+		// Scrub query+fragment before returning to the model context.
+		return openagent.ErrorResult(scrubURLError(err), false, "")
 	}
 	defer utils.DrainAndClose(resp.Body)
 
@@ -293,4 +309,47 @@ type HwParams struct {
 	Headers map[string]string `json:"headers,omitempty" jsonschema:"description=Optional extra headers (e.g. Content-Type). Do NOT pass Authorization or x-sdk-date — they are auto-signed."`
 	Body    string            `json:"body,omitempty" jsonschema:"description=Optional request body (e.g. JSON string for POST requests)"`
 	Timeout int               `json:"timeout,omitempty" jsonschema:"description=Request timeout in seconds (default: 30, min: 1, max: 120)"`
+}
+
+// scrubURLError strips the query string and fragment from the URL embedded in
+// a *url.Error returned by http.Client.Do, so secrets the LLM injected into
+// the query (e.g. ?token=xxx) don't echo back into the model context via the
+// error message. Non-url.Error errors pass through unchanged.
+func scrubURLError(err error) error {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		urlErr.URL = utils.ScrubURL(urlErr.URL)
+		return urlErr
+	}
+	return fmt.Errorf("http_request: %w", err)
+}
+
+// isHuaweiCloudHost reports whether host is a HuaweiCloud API endpoint.
+// The signed Authorization header (carrying the plaintext AK) is only safe
+// to send to these domains — any other host would receive the credential.
+// Covers the international (.com), Chinese (.cn), and European (.eu) domains.
+func isHuaweiCloudHost(host string) bool {
+	// Strip port if present.
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.ToLower(host)
+	// Strip a trailing dot (FQDN root label) so "bss.myhuaweicloud.com." is
+	// accepted — it is the same host as "bss.myhuaweicloud.com".
+	host = strings.TrimSuffix(host, ".")
+	// HuaweiCloud API domains end with a known suffix. We match on a leading-
+	// dot suffix (not exact, not bare HasSuffix on the unsuffixed host) so
+	// subdomains are allowed (bss.myhuaweicloud.com, ecs.cn-east-3.myhuaweicloud.com)
+	// but prefix-confusers are not (evilmyhuaweicloud.com).
+	suffixes := []string{
+		".myhuaweicloud.com",
+		".myhuaweicloud.cn",
+		".myhuaweicloud.eu",
+	}
+	for _, sfx := range suffixes {
+		if strings.HasSuffix(host, sfx) {
+			return true
+		}
+	}
+	return false
 }

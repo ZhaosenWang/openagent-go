@@ -20,7 +20,7 @@ import (
 //	Authorization: SDK-HMAC-SHA256 Access={ak}, SignedHeaders={...}, Signature={...}
 //	x-sdk-date: {timestamp}
 //	[x-security-token: {token}]   (when temporary credentials are used)
-func Sign(method, endpoint, path string, query map[string]string, body []byte, ak, sk, securityToken string) map[string]string {
+func Sign(method, endpoint, path string, query url.Values, body []byte, ak, sk, securityToken string) map[string]string {
 	ts := timestamp()
 	host := hostFromEndpoint(endpoint)
 
@@ -112,20 +112,34 @@ func canonicalURI(path string) string {
 	return "/" + strings.Join(segments, "/") + "/"
 }
 
-// canonicalQueryString sorts query keys and URL-encodes both keys and values.
-func canonicalQueryString(query map[string]string) string {
+// canonicalQueryString builds the SDK-HMAC-SHA256 canonical query string:
+// all key-value pairs (including repeated keys) sorted by key, then by value
+// within the same key, URL-encoded, joined by &. This matches the HuaweiCloud
+// SDK spec — repeated query keys (e.g. ?tag=prod&tag=cn-east-3) must all
+// appear in the signature, not just the first value.
+func canonicalQueryString(query url.Values) string {
 	if len(query) == 0 {
 		return ""
 	}
-	keys := make([]string, 0, len(query))
-	for k := range query {
-		keys = append(keys, k)
+	// Collect all key-value pairs.
+	type kv struct{ k, v string }
+	var pairs []kv
+	for k, vs := range query {
+		for _, v := range vs {
+			pairs = append(pairs, kv{k, v})
+		}
 	}
-	sort.Strings(keys)
+	// Sort by key, then by value.
+	sort.Slice(pairs, func(i, j int) bool {
+		if pairs[i].k != pairs[j].k {
+			return pairs[i].k < pairs[j].k
+		}
+		return pairs[i].v < pairs[j].v
+	})
 
-	parts := make([]string, 0, len(keys))
-	for _, k := range keys {
-		parts = append(parts, urlEncode(k)+"="+urlEncode(query[k]))
+	parts := make([]string, len(pairs))
+	for i, p := range pairs {
+		parts[i] = urlEncode(p.k) + "=" + urlEncode(p.v)
 	}
 	return strings.Join(parts, "&")
 }

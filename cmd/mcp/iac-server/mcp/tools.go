@@ -36,7 +36,7 @@ type Config struct {
 	ProviderMirrors []string // provider download mirrors (URLs or local paths)
 }
 
-// NewTools builds the 11 tools exposed by iac-server.
+// NewTools builds the 12 tools exposed by iac-server.
 func NewTools(cfg Config) []openagent.Tool {
 	return []openagent.Tool{
 		&proposeArchitectureTool{cfg: cfg},
@@ -272,7 +272,7 @@ type applyDeploymentTool struct{ cfg Config }
 func (t *applyDeploymentTool) Definition() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
 		Name:        "apply_deployment",
-		Description: "Step 5 of deployment: Apply a saved terraform plan. This creates/modifies real cloud resources. The deployment must have been planned (generate_terraform_plan succeeded) AND cost-estimated (estimate_cost succeeded) first — apply is rejected with an error if the deployment has no current cost estimate.",
+		Description: "Step 5 of deployment: Apply a saved terraform plan. This creates/modifies real cloud resources. The deployment must have been planned (generate_terraform_plan succeeded) AND cost-estimated (estimate_cost succeeded) first — apply is rejected with an error if the deployment has no current cost estimate." + " ASYNC: returns immediately with a job_id — call get_job_result(job_id, wait_seconds=25) to poll for the result.",
 		Parameters:  openagent.SchemaOf[ApplyDeploymentParams](),
 	}
 }
@@ -286,29 +286,68 @@ func (t *applyDeploymentTool) Execute(ctx context.Context, args json.RawMessage)
 		return openagent.ErrorResult(fmt.Errorf("apply_deployment: invalid deployment_id %q", params.DeploymentID), false, "")
 	}
 
-	dir := workDir(t.cfg.DeploymentsDir, params.DeploymentID)
+	jobID, err := t.cfg.Planner.SubmitJob(ctx, params.DeploymentID, "apply_deployment", func(ctx context.Context) (string, error) {
+		dir := workDir(t.cfg.DeploymentsDir, params.DeploymentID)
 
-	// Cost gate: apply is only allowed after estimate_cost ran for the
-	// current deployment state (any DAG/.tf mutation invalidates the marker).
-	if !agent.HasCost(dir) {
-		return openagent.ErrorResult(fmt.Errorf("apply_deployment: deployment %s has not been cost-estimated for its current state — call estimate_cost first", params.DeploymentID), false, "")
-	}
+		// State gate: apply requires a plan that was actually generated and
+		// validated by terraform plan, OR a deployment that was already applied
+		// (idempotent re-apply). A stale cost.json from a previous estimate
+		// (before a failed re-generate) must not let apply through — the
+		// DagSpecified status from a failed generate rollback blocks that.
+		status := agent.DagStatusOf(dir)
+		switch status {
+		case agent.DagPlanned, agent.DagCostEstimated:
+			// ok — has a valid plan or a cost-estimated plan
+		case agent.DagApplied:
+			// ok — idempotent re-apply; terraform apply is a no-op on a
+			// converged state, so allowing this preserves apply idempotency.
+		case agent.DagDestroyed:
+			return "", fmt.Errorf("apply_deployment: deployment %s was already destroyed — call generate_terraform_plan to re-create it", params.DeploymentID)
+		default:
+			return "", fmt.Errorf("apply_deployment: deployment %s is not in a plannable state (dag.Status=%q) — call generate_terraform_plan first", params.DeploymentID, status)
+		}
 
-	client, err := iac.NewClient(ctx, dir, iacConfig(t.cfg.Cloud, t.cfg.DryRun, t.cfg.BinaryMirrors, t.cfg.ProviderMirrors))
+		// Cost gate: apply is only allowed after estimate_cost ran for the
+		// current deployment state (any DAG/.tf mutation invalidates the marker).
+		if !agent.HasCost(dir) {
+			return "", fmt.Errorf("apply_deployment: deployment %s has not been cost-estimated for its current state — call estimate_cost first", params.DeploymentID)
+		}
+
+		client, err := iac.NewClient(ctx, dir, iacConfig(t.cfg.Cloud, t.cfg.DryRun, t.cfg.BinaryMirrors, t.cfg.ProviderMirrors))
+		if err != nil {
+			return "", fmt.Errorf("apply_deployment: %w", err)
+		}
+
+		result, err := client.Apply(ctx)
+		if err != nil {
+			// If the job was cancelled (superseded by a newer submission or
+			// the 15-min timeout fired), terraform received SIGINT and may
+			// have left partial resources / a stale state lock. Tell the
+			// client explicitly so it uses troubleshoot_deployment instead
+			// of blindly retrying.
+			if ctx.Err() != nil {
+				return "", fmt.Errorf("apply_deployment: interrupted (ctx cancelled: %v) — terraform may have left partial resources or a state lock; run troubleshoot_deployment to check the real state before retrying: %w", ctx.Err(), err)
+			}
+			return "", fmt.Errorf("apply_deployment: %w", err)
+		}
+
+		// Advance the DAG state machine to DagApplied so a subsequent
+		// apply_deployment is treated as an idempotent re-apply (the state
+		// gate accepts DagApplied) rather than an error. A save failure here
+		// does not undo the apply — the resources exist on the cloud; only
+		// the persisted contract is stale, and the client can troubleshoot.
+		_ = agent.SetDagStatus(dir, agent.DagApplied)
+
+		data, err := json.Marshal(result)
+		if err != nil {
+			return "", fmt.Errorf("apply_deployment: marshal: %w", err)
+		}
+		return string(data), nil
+	})
 	if err != nil {
-		return openagent.ErrorResult(fmt.Errorf("apply_deployment: %w", err), false, "")
+		return openagent.ErrorResult(err, false, "")
 	}
-
-	result, err := client.Apply(ctx)
-	if err != nil {
-		return openagent.ErrorResult(fmt.Errorf("apply_deployment: %w", err), false, "")
-	}
-
-	data, err := json.Marshal(result)
-	if err != nil {
-		return openagent.ErrorResult(fmt.Errorf("apply_deployment: marshal: %w", err), false, "")
-	}
-	return &openagent.ToolResult{Content: string(data)}
+	return jobStarted(jobID, "apply_deployment")
 }
 
 // ── destroy_deployment ──
@@ -318,7 +357,7 @@ type destroyDeploymentTool struct{ cfg Config }
 func (t *destroyDeploymentTool) Definition() openagent.FunctionDefinition {
 	return openagent.FunctionDefinition{
 		Name:        "destroy_deployment",
-		Description: "Destroy all resources in a deployment. This permanently deletes cloud resources. Use with caution.",
+		Description: "Destroy all resources in a deployment. This permanently deletes cloud resources. Use with caution." + " ASYNC: returns immediately with a job_id — call get_job_result(job_id, wait_seconds=25) to poll for the result.",
 		Parameters:  openagent.SchemaOf[DestroyDeploymentParams](),
 	}
 }
@@ -332,26 +371,67 @@ func (t *destroyDeploymentTool) Execute(ctx context.Context, args json.RawMessag
 		return openagent.ErrorResult(fmt.Errorf("destroy_deployment: invalid deployment_id %q", params.DeploymentID), false, "")
 	}
 
-	dir := workDir(t.cfg.DeploymentsDir, params.DeploymentID)
-	client, err := iac.NewClient(ctx, dir, iacConfig(t.cfg.Cloud, t.cfg.DryRun, t.cfg.BinaryMirrors, t.cfg.ProviderMirrors))
-	if err != nil {
-		return openagent.ErrorResult(fmt.Errorf("destroy_deployment: %w", err), false, "")
-	}
+	jobID, err := t.cfg.Planner.SubmitJob(ctx, params.DeploymentID, "destroy_deployment", func(ctx context.Context) (string, error) {
+		dir := workDir(t.cfg.DeploymentsDir, params.DeploymentID)
+		// Refuse to "destroy" a deployment that was never created. terraform
+		// destroy on an empty/missing directory succeeds as a no-op and would
+		// report {"destroyed": true} — misleading when the id is bogus. Require
+		// the deployment directory to exist (it is created by propose_architecture).
+		if _, err := os.Stat(dir); err != nil {
+			if os.IsNotExist(err) {
+				return "", fmt.Errorf("destroy_deployment: deployment %s does not exist — check list_deployments", params.DeploymentID)
+			}
+			return "", fmt.Errorf("destroy_deployment: %w", err)
+		}
+		// State gate: destroy only makes sense for a deployment that was
+		// actually applied (or at least planned/cost-estimated). Destroying
+		// a proposed/specified deployment (never applied) would run terraform
+		// destroy on a state with no resources — a no-op reported as success,
+		// which is misleading. An already-destroyed deployment is rejected
+		// so the client doesn't think it destroyed something that wasn't there.
+		switch status := agent.DagStatusOf(dir); status {
+		case agent.DagApplied, agent.DagPlanned, agent.DagCostEstimated:
+			// ok — has resources (applied) or a plan that may have partial resources
+		case agent.DagDestroyed:
+			return "", fmt.Errorf("destroy_deployment: deployment %s was already destroyed", params.DeploymentID)
+		case "":
+			// Pre-DAG deployment (no dag.json) — allow for backward compat.
+		default:
+			return "", fmt.Errorf("destroy_deployment: deployment %s was never applied (dag.Status=%q) — nothing to destroy", params.DeploymentID, status)
+		}
+		client, err := iac.NewClient(ctx, dir, iacConfig(t.cfg.Cloud, t.cfg.DryRun, t.cfg.BinaryMirrors, t.cfg.ProviderMirrors))
+		if err != nil {
+			return "", fmt.Errorf("destroy_deployment: %w", err)
+		}
 
-	resources, err := client.Destroy(ctx)
-	if err != nil {
-		return openagent.ErrorResult(fmt.Errorf("destroy_deployment: %w", err), false, "")
-	}
+		resources, err := client.Destroy(ctx)
+		if err != nil {
+			// Same interruption guidance as apply — a cancelled destroy may
+			// leave resources half-destroyed or a state lock behind.
+			if ctx.Err() != nil {
+				return "", fmt.Errorf("destroy_deployment: interrupted (ctx cancelled: %v) — terraform may have left resources partially destroyed or a state lock; run troubleshoot_deployment to check the real state before retrying: %w", ctx.Err(), err)
+			}
+			return "", fmt.Errorf("destroy_deployment: %w", err)
+		}
 
-	result := map[string]any{
-		"destroyed": true,
-		"resources": resources,
-	}
-	data, err := json.Marshal(result)
+		result := map[string]any{
+			"destroyed": true,
+			"resources": resources,
+		}
+
+		// Advance the DAG state machine to DagDestroyed.
+		_ = agent.SetDagStatus(dir, agent.DagDestroyed)
+
+		data, err := json.Marshal(result)
+		if err != nil {
+			return "", fmt.Errorf("destroy_deployment: marshal: %w", err)
+		}
+		return string(data), nil
+	})
 	if err != nil {
-		return openagent.ErrorResult(fmt.Errorf("destroy_deployment: marshal: %w", err), false, "")
+		return openagent.ErrorResult(err, false, "")
 	}
-	return &openagent.ToolResult{Content: string(data)}
+	return jobStarted(jobID, "destroy_deployment")
 }
 
 // ── get_deployment_status ──
@@ -387,9 +467,12 @@ func (t *getDeploymentStatusTool) Execute(ctx context.Context, args json.RawMess
 	}
 
 	// Parse the state file to extract a summary.
+	// terraform state v4 resources have no "address" field — the address is
+	// implicitly "<type>.<name>". We read type+name and synthesize address so
+	// the client gets a usable identifier for each resource.
 	var state struct {
 		Resources []struct {
-			Address string `json:"address"`
+			Address string `json:"address"` // absent in state v4; kept for forward-compat
 			Type    string `json:"type"`
 			Name    string `json:"name"`
 		} `json:"resources"`
@@ -402,10 +485,25 @@ func (t *getDeploymentStatusTool) Execute(ctx context.Context, args json.RawMess
 		return openagent.ErrorResult(fmt.Errorf("get_deployment_status: parse state: %w", err), false, "")
 	}
 
+	// Build resource summaries with a non-empty address (type.name when the
+	// state file omits it).
+	resources := make([]map[string]string, 0, len(state.Resources))
+	for _, r := range state.Resources {
+		addr := r.Address
+		if addr == "" && r.Type != "" && r.Name != "" {
+			addr = r.Type + "." + r.Name
+		}
+		resources = append(resources, map[string]string{
+			"address": addr,
+			"type":    r.Type,
+			"name":    r.Name,
+		})
+	}
+
 	summary := map[string]any{
 		"deployment_id":  params.DeploymentID,
 		"resource_count": len(state.Resources),
-		"resources":      state.Resources,
+		"resources":      resources,
 		"outputs":        state.Outputs,
 	}
 	result, err := json.Marshal(summary)
@@ -508,7 +606,9 @@ func (t *listDeploymentsTool) Execute(ctx context.Context, _ json.RawMessage) *o
 		HasPlan  bool   `json:"has_plan"`
 	}
 
-	var deployments []deployment
+	// Start as a non-nil slice so an empty deployments dir marshals to []
+	// (not null) — clients that unmarshal into []T choke on null.
+	deployments := make([]deployment, 0)
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
