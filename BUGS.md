@@ -1,6 +1,6 @@
 # BUGS.md — Known Issues & Technical Debt
 
-> Last updated 2026-08-07 (B9 summarizer 重试 + nil 防御已修复).
+> Last updated 2026-08-07 (B20 prompt 超窗口上限: overhead 漏算 + 压缩仅 turn 0).
 > Format: `[P0]` = critical, `[P1]` = high, `[P2]` = medium, `[P3]` = low.
 
 ---
@@ -39,6 +39,14 @@
 `model/openai/openai.go:257-261`：注释称"drop it explicitly"，但 `out[i]` 是**索引赋值**而非 append——未知 part 类型的零值元素保留原位，序列化为 `content: [..., null, ...]` → OpenAI 兼容 API 400，run 硬失败。注释（"序列化为空 {} 被 API 静默丢弃"）与实现双重错误。
 
 修复：默认分支 `continue`（append 已知类型）。
+
+### B20. 压缩触发后 prompt 仍超上下文窗口
+
+现象：ACP 多轮对话报 `prompt exceeds model context window: 131793 > 131072`（压缩已在 70% 触发，仍超 100%）。
+
+根因：`estimatePromptOverhead`（`kernel/prompt.go:190-217`）漏算 buildPrompt 注入的 skills catalog / memories / resources / dynamic-template → budget 偏大、裁剪不足；压缩只在 turn 0（`kernel/run.go:100-102`），后续 tool 轮无补偿；叠加 tokenizer CJK 误差（cl100k 高估 ~60%）。
+
+修复：(a) `estimatePromptOverhead` 计入漏算组件；(b) turn>0 也检查压缩；(c) 或调低 budget 比例（70%→60%）。
 
 ---
 
