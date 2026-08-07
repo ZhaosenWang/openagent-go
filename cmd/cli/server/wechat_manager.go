@@ -461,6 +461,13 @@ const wechatDefaultBaseURL = "https://ilinkai.weixin.qq.com"
 func wechatMessageHandler(cfg *agent.Agent, deps kernel.Deps, ch *wechat.Channel) channel.MessageHandler {
 	return func(msgCtx context.Context, msg channel.IncomingMessage, reply channel.ReplyFunc) {
 		sessionID := "wechat_" + msg.ChatID
+
+		// Intercept /clear before sending to the agent.
+		if isClearCommand(msg.Text) {
+			handleClearCommand(deps, reply, msgCtx, sessionID)
+			return
+		}
+
 		go func() {
 			// "对方正在输入" while the agent works (best-effort).
 			_ = ch.SendTyping(msgCtx, msg.UserID)

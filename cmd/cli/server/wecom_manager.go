@@ -352,6 +352,13 @@ func (m *WecomManager) SetCredentials(botID, secret string) error {
 func wecomMessageHandler(cfg *agent.Agent, deps kernel.Deps) channel.MessageHandler {
 	return func(msgCtx context.Context, msg channel.IncomingMessage, reply channel.ReplyFunc) {
 		sessionID := "wecom_" + msg.ChatID
+
+		// Intercept /clear before sending to the agent.
+		if isClearCommand(msg.Text) {
+			handleClearCommand(deps, reply, msgCtx, sessionID)
+			return
+		}
+
 		go func() {
 			session := openagent.Session{
 				ID:        sessionID,

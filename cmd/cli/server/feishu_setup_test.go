@@ -196,7 +196,7 @@ func TestClearCredentialsPreservesOtherFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Now clear via the manager path used by the DELETE endpoint.
-	m := NewFeishuManager(context.Background(), ".openagent/profile", nil, nil, kernel.Deps{})
+	m := NewFeishuManager(context.Background(), ".openagent/profile", nil, nil, kernel.Deps{}, "")
 	if err := m.ClearCredentials(); err != nil {
 		t.Fatal(err)
 	}
@@ -235,7 +235,7 @@ func TestClearCredentialsPreservesOtherFields(t *testing.T) {
 // total.
 func TestFeishuQRCacheRoundTrip(t *testing.T) {
 	profiles := filepath.Join(t.TempDir(), "profile")
-	m := NewFeishuManager(context.Background(), profiles, nil, nil, kernel.Deps{})
+	m := NewFeishuManager(context.Background(), profiles, nil, nil, kernel.Deps{}, "")
 
 	if err := saveFeishuQR(profiles, "https://qr.example/x", 300); err != nil {
 		t.Fatal(err)
@@ -271,7 +271,7 @@ func TestFeishuQRCacheRoundTrip(t *testing.T) {
 // to surface the expiry on its next cycle.
 func TestFeishuQRExpired(t *testing.T) {
 	profiles := filepath.Join(t.TempDir(), "profile")
-	m := NewFeishuManager(context.Background(), profiles, nil, nil, kernel.Deps{})
+	m := NewFeishuManager(context.Background(), profiles, nil, nil, kernel.Deps{}, "")
 
 	if err := saveFeishuQR(profiles, "https://qr.example/x", 300); err != nil {
 		t.Fatal(err)
@@ -294,7 +294,7 @@ func TestFeishuQRExpired(t *testing.T) {
 // not cancel it, and the SDK polls without a client timeout) must return
 // within disconnectTimeout instead of hanging the endpoint.
 func TestDisconnectTimesOutOnStuckFlow(t *testing.T) {
-	m := NewFeishuManager(context.Background(), filepath.Join(t.TempDir(), "profile"), nil, nil, kernel.Deps{})
+	m := NewFeishuManager(context.Background(), filepath.Join(t.TempDir(), "profile"), nil, nil, kernel.Deps{}, "")
 	cancelled := make(chan struct{})
 	m.mu.Lock()
 	m.cancel = func() { close(cancelled) }
@@ -322,7 +322,7 @@ func TestDisconnectTimesOutOnStuckFlow(t *testing.T) {
 // registration goroutine finishing late would clobber the state of a
 // newer connection.
 func TestSetStatusGuardDropsStalePublish(t *testing.T) {
-	m := NewFeishuManager(context.Background(), filepath.Join(t.TempDir(), "profile"), nil, nil, kernel.Deps{})
+	m := NewFeishuManager(context.Background(), filepath.Join(t.TempDir(), "profile"), nil, nil, kernel.Deps{}, "")
 	current := make(chan struct{})
 	m.mu.Lock()
 	m.done = current
@@ -345,7 +345,7 @@ func TestSetStatusGuardDropsStalePublish(t *testing.T) {
 // cleanup (the buggy ordering) makes the guard see m.done != guard and
 // drop the publish, leaving the status stuck on the previous phase.
 func TestFlowTerminalPublishSurvivesOwnCleanup(t *testing.T) {
-	m := NewFeishuManager(context.Background(), filepath.Join(t.TempDir(), "profile"), nil, nil, kernel.Deps{})
+	m := NewFeishuManager(context.Background(), filepath.Join(t.TempDir(), "profile"), nil, nil, kernel.Deps{}, "")
 	done := make(chan struct{})
 	m.mu.Lock()
 	m.done = done

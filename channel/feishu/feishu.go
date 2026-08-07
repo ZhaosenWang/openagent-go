@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,21 +19,39 @@ import (
 	lark "github.com/larksuite/oapi-sdk-go/v3"
 	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher"
+	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher/callback"
 	larkapplication "github.com/larksuite/oapi-sdk-go/v3/service/application/v6"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 	larkws "github.com/larksuite/oapi-sdk-go/v3/ws"
 
 	"github.com/yusheng-g/openagent-go/channel"
+	"github.com/yusheng-g/openagent-go/governance"
 )
+
+// leadingMentionRe matches one or more consecutive Feishu @-mention
+// placeholders at the start of a message (e.g. "@_user_1 @_user_2").
+// In group chats, Feishu embeds these opaque tokens in the text field
+// instead of human-readable "@name". They must be stripped so that
+// slash commands like "/mode" are recognized and the agent doesn't
+// receive rendering artifacts as user input.
+var leadingMentionRe = regexp.MustCompile(`^(@_user_\d+\s*)+`)
 
 // Channel implements channel.Channel for Feishu via WebSocket long connection.
 type Channel struct {
 	appID     string
 	appSecret string
 
-	client *lark.Client
-	ws     *larkws.Client
-	once   sync.Once
+	client   *lark.Client
+	ws       *larkws.Client
+	once     sync.Once
+	approver *feishuApprover
+
+	// Per-chat mode state ("manual" | "auto"). defMode is the fallback
+	// for chats that have never switched; it comes from config
+	// DefaultMode (defaults to "manual").
+	modeMu  sync.RWMutex
+	modes   map[string]string
+	defMode string
 
 	// onReady is invoked by the SDK once the WebSocket is connected and
 	// ready to receive messages (nil = ignore). Used by the connection
@@ -53,10 +72,81 @@ type Channel struct {
 	connectedOnce atomic.Bool
 }
 
-// New returns a Feishu Channel. The Channel must be started via Start() to
-// begin receiving messages.
-func New(appID, appSecret string) *Channel {
-	return &Channel{appID: appID, appSecret: appSecret}
+// New returns a Feishu Channel. defaultMode is the initial mode for chats
+// that haven't explicitly switched ("manual" or "auto"; empty = "manual").
+// The Channel must be started via Start() to begin receiving messages.
+func New(appID, appSecret, defaultMode string) *Channel {
+	if !channel.IsValidMode(defaultMode) {
+		defaultMode = channel.ModeManual
+	}
+	return &Channel{
+		appID:     appID,
+		appSecret: appSecret,
+		approver:  newFeishuApprover(),
+		modes:     make(map[string]string),
+		defMode:   defaultMode,
+	}
+}
+
+// GetMode returns the current mode for a chat ("manual" | "auto").
+// Chats that have never switched return the default mode.
+func (c *Channel) GetMode(chatID string) string {
+	c.modeMu.RLock()
+	defer c.modeMu.RUnlock()
+	if m, ok := c.modes[chatID]; ok {
+		return m
+	}
+	return c.defMode
+}
+
+// SetMode updates the mode for a chat.
+func (c *Channel) SetMode(chatID, mode string) {
+	if !channel.IsValidMode(mode) {
+		return
+	}
+	c.modeMu.Lock()
+	defer c.modeMu.Unlock()
+	c.modes[chatID] = mode
+}
+
+// BuildModeCard returns a platform-neutral Card for the mode-switching
+// UI. The current mode for the chat is highlighted. Used by the channel
+// handler when the user sends /mode.
+func (c *Channel) BuildModeCard(chatID string) *channel.Card {
+	return &channel.Card{
+		Header:     channel.CardHeader{Title: "模式切换"},
+		Color:      channel.CardColorBlue,
+		Content:    modeCardContent(c.GetMode(chatID)),
+		ModeSwitch: &channel.CardModeSwitch{CurrentMode: c.GetMode(chatID)},
+	}
+}
+
+// modeCardContent returns the markdown body for the mode card.
+func modeCardContent(currentMode string) string {
+	return fmt.Sprintf(
+		"选择 agent 的工作模式：\n\n"+
+			modeDescription+"\n\n"+
+			"当前模式：**%s**",
+		modeLabel(currentMode),
+	)
+}
+
+// Approver returns the Feishu-card-based human approver for this channel.
+// May be called before Start; the lark client is wired in Start.
+func (c *Channel) Approver(_ governance.ApprovalMemory) governance.HumanApprover {
+	return c.approver
+}
+
+// SetRunCardUpdater registers a callback that Ask invokes to embed approval
+// buttons in the run card instead of sending a separate approval card.
+// streamReply calls this before each agent run and clears it after.
+func (c *Channel) SetRunCardUpdater(sessionID string, cb func(toolName, args, approvalID string)) {
+	c.approver.setRunCardUpdater(sessionID, cb)
+}
+
+// ClearRunCardUpdater removes the run-card update callback for a session.
+func (c *Channel) ClearRunCardUpdater(sessionID string) {
+	c.approver.clearRunCardUpdater(sessionID)
 }
 
 // SetOnReady registers the connection-ready callback (nil clears it).
@@ -78,6 +168,7 @@ func (c *Channel) Name() string { return "feishu" }
 // Feishu and blocks until ctx is cancelled.
 func (c *Channel) Start(ctx context.Context, handler channel.MessageHandler) error {
 	c.client = lark.NewClient(c.appID, c.appSecret)
+	c.approver.client = c.client
 
 	dh := dispatcher.NewEventDispatcher("", "").
 		OnP2MessageReceiveV1(func(ctx context.Context, event *larkim.P2MessageReceiveV1) error {
@@ -87,6 +178,9 @@ func (c *Channel) Start(ctx context.Context, handler channel.MessageHandler) err
 			}
 			handler(ctx, *msg, c.buildReply(ctx, event))
 			return nil
+		}).
+		OnP2CardActionTrigger(func(ctx context.Context, event *callback.CardActionTriggerEvent) (*callback.CardActionTriggerResponse, error) {
+			return c.handleCardAction(ctx, event)
 		}).
 		// Silently accept non-message events to avoid error spam.
 		OnP2ChatAccessEventBotP2pChatEnteredV1(func(ctx context.Context, event *larkim.P2ChatAccessEventBotP2pChatEnteredV1) error {
@@ -209,7 +303,7 @@ func toIncoming(event *larkim.P2MessageReceiveV1) *channel.IncomingMessage {
 	}
 	msg := event.Event.Message
 
-	text := extractText(msg)
+	text := stripLeadingMentions(extractText(msg))
 	if strings.TrimSpace(text) == "" {
 		return nil
 	}
@@ -299,6 +393,16 @@ func extractText(msg *larkim.EventMessage) string {
 	return strings.TrimSpace(raw)
 }
 
+// stripLeadingMentions removes Feishu @-mention placeholders (@_user_N)
+// from the beginning of text. Only leading mentions are stripped so that
+// inline mentions (e.g. "tell @_user_1 to review") are preserved for the
+// agent to see. Returns empty string when text contains only mentions.
+func stripLeadingMentions(text string) string {
+	t := strings.TrimSpace(text)
+	t = leadingMentionRe.ReplaceAllString(t, "")
+	return strings.TrimSpace(t)
+}
+
 // ── Reply ──
 
 // buildReply returns a channel.ReplyFunc that sends a message back
@@ -379,7 +483,14 @@ func (c *Channel) sendCard(ctx context.Context, receiveIDType, receiveID string,
 }
 
 func (c *Channel) sendMessage(ctx context.Context, receiveIDType, receiveID, msgType, content string) (string, error) {
-	resp, err := c.client.Im.Message.Create(ctx,
+	return createMessage(ctx, c.client, receiveIDType, receiveID, msgType, content)
+}
+
+// createMessage sends a message via the Feishu IM API and returns the
+// platform-assigned message ID. Shared by Channel.sendMessage and
+// feishuApprover.sendInteractive.
+func createMessage(ctx context.Context, client *lark.Client, receiveIDType, receiveID, msgType, content string) (string, error) {
+	resp, err := client.Im.Message.Create(ctx,
 		larkim.NewCreateMessageReqBuilder().
 			ReceiveIdType(receiveIDType).
 			Body(larkim.NewCreateMessageReqBodyBuilder().
@@ -403,19 +514,96 @@ func (c *Channel) sendMessage(ctx context.Context, receiveIDType, receiveID, msg
 // patchCard updates an existing interactive card message by message ID.
 // https://open.feishu.cn/document/server-docs/im-v1/message/patch
 func (c *Channel) patchCard(ctx context.Context, messageID, cardJSON string) error {
-	content := cardJSON // PATCH body just needs the new card content
-	resp, err := c.client.Im.Message.Patch(ctx,
+	return patchMessageCard(ctx, c.client, messageID, cardJSON)
+}
+
+// patchMessageCard patches an existing interactive card message.
+// Shared by Channel.patchCard and feishuApprover.patchResolved.
+func patchMessageCard(ctx context.Context, client *lark.Client, messageID, cardJSON string) error {
+	resp, err := client.Im.Message.Patch(ctx,
 		larkim.NewPatchMessageReqBuilder().
 			MessageId(messageID).
 			Body(larkim.NewPatchMessageReqBodyBuilder().
-				Content(content).
+				Content(cardJSON).
 				Build()).
 			Build())
 	if err != nil {
 		return fmt.Errorf("feishu: patch card: %w", err)
 	}
 	if !resp.Success() {
+		slog.Warn("feishu: patch card failed", "code", resp.Code, "msg", resp.Msg, "cardSize", len(cardJSON))
 		return fmt.Errorf("feishu: patch card failed: code=%d msg=%s", resp.Code, resp.Msg)
 	}
 	return nil
+}
+
+// CardSize returns the serialized JSON size of a card for size-limit
+// checks. Implements the server.CardSizer interface.
+func (c *Channel) CardSize(card *channel.Card) int {
+	b, err := BuildCard(card)
+	if err != nil {
+		return 0
+	}
+	return len(b)
+}
+
+// ── Card action routing ──
+
+// handleCardAction routes a Feishu card action trigger event to either
+// mode-switch handling (when value["type"]=="mode_switch") or the
+// existing approval flow (delegated to feishuApprover).
+func (c *Channel) handleCardAction(ctx context.Context, event *callback.CardActionTriggerEvent) (*callback.CardActionTriggerResponse, error) {
+	if event != nil && event.Event != nil && event.Event.Action != nil {
+		if typ, _ := event.Event.Action.Value["type"].(string); typ == "mode_switch" {
+			return c.handleModeSwitch(ctx, event)
+		}
+	}
+	return c.approver.handleCardAction(ctx, event)
+}
+
+// handleModeSwitch processes a mode-switch button click. It extracts the
+// target mode and chat ID from the event, updates the per-chat mode
+// state, patches the card to show the result, and returns a toast.
+func (c *Channel) handleModeSwitch(_ context.Context, event *callback.CardActionTriggerEvent) (*callback.CardActionTriggerResponse, error) {
+	action := event.Event.Action
+	mode, _ := action.Value["mode"].(string)
+	if !channel.IsValidMode(mode) {
+		return toastResponse("error", "未知模式: "+mode), nil
+	}
+
+	chatID := ""
+	if event.Event.Context != nil {
+		chatID = event.Event.Context.OpenChatID
+	}
+	if chatID == "" {
+		return toastResponse("error", "无法识别聊天ID"), nil
+	}
+
+	c.SetMode(chatID, mode)
+
+	// Patch the card to show the resolved state (fire-and-forget).
+	go c.patchModeCardResolved(event, mode)
+
+	return toastResponse("success", "已切换到 "+modeLabel(mode)+" 模式"), nil
+}
+
+// patchModeCardResolved updates the mode-switch card in-place to reflect
+// the new current mode. Failures are non-critical (the toast already
+// confirmed the switch).
+func (c *Channel) patchModeCardResolved(event *callback.CardActionTriggerEvent, mode string) {
+	if c.client == nil || event.Event.Context == nil {
+		return
+	}
+	msgID := event.Event.Context.OpenMessageID
+	if msgID == "" {
+		return
+	}
+	cardJSON, err := buildModeCardResolved(mode)
+	if err != nil {
+		slog.Warn("feishu: build mode resolved card", "error", err)
+		return
+	}
+	if err := c.patchCard(context.Background(), msgID, cardJSON); err != nil {
+		slog.Warn("feishu: patch mode card", "error", err)
+	}
 }

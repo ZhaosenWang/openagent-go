@@ -147,6 +147,7 @@ func registerFeishuApp(ctx context.Context, profiles string, onQR func(url strin
 				Items: registration.AppAddonsEventItems{
 					Tenant: []string{
 						"im.message.receive_v1",
+						"card.action.trigger",
 					},
 				},
 			},
