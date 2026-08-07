@@ -9,9 +9,11 @@ package summarizer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	openagent "github.com/yusheng-g/openagent-go"
 )
@@ -22,6 +24,9 @@ type Compressor struct {
 	mu        sync.RWMutex
 	model     openagent.Model
 	maxTokens int // 0 = no hint; non-zero = prompt the model to keep the summary under this
+	// backoff returns the wait before retry attempt N (1-based). nil uses
+	// the default exponential backoff. Overridable in tests to avoid sleeps.
+	backoff func(attempt int, re *openagent.RetryableError) time.Duration
 }
 
 // New creates a Compressor backed by m.
@@ -69,14 +74,48 @@ func (c *Compressor) Summarize(ctx context.Context, messages []openagent.Message
 	// No MaxTokens on purpose: a hard output cap truncates the JSON
 	// envelope mid-stream and parseSummary rejects it. Length control is
 	// the prompt hint below plus the prompt-side truncation in kernel.
-	resp, err := model.ChatCompletion(ctx, openagent.ChatCompletionRequest{
-		Messages: []openagent.Message{
-			{Role: openagent.RoleSystem, Content: summarizeSystemPrompt},
-			{Role: openagent.RoleUser, Content: prompt},
-		},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("summarizer: model call: %w", err)
+
+	// Retry transient failures (429/5xx incl. 504 Gateway Timeout) once
+	// with backoff — mirrors kernel/modelcall.go's retry contract. Without
+	// this a single transient gateway error fails compaction, the working
+	// set is left untrimmed, and the growing context eventually trips the
+	// hard window check (fail-loud turn failure).
+	const maxRetries = 1
+	var lastErr error
+	var resp *openagent.ChatCompletionResponse
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-time.After(c.backoffFor(attempt, lastErr)):
+			case <-ctx.Done():
+				return nil, fmt.Errorf("summarizer: model call: %w", ctx.Err())
+			}
+		}
+		var err error
+		resp, err = model.ChatCompletion(ctx, openagent.ChatCompletionRequest{
+			Messages: []openagent.Message{
+				{Role: openagent.RoleSystem, Content: summarizeSystemPrompt},
+				{Role: openagent.RoleUser, Content: prompt},
+			},
+		})
+		if err == nil {
+			if resp == nil {
+				// Defend against a third-party Model returning (nil, nil)
+				// — a contract violation that would panic below. Not
+				// retryable: retrying won't fix a broken implementation.
+				return nil, fmt.Errorf("summarizer: model returned nil response")
+			}
+			break
+		}
+		var re *openagent.RetryableError
+		if !errors.As(err, &re) {
+			return nil, fmt.Errorf("summarizer: model call: %w", err)
+		}
+		lastErr = err
+	}
+	if resp == nil {
+		// Retries exhausted on a transient error.
+		return nil, fmt.Errorf("summarizer: model call: %w", lastErr)
 	}
 
 	content := ""
@@ -88,6 +127,21 @@ func (c *Compressor) Summarize(ctx context.Context, messages []openagent.Message
 		return nil, fmt.Errorf("summarizer: model returned empty summary")
 	}
 	return &openagent.CompressedContext{Summary: content}, nil
+}
+
+// backoffFor returns the wait before retry attempt N (1-based), honoring
+// a RetryAfter hint when the provider supplies one.
+func (c *Compressor) backoffFor(attempt int, lastErr error) time.Duration {
+	var re *openagent.RetryableError
+	errors.As(lastErr, &re)
+	if c.backoff != nil {
+		return c.backoff(attempt, re)
+	}
+	b := time.Duration(1<<uint(attempt-1)) * time.Second
+	if re != nil && re.RetryAfter > 0 {
+		b = re.RetryAfter
+	}
+	return b
 }
 
 // ── Prompt ──

@@ -1,6 +1,6 @@
 # BUGS.md — Known Issues & Technical Debt
 
-> Last updated 2026-08-04 (B3 Discover 空 query 已修复).
+> Last updated 2026-08-07 (B9 summarizer 重试 + nil 防御已修复).
 > Format: `[P0]` = critical, `[P1]` = high, `[P2]` = medium, `[P3]` = low.
 
 ---
@@ -62,12 +62,12 @@
 
 修复：同 firstLine 改为 rune 截断。
 
-### B9. summarizer 无重试 + 无 nil 防御
+### B9. ~~summarizer 无重试 + 无 nil 防御~~ ✅ 已修复（2026-08-07）
 
-- 主模型调用有重试，但 Compact→Summarize 单发：429/503 瞬时限流 → 溢出区间既不在摘要也不在工作集 → **当轮上下文空洞**（`kernel/run.go` 仅 `slog.Error` 后继续，prepareMemory 仍推进工作集起点）。
-- `summarizer/llm.go:70-74` 未判 `resp == nil`（extractor_llm.go:137 有检查，两处不对称）；接口未禁止第三方 Model 返回 (nil,nil)，违规即 panic。
+- ~~主模型调用有重试，但 Compact→Summarize 单发：429/503 瞬时限流 → 溢出区间既不在摘要也不在工作集 → **当轮上下文空洞**（`kernel/run.go` 仅 `slog.Error` 后继续，prepareMemory 仍推进工作集起点）。~~
+- ~~`summarizer/llm.go:70-74` 未判 `resp == nil`（extractor_llm.go:137 有检查，两处不对称）；接口未禁止第三方 Model 返回 (nil,nil)，违规即 panic。~~
 
-修复：Summarize 调用处对 RetryableError 重试一次；补 `resp == nil` 防御。
+修复：`summarizer/llm.go` 的 `Summarize` 对 `RetryableError` 重试一次（默认 1s 指数退避，尊重 `RetryAfter`，cancel 安全），镜像 `kernel/modelcall.go` 的重试契约；补 `resp == nil` 防御（返回明确错误，不重试、不 panic）。新增 `summarizer/llm_test.go` 覆盖重试成功/耗尽/nil 响应/非重试错误/cancel 路径。
 
 ### B10. SSE 连接永久悬挂（team 端点）
 
